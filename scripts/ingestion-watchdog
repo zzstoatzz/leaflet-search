@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     atproto_handle: str = ""
     atproto_password: str = ""
     turso_db_token: str = ""
+    prefect_api_url: str = ""
+    prefect_api_auth_string: str = ""
 
 
 def _max_indexed_at(token: str) -> str:
@@ -136,6 +138,55 @@ def check(window_secs: int) -> tuple[bool, str]:
                 time.sleep(30)
         if last_err:
             problems.append(last_err)
+
+    # 4. snapshot builder (heavypad prefect flow) — cause-level check so a
+    # failing flow pages within 15min instead of waiting for the 180m
+    # snapshot-age symptom. Skipped silently when the creds aren't set.
+    if settings.prefect_api_url and settings.prefect_api_auth_string:
+        try:
+            import base64
+
+            base_url = settings.prefect_api_url.rstrip("/")
+            headers = {
+                "Authorization": "Basic "
+                + base64.b64encode(settings.prefect_api_auth_string.encode()).decode()
+            }
+            # the flow-name filter is ignored by this server version; the
+            # deployment id is the unambiguous handle anyway.
+            dep = httpx.get(
+                base_url + "/deployments/name/pub-search-snapshot/pub-search-snapshot",
+                headers=headers,
+                timeout=10,
+            )
+            dep.raise_for_status()
+            r = httpx.post(
+                base_url + "/flow_runs/filter",
+                headers=headers,
+                json={
+                    "deployments": {"id": {"any_": [dep.json()["id"]]}},
+                    "flow_runs": {"state": {"type": {"any_": ["COMPLETED", "FAILED", "CRASHED"]}}},
+                    "sort": "END_TIME_DESC",
+                    "limit": 1,
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            runs = r.json()
+            if runs:
+                last = runs[0]
+                state = last.get("state_type", "?")
+                if state != "COMPLETED":
+                    problems.append(
+                        f"snapshot builder flow run {last.get('name', '?')} ended {state}"
+                    )
+                else:
+                    print(f"builder ok: last run {last.get('name', '?')} COMPLETED")
+            else:
+                problems.append("snapshot builder: no terminal flow runs found")
+        except Exception as e:
+            # the prefect API being unreachable is itself worth knowing about,
+            # but don't page for a transient blip alone — print, don't append.
+            print(f"builder check skipped: prefect API unreachable ({e!r})")
 
     if problems:
         return True, "; ".join(problems)

@@ -27,4 +27,6 @@ jobs:
           ATPROTO_HANDLE: ${{ secrets.ATPROTO_HANDLE }}
           ATPROTO_PASSWORD: ${{ secrets.ATPROTO_PASSWORD }}
           TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
+          PREFECT_API_URL: ${{ secrets.PREFECT_API_URL }}
+          PREFECT_API_AUTH_STRING: ${{ secrets.PREFECT_API_AUTH_STRING }}
         run: ./scripts/ingestion-watchdog

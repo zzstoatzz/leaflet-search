@@ -29,11 +29,11 @@
 - unicode61 tokenizer (non-alphanumeric = separator)
 
 ## snapshot builder (replica freshness)
-- run as an ephemeral machine from the latest CI image:
-  `fly machine run registry.fly.io/leaflet-search-backend:deployment-<ID> -a leaflet-search-backend --rm --vm-memory 1024 --region ewr -e BUILDER_MODE=1 -e BUILDER_CHANNEL=staging --name builder-<n>`
+- runs OFF fly since 2026-07-25: prefect deployment `pub-search-snapshot` on heavypad (`my-prefect-server/flows/pub_search_snapshot.py`), every 2h — see `docs/builder-offbox-plan.md`
+- trigger a build now: `prefect deployment run 'pub-search-snapshot/pub-search-snapshot' --watch` (against prefect-server.waow.tech, tailnet)
 - channels: `staging` (default) → `staging/builds/…` + `latest.staging.json`; `prod` requires `BUILDER_ALLOW_PROD=1` and writes `builds/…` + `latest.json` (pointer uploaded LAST)
 - gates before publish: doc-count tolerance vs turso, FTS sentinel, quick_check; banned DIDs + bridgy rows excluded at build time (`policy.zig`)
-- completion signal: `builder: published <id> to <channel> channel` in logs/logfire
+- completion signal: `builder: published <id> to <channel> channel` in the flow-run logs; fly promote watcher adopts within its 5-min poll
 
 ## zig dependencies
 - update a dependency hash: `zig fetch --save <url>` (fetches and updates build.zig.zon automatically)

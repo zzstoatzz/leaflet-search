@@ -1,6 +1,7 @@
 """Pure watchdog policy helpers, kept separate from network and auth code."""
 
-SNAPSHOT_AGE_ALERT_MINUTES = 120
+# cadence (2h heavypad prefect builds) + build (~20m) + adoption poll (5m) + margin
+SNAPSHOT_AGE_ALERT_MINUTES = 180
 
 
 def snapshot_age_minutes(manifest: object, now_timestamp: float) -> float:

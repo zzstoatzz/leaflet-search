@@ -147,20 +147,18 @@ surgery footgun.
 1. add the DID to `backend/src/policy.zig` `BANNED_DIDS` → deploy. the
    indexer refuses new inserts, the builder excludes existing rows, and
    the promote watcher will reject any snapshot containing them.
-2. deploy the backend. CI reconciles the scheduled builder to the serving
-   image's immutable digest, stamps the source revision into
-   `BUILDER_VERSION`, and starts a matching build immediately. Verify with
-   `scripts/reconcile-snapshot-builder --version <git-sha> --dry-run`.
+2. deploy the backend, then trigger a build:
+   `prefect deployment run 'pub-search-snapshot/pub-search-snapshot' --watch`.
+   the flow clones fresh, so the new ban list is in the binary it builds.
 3. purge vectors (`scripts/purge-bridgyfed-vectors` handles the banned
    list) and, eventually, turso history (`scripts/purge-banned-turso` —
    paced, canary-gated; turso rows are invisible to serving meanwhile,
    the builder filters them every build).
 
-**emergency takedown** (minutes matter): edit turso, then run the builder
-immediately instead of waiting for the hour:
-`fly machine run <ci-image> -a leaflet-search-backend --rm --vm-memory 1024
--e BUILDER_MODE=1 -e BUILDER_CHANNEL=prod -e BUILDER_ALLOW_PROD=1`.
-the watcher adopts within its next 5-minute poll. ~15 minutes end to end,
+**emergency takedown** (minutes matter): edit turso, then trigger a build
+immediately instead of waiting for the 2h schedule:
+`prefect deployment run 'pub-search-snapshot/pub-search-snapshot' --watch`.
+the watcher adopts within its next 5-minute poll. ~25 minutes end to end,
 all through the verified path. also delete the tpuf vector for instant
 semantic removal.
 

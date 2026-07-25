@@ -34,7 +34,7 @@ def main() -> int:
         "--env",
         f"BUILDER_VERSION={args.version}",
         "--env",
-        "BUILDER_TIMEOUT_SECS=2700",
+        "BUILDER_TIMEOUT_SECS=5400",
         "--env",
         "TURSO_DISABLE_KEEPALIVE=1",
         "--skip-start",
@@ -63,7 +63,7 @@ def main() -> int:
         "BUILDER_MODE": "1",
         "BUILDER_CHANNEL": "prod",
         "BUILDER_ALLOW_PROD": "1",
-        "BUILDER_TIMEOUT_SECS": "2700",
+        "BUILDER_TIMEOUT_SECS": "5400",
         "TURSO_DISABLE_KEEPALIVE": "1",
     }
     if missing := {key: value for key, value in required_env.items() if env.get(key) != value}:

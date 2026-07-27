@@ -92,12 +92,82 @@ pub const Store = struct {
         return collect(allocator, &r);
     }
 
-    /// get labels for a specific subject URI.
-    pub fn queryBySubject(self: *Store, allocator: Allocator, uri: []const u8) ![]StoredLabel {
-        var r = try self.conn.rows(
-            "SELECT seq, src, uri, cid, val, neg, cts, exp, sig, encoded FROM labels WHERE uri = ? ORDER BY seq ASC",
-            .{uri},
-        );
+    /// a queryLabels filter. `patterns` entries are subject URIs, optionally
+    /// ending in `*` for a prefix match; a bare `*` matches every subject.
+    /// An empty `patterns` also matches everything.
+    pub const Filter = struct {
+        patterns: []const []const u8 = &.{},
+        sources: []const []const u8 = &.{},
+        cursor: i64 = 0,
+        limit: i64 = 50,
+    };
+
+    /// com.atproto.label.queryLabels — pattern/source filtered, seq-paginated.
+    pub fn query(self: *Store, allocator: Allocator, filter: Filter) ![]StoredLabel {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+
+        try w.writeAll("SELECT seq, src, uri, cid, val, neg, cts, exp, sig, encoded FROM labels WHERE seq > ?");
+
+        const match_all = filter.patterns.len == 0 or blk: {
+            for (filter.patterns) |p| if (std.mem.eql(u8, p, "*")) break :blk true;
+            break :blk false;
+        };
+
+        if (!match_all) {
+            try w.writeAll(" AND (");
+            for (filter.patterns, 0..) |p, i| {
+                if (i > 0) try w.writeAll(" OR ");
+                // prefix patterns compare the leading substr rather than LIKE:
+                // LIKE is ASCII case-insensitive and would need %/_ escaping.
+                if (p.len > 0 and p[p.len - 1] == '*') {
+                    try w.writeAll("substr(uri, 1, ?) = ?");
+                } else {
+                    try w.writeAll("uri = ?");
+                }
+            }
+            try w.writeByte(')');
+        }
+
+        if (filter.sources.len > 0) {
+            try w.writeAll(" AND src IN (");
+            for (0..filter.sources.len) |i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeByte('?');
+            }
+            try w.writeByte(')');
+        }
+
+        try w.writeAll(" ORDER BY seq ASC LIMIT ?");
+
+        const stmt = try self.conn.prepare(w.buffered());
+        errdefer stmt.deinit();
+
+        var idx: usize = 0;
+        try stmt.bindValue(filter.cursor, idx);
+        idx += 1;
+
+        if (!match_all) {
+            for (filter.patterns) |p| {
+                if (p.len > 0 and p[p.len - 1] == '*') {
+                    const prefix = p[0 .. p.len - 1];
+                    try stmt.bindValue(@as(i64, @intCast(prefix.len)), idx);
+                    idx += 1;
+                    try stmt.bindValue(prefix, idx);
+                } else {
+                    try stmt.bindValue(p, idx);
+                }
+                idx += 1;
+            }
+        }
+        for (filter.sources) |s| {
+            try stmt.bindValue(s, idx);
+            idx += 1;
+        }
+        try stmt.bindValue(filter.limit, idx);
+
+        var r: zqlite.Rows = .{ .stmt = stmt, .err = null };
         defer r.deinit();
         return collect(allocator, &r);
     }
@@ -204,36 +274,133 @@ test "store insert and query by cursor" {
     try std.testing.expectEqualStrings("did:plc:user2", after[0].label.uri);
 }
 
-test "store query by subject" {
-    var store = try Store.init(":memory:");
-    defer store.deinit();
-    const allocator = std.testing.allocator;
-
-    var label1 = Label{
+fn seedThree(store: *Store) !void {
+    var l1 = Label{
         .src = "did:plc:labeler",
         .uri = "did:plc:target",
         .val = "bulk-mirror",
         .cts = "2024-01-01T00:00:00.000Z",
         .sig = &(.{0xaa} ** 64),
     };
-    _ = try store.insert(&label1, "e1");
+    _ = try store.insert(&l1, "e1");
 
-    var label2 = Label{
+    var l2 = Label{
         .src = "did:plc:labeler",
         .uri = "did:plc:other",
         .val = "bulk-mirror",
         .cts = "2024-01-01T00:00:01.000Z",
         .sig = &(.{0xbb} ** 64),
     };
-    _ = try store.insert(&label2, "e2");
+    _ = try store.insert(&l2, "e2");
 
-    const results = try store.queryBySubject(allocator, "did:plc:target");
+    var l3 = Label{
+        .src = "did:plc:elsewhere",
+        .uri = "at://did:plc:target/app.bsky.feed.post/abc",
+        .val = "bulk-mirror",
+        .cts = "2024-01-01T00:00:02.000Z",
+        .sig = &(.{0xcc} ** 64),
+    };
+    _ = try store.insert(&l3, "e3");
+}
+
+fn queryUris(store: *Store, allocator: Allocator, filter: Store.Filter) ![]const []const u8 {
+    const results = try store.query(allocator, filter);
     defer {
         for (results) |item| freeStored(allocator, item);
         allocator.free(results);
     }
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("did:plc:target", results[0].label.uri);
+    var uris: std.ArrayList([]const u8) = .empty;
+    errdefer uris.deinit(allocator);
+    for (results) |item| try uris.append(allocator, try allocator.dupe(u8, item.label.uri));
+    return uris.toOwnedSlice(allocator);
+}
+
+fn freeUris(allocator: Allocator, uris: []const []const u8) void {
+    for (uris) |u| allocator.free(u);
+    allocator.free(uris);
+}
+
+test "store query by exact subject" {
+    var store = try Store.init(":memory:");
+    defer store.deinit();
+    const allocator = std.testing.allocator;
+    try seedThree(&store);
+
+    const uris = try queryUris(&store, allocator, .{ .patterns = &.{"did:plc:target"} });
+    defer freeUris(allocator, uris);
+    try std.testing.expectEqual(@as(usize, 1), uris.len);
+    try std.testing.expectEqualStrings("did:plc:target", uris[0]);
+}
+
+// regression: `uriPatterns=*` matched the literal string "*" and returned []
+test "store query wildcard matches every subject" {
+    var store = try Store.init(":memory:");
+    defer store.deinit();
+    const allocator = std.testing.allocator;
+    try seedThree(&store);
+
+    const star = try queryUris(&store, allocator, .{ .patterns = &.{"*"} });
+    defer freeUris(allocator, star);
+    try std.testing.expectEqual(@as(usize, 3), star.len);
+
+    // a `*` anywhere in the list widens the whole query
+    const mixed = try queryUris(&store, allocator, .{ .patterns = &.{ "did:plc:nobody", "*" } });
+    defer freeUris(allocator, mixed);
+    try std.testing.expectEqual(@as(usize, 3), mixed.len);
+}
+
+test "store query prefix pattern" {
+    var store = try Store.init(":memory:");
+    defer store.deinit();
+    const allocator = std.testing.allocator;
+    try seedThree(&store);
+
+    const uris = try queryUris(&store, allocator, .{ .patterns = &.{"at://did:plc:target/*"} });
+    defer freeUris(allocator, uris);
+    try std.testing.expectEqual(@as(usize, 1), uris.len);
+    try std.testing.expectEqualStrings("at://did:plc:target/app.bsky.feed.post/abc", uris[0]);
+
+    // a prefix that matches nothing stays empty (no accidental full scan)
+    const none = try queryUris(&store, allocator, .{ .patterns = &.{"at://did:plc:nobody/*"} });
+    defer freeUris(allocator, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "store query multiple patterns, sources, limit and cursor" {
+    var store = try Store.init(":memory:");
+    defer store.deinit();
+    const allocator = std.testing.allocator;
+    try seedThree(&store);
+
+    const both = try queryUris(&store, allocator, .{
+        .patterns = &.{ "did:plc:target", "did:plc:other" },
+    });
+    defer freeUris(allocator, both);
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+
+    const from_labeler = try queryUris(&store, allocator, .{
+        .patterns = &.{"*"},
+        .sources = &.{"did:plc:elsewhere"},
+    });
+    defer freeUris(allocator, from_labeler);
+    try std.testing.expectEqual(@as(usize, 1), from_labeler.len);
+    try std.testing.expectEqualStrings("at://did:plc:target/app.bsky.feed.post/abc", from_labeler[0]);
+
+    const page1 = try store.query(allocator, .{ .patterns = &.{"*"}, .limit = 2 });
+    defer {
+        for (page1) |item| freeStored(allocator, item);
+        allocator.free(page1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), page1.len);
+
+    const page2 = try queryUris(&store, allocator, .{
+        .patterns = &.{"*"},
+        .limit = 2,
+        .cursor = page1[page1.len - 1].seq,
+    });
+    defer freeUris(allocator, page2);
+    try std.testing.expectEqual(@as(usize, 1), page2.len);
+    try std.testing.expectEqualStrings("at://did:plc:target/app.bsky.feed.post/abc", page2[0]);
 }
 
 test "store empty returns zero seq" {

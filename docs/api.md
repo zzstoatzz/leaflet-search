@@ -325,6 +325,16 @@ page. the labels themselves are served over standard XRPC at
 `labeler.pub-search.waow.tech` (`com.atproto.label.queryLabels` /
 `subscribeLabels`).
 
+`queryLabels` takes the lexicon's parameters: `uriPatterns` (repeatable, and
+comma-joined values are also accepted — an entry may be an exact subject, a
+`prefix*` pattern, or a bare `*` for every subject), optional `sources`
+(repeatable labeler DIDs), `limit` (1–250, default 50) and `cursor`. the
+response carries a `cursor` whenever a full page was returned.
+
+```
+GET https://labeler.pub-search.waow.tech/xrpc/com.atproto.label.queryLabels?uriPatterns=*&limit=250
+```
+
 `GET /admin/label?token=…&did=…&val=bulk-generated&neg=0|1` (BACKFILL_TOKEN-
 gated) emits or negates a label manually — the negation path is the appeal /
 correction lever; it also updates the classifier's state so the account is

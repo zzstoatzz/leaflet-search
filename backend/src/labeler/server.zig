@@ -199,19 +199,31 @@ pub const Server = struct {
     }
 
     fn handleQueryLabels(self: *Server, conn: *websocket.Conn, query: []const u8) void {
-        // parse uriPatterns param
-        const raw = queryParam(query, "uriPatterns") orelse {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // uriPatterns is an array: repeated params, comma-joined, or both.
+        // Values are percent-encoded by standards-following clients
+        // (did%3Aplc%3A…), so decode before they reach the store.
+        const patterns = collectListParam(alloc, query, "uriPatterns") catch return;
+        if (patterns.len == 0) {
             httpRespond(conn, "400 Bad Request", "application/json",
                 \\{"error":"InvalidRequest","message":"uriPatterns parameter required"}
             );
             return;
-        };
-        // standards-following clients percent-encode the DID's colons
-        // (did%3Aplc%3A…); the store matches exact strings, so decode first.
-        var uri_buf: [512]u8 = undefined;
-        const uri = percentDecode(&uri_buf, raw) orelse raw;
+        }
+        const sources = collectListParam(alloc, query, "sources") catch return;
 
-        const labels = self.store.queryBySubject(self.allocator, uri) catch {
+        const limit = parseIntParam(query, "limit", 50, 1, 250);
+        const cursor = parseIntParam(query, "cursor", 0, 0, std.math.maxInt(i32));
+
+        const labels = self.store.query(self.allocator, .{
+            .patterns = patterns,
+            .sources = sources,
+            .cursor = cursor,
+            .limit = limit,
+        }) catch {
             httpRespond(conn, "500 Internal Server Error", "application/json",
                 \\{"error":"InternalError","message":"database query failed"}
             );
@@ -236,7 +248,12 @@ pub const Server = struct {
         defer aw.deinit();
         const w = &aw.writer;
 
-        w.writeAll("{\"labels\":[") catch return;
+        w.writeAll("{") catch return;
+        // a full page means there may be more; the cursor is the last seq seen
+        if (labels.len == @as(usize, @intCast(limit))) {
+            w.print("\"cursor\":\"{d}\",", .{labels[labels.len - 1].seq}) catch return;
+        }
+        w.writeAll("\"labels\":[") catch return;
 
         for (labels, 0..) |stored, i| {
             if (i > 0) w.writeByte(',') catch return;
@@ -321,6 +338,37 @@ fn percentDecode(buf: []u8, s: []const u8) ?[]const u8 {
     return buf[0..w];
 }
 
+/// %XX-decode into a fresh allocation. Falls back to a copy of the raw value
+/// when the input has malformed escapes.
+fn percentDecodeAlloc(allocator: Allocator, s: []const u8) ![]const u8 {
+    const buf = try allocator.alloc(u8, s.len);
+    const decoded = percentDecode(buf, s) orelse return allocator.dupe(u8, s);
+    return decoded;
+}
+
+/// gather an XRPC array param — repeated `name=` pairs, each of which may also
+/// be a comma-joined list (some clients do that). Values are percent-decoded.
+fn collectListParam(allocator: Allocator, query: []const u8, name: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var pairs = std.mem.splitScalar(u8, query, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        var parts = std.mem.splitScalar(u8, pair[eq + 1 ..], ',');
+        while (parts.next()) |part| {
+            if (part.len == 0) continue;
+            try out.append(allocator, try percentDecodeAlloc(allocator, part));
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseIntParam(query: []const u8, name: []const u8, default: i64, min: i64, max: i64) i64 {
+    const raw = queryParam(query, name) orelse return default;
+    const v = std.fmt.parseInt(i64, raw, 10) catch return default;
+    return std.math.clamp(v, min, max);
+}
+
 fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -390,6 +438,32 @@ test "query param parsing" {
     try std.testing.expectEqualStrings("world", queryParam("foo=hello&bar=world", "bar").?);
     try std.testing.expect(queryParam("foo=hello", "bar") == null);
     try std.testing.expect(queryParam("", "foo") == null);
+}
+
+test "array + int query params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // repeated params, comma-joined values, and percent-encoding all decode
+    const patterns = try collectListParam(
+        alloc,
+        "uriPatterns=did%3Aplc%3Aabc&uriPatterns=at%3A%2F%2Ffoo%2F*,%2A&limit=10",
+        "uriPatterns",
+    );
+    try std.testing.expectEqual(@as(usize, 3), patterns.len);
+    try std.testing.expectEqualStrings("did:plc:abc", patterns[0]);
+    try std.testing.expectEqualStrings("at://foo/*", patterns[1]);
+    try std.testing.expectEqualStrings("*", patterns[2]);
+
+    const missing = try collectListParam(alloc, "limit=10", "sources");
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+
+    try std.testing.expectEqual(@as(i64, 10), parseIntParam("limit=10", "limit", 50, 1, 250));
+    try std.testing.expectEqual(@as(i64, 50), parseIntParam("", "limit", 50, 1, 250));
+    try std.testing.expectEqual(@as(i64, 250), parseIntParam("limit=9999", "limit", 50, 1, 250));
+    try std.testing.expectEqual(@as(i64, 1), parseIntParam("limit=0", "limit", 50, 1, 250));
+    try std.testing.expectEqual(@as(i64, 50), parseIntParam("limit=abc", "limit", 50, 1, 250));
 }
 
 test "event frame structure" {

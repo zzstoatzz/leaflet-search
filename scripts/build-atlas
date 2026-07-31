@@ -565,58 +565,94 @@ def main():
     log(f"  2D range: x=[{X_2d[:,0].min():.2f}, {X_2d[:,0].max():.2f}] y=[{X_2d[:,1].min():.2f}, {X_2d[:,1].max():.2f}]")
 
     # --- step 3: clustering ---
+    # Cluster in a dedicated 10D UMAP, NOT in the 2D display coords. Fitting
+    # HDBSCAN on X_2d makes the projection's own artifacts (tearing, crowding)
+    # into cluster boundaries; measured against PCA-50 cosine space — which
+    # neither projection was fit in — that scored +0.004 coarse / -0.067 fine,
+    # i.e. the fine tier was structured worse than chance. Clustering in 10D
+    # scores +0.033 / +0.017. X_2d stays purely for rendering.
+    log("UMAP 50 → 10 (clustering space)...")
+    cluster_reducer = umap.UMAP(
+        n_components=10,
+        metric="cosine",
+        n_neighbors=30,
+        min_dist=0.0,
+        random_state=42,
+        low_memory=True,
+    )
+    X_10d = cluster_reducer.fit_transform(X_pca)
+
     import hdbscan
 
-    log("HDBSCAN coarse (min_cluster_size=50)...")
-    clusterer_coarse = hdbscan.HDBSCAN(min_cluster_size=50, min_samples=10)
-    labels_coarse_raw = clusterer_coarse.fit_predict(X_2d)
-    n_coarse = len(set(labels_coarse_raw)) - (1 if -1 in labels_coarse_raw else 0)
-    n_outliers_coarse = (labels_coarse_raw == -1).sum()
-    log(f"  {n_coarse} clusters, {n_outliers_coarse} outliers")
+    def cluster_tier(name, min_cluster_size, min_samples):
+        """HDBSCAN in 10D; outliers snapped to the nearest 10D centroid.
 
-    # compute centroids for coarse
-    coarse_centroids = {}
-    for cid in set(labels_coarse_raw):
-        if cid == -1:
-            continue
-        mask = labels_coarse_raw == cid
-        coarse_centroids[cid] = X_2d[mask].mean(axis=0)
+        Returns (labels, centroids_2d, is_core) — centroids are recomputed in
+        display space afterwards, since that's where labels get placed.
+        `is_core` marks points HDBSCAN actually assigned, before snapping.
+        """
+        log(f"HDBSCAN {name} (min_cluster_size={min_cluster_size}) on 10D...")
+        raw = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size, min_samples=min_samples
+        ).fit_predict(X_10d)
+        n_clusters = len(set(raw)) - (1 if -1 in raw else 0)
+        n_out = (raw == -1).sum()
+        log(f"  {n_clusters} clusters, {n_out} outliers ({n_out / len(raw):.1%})")
 
-    labels_coarse = assign_outliers(X_2d, labels_coarse_raw, coarse_centroids)
-    # recompute centroids after outlier assignment
-    for cid in set(labels_coarse):
-        mask = labels_coarse == cid
-        coarse_centroids[cid] = X_2d[mask].mean(axis=0)
+        centroids_10d = {}
+        for cid in set(raw):
+            if cid == -1:
+                continue
+            centroids_10d[cid] = X_10d[raw == cid].mean(axis=0)
 
-    log("HDBSCAN fine (min_cluster_size=20)...")
-    clusterer_fine = hdbscan.HDBSCAN(min_cluster_size=20, min_samples=3)
-    labels_fine_raw = clusterer_fine.fit_predict(X_2d)
-    n_fine = len(set(labels_fine_raw)) - (1 if -1 in labels_fine_raw else 0)
-    n_outliers_fine = (labels_fine_raw == -1).sum()
-    log(f"  {n_fine} clusters, {n_outliers_fine} outliers")
+        labels = assign_outliers(X_10d, raw, centroids_10d)
 
-    fine_centroids = {}
-    for cid in set(labels_fine_raw):
-        if cid == -1:
-            continue
-        mask = labels_fine_raw == cid
-        fine_centroids[cid] = X_2d[mask].mean(axis=0)
+        centroids_2d = {}
+        for cid in set(labels):
+            centroids_2d[cid] = X_2d[labels == cid].mean(axis=0)
+        return labels, centroids_2d, raw != -1
 
-    labels_fine = assign_outliers(X_2d, labels_fine_raw, fine_centroids)
-    for cid in set(labels_fine):
-        mask = labels_fine == cid
-        fine_centroids[cid] = X_2d[mask].mean(axis=0)
+    labels_coarse, coarse_centroids, core_coarse = cluster_tier("coarse", 50, 10)
+    labels_fine, fine_centroids, core_fine = cluster_tier("fine", 20, 3)
 
     # --- step 4: labels via c-TF-IDF + optional LLM refinement ---
     log("computing cluster labels (c-TF-IDF on titles)...")
 
-    coarse_titles: dict[int, list[str]] = {}
-    fine_titles: dict[int, list[str]] = {}
+    # Label evidence comes from CORE members only — points HDBSCAN actually
+    # assigned, not the ~40% it calls noise and assign_outliers snaps to a
+    # nearest centroid for display. Snapped points are ~2.6x further from the
+    # centroid they inherit than real members, and they make up a median 36%
+    # (coarse) / 42% (fine) of each cluster's titles, so pooling them blurs
+    # the vocabulary the label is drawn from. On a ~53k-doc corpus this
+    # changes 61% of coarse and 70% of fine labels — e.g. "startup marketing
+    # video" -> "startup microsoft senior".
+    #
+    # Cluster ids always originate from core points, but a cluster whose core
+    # members all have empty titles would end up with no evidence at all, so
+    # fall back to the full membership in that case rather than emitting
+    # "cluster 47".
+    coarse_titles: dict[int, list[str]] = {int(c): [] for c in coarse_centroids}
+    fine_titles: dict[int, list[str]] = {int(c): [] for c in fine_centroids}
+    coarse_all: dict[int, list[str]] = {int(c): [] for c in coarse_centroids}
+    fine_all: dict[int, list[str]] = {int(c): [] for c in fine_centroids}
     for i, meta in enumerate(metadata):
         title = meta.get("title", "")
-        if title:
-            coarse_titles.setdefault(int(labels_coarse[i]), []).append(title)
-            fine_titles.setdefault(int(labels_fine[i]), []).append(title)
+        if not title:
+            continue
+        cc, cf = int(labels_coarse[i]), int(labels_fine[i])
+        coarse_all[cc].append(title)
+        fine_all[cf].append(title)
+        if core_coarse[i]:
+            coarse_titles[cc].append(title)
+        if core_fine[i]:
+            fine_titles[cf].append(title)
+
+    for cid, titles in coarse_titles.items():
+        if not titles:
+            coarse_titles[cid] = coarse_all[cid]
+    for cid, titles in fine_titles.items():
+        if not titles:
+            fine_titles[cid] = fine_all[cid]
 
     coarse_labels = cluster_labels(coarse_titles)
     fine_labels = cluster_labels(fine_titles)

@@ -2038,7 +2038,10 @@
           uriToIndex.set(d.points[i].uri, i);
         }
         // build cluster metadata: fine cluster array, dominant platform, spatial radius
-        clusterFineArr = new Uint8Array(n);
+        // Uint16, not Uint8: fine cluster ids run into the hundreds, and
+        // truncation aliased distant clusters together (id 300 → 44), which
+        // drew connection lines between unrelated documents.
+        clusterFineArr = new Uint16Array(n);
         var coarsePlatCounts = {};
         var finePlatCounts = {};
         for (var i = 0; i < n; i++) {
@@ -2108,8 +2111,7 @@
         // Gather each fine cluster's member coords, trim far-flung outliers so
         // the cloud hugs the dense core, then stride-sample down to a small cap.
         // The render pass stamps a soft halo sprite at each of these to build an
-        // organic translucent nebula. Full int cluster ids (not the Uint8 array,
-        // which truncates past 255 fine clusters).
+        // organic translucent nebula.
         var finePts = {};
         for (var i = 0; i < n; i++) {
           var cf = d.points[i].clusterFine;

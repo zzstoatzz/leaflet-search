@@ -193,9 +193,12 @@ const TrendingByAuthorQuery = zql.Query(
 // Curator-filtered variants: docs that a specific recommender DID has
 // recommended. Different intent from author: "show me what they read &
 // liked" (curator) vs "show me what they wrote that got recommended"
-// (author). Uses an EXISTS subquery so the outer aggregation still counts
-// ALL recommenders for each doc (the displayed total reflects popularity,
-// not just this curator's contribution).
+// (author). The curator's recommends drive the join from a subquery-in-FROM
+// (one idx_recommends_did dive, then point lookups per curated doc) — the
+// old correlated-EXISTS shape made Turso SCAN all of `documents` and probe
+// the curator's whole recommend list per row (28s observed live). The outer
+// aggregation still counts ALL recommenders for each doc (the displayed
+// total reflects popularity, not just this curator's contribution).
 const TopByCuratorQuery = zql.Query(
     \\SELECT d.uri, d.did, d.title, COALESCE(d.created_at, '') AS created_at,
     \\  d.rkey, COALESCE(d.base_path, '') AS base_path, d.platform,
@@ -205,10 +208,10 @@ const TopByCuratorQuery = zql.Query(
     \\    WHEN DATE(COALESCE(NULLIF(r.created_at, ''), r.indexed_at)) >= DATE('now', ?)
     \\    THEN r.did END) AS recommend_count,
     \\  COUNT(DISTINCT r.did) AS total_count
-    \\FROM documents d
+    \\FROM (SELECT DISTINCT document_uri FROM recommends WHERE did = ?) c
+    \\JOIN documents d ON d.uri = c.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
     \\JOIN recommends r ON r.document_uri = d.uri
-    \\WHERE EXISTS (SELECT 1 FROM recommends r2 WHERE r2.document_uri = d.uri AND r2.did = ?)
     \\GROUP BY d.uri
     \\HAVING recommend_count > 0
     \\ORDER BY recommend_count DESC, d.created_at DESC
@@ -224,10 +227,10 @@ const TrendingByCuratorQuery = zql.Query(
     \\    WHEN DATE(COALESCE(NULLIF(r.created_at, ''), r.indexed_at)) >= DATE('now', ?)
     \\    THEN r.did END) AS recommend_count,
     \\  COUNT(DISTINCT r.did) AS total_count
-    \\FROM documents d
+    \\FROM (SELECT DISTINCT document_uri FROM recommends WHERE did = ?) c
+    \\JOIN documents d ON d.uri = c.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
     \\JOIN recommends r ON r.document_uri = d.uri
-    \\WHERE EXISTS (SELECT 1 FROM recommends r2 WHERE r2.document_uri = d.uri AND r2.did = ?)
     \\GROUP BY d.uri
     \\HAVING recommend_count > 0
     \\ORDER BY CAST(recommend_count AS REAL)
@@ -288,9 +291,8 @@ const RecentByAuthorQuery = zql.Query(
 );
 
 // curator-filtered: docs THEY recommended, ordered by when THEY recommended
-// them (the CASE picks this curator's own recommend rows out of the join).
-// Params, in textual order: (1) window date-mod, (2) curator for EXISTS,
-// (3) curator for the ORDER BY CASE.
+// them (curated_at comes from the driving subquery, so no per-row CASE in
+// the ORDER BY). Params, in textual order: (1) window date-mod, (2) curator.
 const RecentByCuratorQuery = zql.Query(
     \\SELECT d.uri, d.did, d.title, COALESCE(d.created_at, '') AS created_at,
     \\  d.rkey, COALESCE(d.base_path, '') AS base_path, d.platform,
@@ -300,13 +302,16 @@ const RecentByCuratorQuery = zql.Query(
     \\    WHEN DATE(COALESCE(NULLIF(r.created_at, ''), r.indexed_at)) >= DATE('now', ?)
     \\    THEN r.did END) AS recommend_count,
     \\  COUNT(DISTINCT r.did) AS total_count
-    \\FROM documents d
+    \\FROM (
+    \\  SELECT document_uri, MAX(COALESCE(NULLIF(created_at, ''), indexed_at)) AS curated_at
+    \\  FROM recommends WHERE did = ? GROUP BY document_uri
+    \\) c
+    \\JOIN documents d ON d.uri = c.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
     \\JOIN recommends r ON r.document_uri = d.uri
-    \\WHERE EXISTS (SELECT 1 FROM recommends r2 WHERE r2.document_uri = d.uri AND r2.did = ?)
     \\GROUP BY d.uri
     \\HAVING recommend_count > 0
-    \\ORDER BY MAX(CASE WHEN r.did = ? THEN COALESCE(NULLIF(r.created_at, ''), r.indexed_at) END) DESC, d.created_at DESC
+    \\ORDER BY MAX(c.curated_at) DESC, d.created_at DESC
     \\LIMIT 250
 );
 
@@ -439,7 +444,7 @@ pub fn fetch(alloc: Allocator, window: Window, sort: Sort, filter: Filter) ![]co
             break :blk switch (sort) {
                 .top => c.query(TopByCuratorQuery.positional, &.{ date_mod, did }) catch return failEnvelope(&output),
                 .trending => c.query(TrendingByCuratorQuery.positional, &.{ date_mod, did }) catch return failEnvelope(&output),
-                .recent => c.query(RecentByCuratorQuery.positional, &.{ date_mod, did, did }) catch return failEnvelope(&output),
+                .recent => c.query(RecentByCuratorQuery.positional, &.{ date_mod, did }) catch return failEnvelope(&output),
             };
         }
         if (filter.author_did) |did| {

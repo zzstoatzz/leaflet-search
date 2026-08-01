@@ -925,6 +925,13 @@ test "isBridgyPds matches bridgy hosts only" {
     try std.testing.expect(!isBridgyPds("https://pds.example.com/brid.gy"));
 }
 
+test "stripUrlScheme drops fragments (regression: zat.dev devlog hash-route base_path)" {
+    try std.testing.expectEqualStrings("zat.dev", stripUrlScheme("https://zat.dev/#devlog/index").?);
+    try std.testing.expectEqualStrings("zat.dev", stripUrlScheme("https://zat.dev/").?);
+    try std.testing.expectEqualStrings("notes.example.com", stripUrlScheme("https://notes.example.com").?);
+    try std.testing.expectEqualStrings("a.dev/blog", stripUrlScheme("http://a.dev/blog#section").?);
+}
+
 test "showInDiscover: false is extracted, absent defaults to discoverable" {
     const opted_out =
         \\{"$type":"site.standard.publication","url":"https://notes.example.com","name":"notes","preferences":{"showInDiscover":false}}
@@ -967,12 +974,17 @@ test "rkeyFromUri" {
 
 fn stripUrlScheme(url: ?[]const u8) ?[]const u8 {
     const u = url orelse return null;
-    const without_scheme = if (mem.startsWith(u8, u, "https://"))
+    var without_scheme = if (mem.startsWith(u8, u, "https://"))
         u["https://".len..]
     else if (mem.startsWith(u8, u, "http://"))
         u["http://".len..]
     else
         u;
+    // fragments are client-side routes, never part of the base: a publication
+    // url like https://zat.dev/#devlog/index would otherwise bake "#devlog/…"
+    // into base_path and every derived doc link becomes a broken SPA route
+    if (mem.indexOfScalar(u8, without_scheme, '#')) |hash|
+        without_scheme = without_scheme[0..hash];
     // strip trailing slash to avoid double-slash when combined with path
     if (without_scheme.len > 1 and without_scheme[without_scheme.len - 1] == '/')
         return without_scheme[0 .. without_scheme.len - 1];

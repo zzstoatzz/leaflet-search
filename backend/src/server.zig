@@ -239,6 +239,8 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
 
     const labeled_pref = parseQueryParam(alloc, target, "labeled") catch null;
     const show_labeled = labeled_pref != null and mem.eql(u8, labeled_pref.?, "show");
+    const hidden_pref = parseQueryParam(alloc, target, "hidden") catch null;
+    const show_hidden = hidden_pref != null and mem.eql(u8, hidden_pref.?, "show");
 
     // Retrieve the full requested prefix plus one policy-visible row. Paging
     // is then a pure slice of a stable ranking, and that extra row is the
@@ -254,6 +256,7 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     const raw_results = search.search(alloc, query, tag_filter, platform_filter, since_filter, author_filter, mode, .{
         .max_results = result_window,
         .show_labeled = show_labeled,
+        .show_hidden = show_hidden,
     }) catch |err| {
         logfire.err("search failed: {}", .{err});
         metrics.stats.recordError();

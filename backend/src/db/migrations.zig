@@ -381,6 +381,14 @@ pub const migrations = [_]zug.Migration{
         // PDS-backfill writes populate it directly.
         .sql = "ALTER TABLE documents ADD COLUMN source_cid TEXT",
     },
+    .{
+        .id = "021_add_publications_show_in_discover",
+        .name = "persist site.standard.publication preferences.showInDiscover",
+        // 1 = discoverable (the lexicon default when preferences are absent).
+        // 0 = the publication opted out of discovery surfaces; still indexed,
+        // but hidden from search results unless the caller asks (hidden=show).
+        .sql = "ALTER TABLE publications ADD COLUMN show_in_discover INTEGER NOT NULL DEFAULT 1",
+    },
 };
 
 // --- tests ---

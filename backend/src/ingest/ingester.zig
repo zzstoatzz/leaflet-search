@@ -481,7 +481,11 @@ fn processPublication(_: Allocator, uri: []const u8, did: []const u8, rkey: []co
         }
     }
 
-    try indexer.insertPublication(uri, did, rkey, name, description, base_path);
+    // site.standard.publication preferences.showInDiscover: absent means
+    // discoverable (matches ecosystem default — most records omit it).
+    const show_in_discover = zat.json.getBool(record_val, "preferences.showInDiscover") orelse true;
+
+    try indexer.insertPublication(uri, did, rkey, name, description, base_path, show_in_discover);
     logfire.counter("ingest.publications_indexed", 1);
 }
 
@@ -919,6 +923,22 @@ test "isBridgyPds matches bridgy hosts only" {
     try std.testing.expect(!isBridgyPds("https://notbrid.gy.example.com"));
     try std.testing.expect(!isBridgyPds("https://mybrid.gy.evil/x"));
     try std.testing.expect(!isBridgyPds("https://pds.example.com/brid.gy"));
+}
+
+test "showInDiscover: false is extracted, absent defaults to discoverable" {
+    const opted_out =
+        \\{"$type":"site.standard.publication","url":"https://notes.example.com","name":"notes","preferences":{"showInDiscover":false}}
+    ;
+    var parsed_out = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, opted_out, .{});
+    defer parsed_out.deinit();
+    try std.testing.expectEqual(false, zat.json.getBool(parsed_out.value, "preferences.showInDiscover") orelse true);
+
+    const no_prefs =
+        \\{"$type":"site.standard.publication","url":"https://notes.example.com","name":"notes"}
+    ;
+    var parsed_abs = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, no_prefs, .{});
+    defer parsed_abs.deinit();
+    try std.testing.expectEqual(true, zat.json.getBool(parsed_abs.value, "preferences.showInDiscover") orelse true);
 }
 
 test "pckt sidecar exposes the referenced publication uri" {

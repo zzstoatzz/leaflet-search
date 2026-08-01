@@ -49,7 +49,7 @@ pub const BUILD_DOC_COUNT_SQL =
     "AND did NOT IN (" ++ policy.banned_dids_sql ++ ")";
 
 const BUILD_PUB_SQL =
-    "SELECT uri, did, rkey, name, description, base_path, platform, indexed_at " ++
+    "SELECT uri, did, rkey, name, description, base_path, platform, indexed_at, COALESCE(show_in_discover, 1) " ++
     "FROM publications WHERE did NOT IN (" ++ policy.banned_dids_sql ++ ")";
 
 // watermark-pinned like documents (NULL indexed_at sorts as old → included)
@@ -281,8 +281,8 @@ fn insertPublicationLocal(conn: zqlite.Conn, row: anytype) !void {
     // insert into main table (no created_at - Turso publications table doesn't have it)
     conn.exec(
         \\INSERT OR REPLACE INTO publications
-        \\(uri, did, rkey, name, description, base_path, platform, indexed_at)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        \\(uri, did, rkey, name, description, base_path, platform, indexed_at, show_in_discover)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     , .{
         row.text(0), // uri
         row.text(1), // did
@@ -292,6 +292,7 @@ fn insertPublicationLocal(conn: zqlite.Conn, row: anytype) !void {
         row.text(5), // base_path
         row.text(6), // platform
         row.text(7), // indexed_at
+        row.int(8), // show_in_discover
     }) catch |err| {
         return err;
     };

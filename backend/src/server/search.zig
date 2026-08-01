@@ -14,6 +14,9 @@ pub const Options = struct {
     /// can slice the page and determine hasMore without guessing.
     max_results: usize = 21,
     show_labeled: bool = false,
+    /// Publications with preferences.showInDiscover=false are indexed but
+    /// excluded from results unless the caller passes hidden=show.
+    show_hidden: bool = false,
 };
 
 pub const SearchMode = enum {
@@ -473,6 +476,32 @@ fn includeDid(did: []const u8, show_labeled: bool) bool {
     return show_labeled or !classifier.isLabeledDid(did) or policy.isKept(did);
 }
 
+/// Doc belongs to a publication that opted out of discovery
+/// (site.standard.publication preferences.showInDiscover=false). Point lookup
+/// against the local replica, same pattern as isBridgyFed; if the replica is
+/// unavailable, err on showing.
+fn isHiddenDocUri(uri: []const u8) bool {
+    const local = db.getLocalDb() orelse return false;
+    var rows = local.query(
+        \\SELECT 1 FROM documents d
+        \\JOIN publications p ON d.publication_uri = p.uri
+        \\WHERE d.uri = ? AND COALESCE(p.show_in_discover, 1) = 0
+    , .{uri}) catch return false;
+    defer rows.deinit();
+    return rows.next() != null;
+}
+
+/// Publication itself opted out of discovery.
+fn isHiddenPublicationUri(uri: []const u8) bool {
+    const local = db.getLocalDb() orelse return false;
+    var rows = local.query(
+        "SELECT 1 FROM publications WHERE uri = ? AND COALESCE(show_in_discover, 1) = 0",
+        .{uri},
+    ) catch return false;
+    defer rows.deinit();
+    return rows.next() != null;
+}
+
 fn queryCandidateLimit(max_results: usize) usize {
     // Deduplication and policy filtering happen after SQL/ANN retrieval. Fetch
     // a bounded surplus so the requested visible prefix can still be filled.
@@ -694,6 +723,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 const doc = Doc.fromRow(row);
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
+                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -709,6 +739,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 const doc = Doc.fromRow(row);
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
+                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -783,6 +814,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
             if (!includeDid(doc.did, options.show_labeled)) continue;
+            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
             if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
             const uri_dupe = try alloc.dupe(u8, doc.uri);
             try seen_uris.put(uri_dupe, {});
@@ -801,6 +833,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
             if (!includeDid(doc.did, options.show_labeled)) continue;
+            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
             if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -818,6 +851,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, pub_result.did, af)) continue;
             }
             if (!includeDid(pub_result.did, options.show_labeled)) continue;
+            if (!options.show_hidden and isHiddenPublicationUri(pub_result.uri)) continue;
             try jw.write(pub_result.toJson(alloc));
             result_count += 1;
         }
@@ -890,6 +924,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             }
             if (!passesSince(doc.createdAt, since_filter)) continue;
             if (!includeDid(doc.did, options.show_labeled)) continue;
+            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
             if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
             const uri_dupe = try alloc.dupe(u8, doc.uri);
             try seen_uris.put(uri_dupe, {});
@@ -921,6 +956,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             }
             if (!passesSince(doc.createdAt, since_filter)) continue;
             if (!includeDid(doc.did, options.show_labeled)) continue;
+            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
             if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -956,6 +992,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                 }
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
+                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 const uri_dupe = try alloc.dupe(u8, doc.uri);
                 try seen_uris.put(uri_dupe, {});
@@ -1000,6 +1037,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                     continue;
                 }
                 if (!includeDid(doc.did, options.show_labeled)) continue;
+                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
                 if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                     try jw.write(doc.toJson(alloc));
                     result_count += 1;
@@ -1037,6 +1075,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                     }
                 }
                 if (!includeDid(pub_result.did, options.show_labeled)) continue;
+                if (!options.show_hidden and isHiddenPublicationUri(pub_result.uri)) continue;
                 try jw.write(pub_result.toJson(alloc));
                 pub_count += 1;
                 result_count += 1;
@@ -1213,6 +1252,7 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
     const fusion_options: Options = .{
         .max_results = 200,
         .show_labeled = options.show_labeled,
+        .show_hidden = options.show_hidden,
     };
 
     // 1. keyword search (~10ms via local SQLite)
@@ -1380,6 +1420,7 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
 
         // cross-platform dedup: skip if same author+title already emitted
         if (!includeDid(jsonStr(obj, "did"), options.show_labeled)) continue;
+        if (!options.show_hidden and isHiddenDocUri(jsonStr(obj, "uri"))) continue;
         if (try isDuplicateAuthorTitle(&seen_authors, alloc, jsonStr(obj, "did"), jsonStr(obj, "title"))) continue;
 
         const source_label: []const u8 = switch (bits) {
@@ -1498,6 +1539,7 @@ fn searchSemantic(alloc: Allocator, query: []const u8, platform_filter: ?[]const
         if (r.title.len == 0) continue;
         if (isBridgyFed(r.uri)) continue;
         if (!includeDid(r.did, options.show_labeled)) continue;
+        if (!options.show_hidden and isHiddenDocUri(r.uri)) continue;
         if (platform_filter) |pf| {
             if (!std.mem.eql(u8, r.platform, pf)) continue;
         }

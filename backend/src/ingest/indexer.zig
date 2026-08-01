@@ -328,6 +328,7 @@ pub fn insertPublication(
     name: []const u8,
     description: ?[]const u8,
     base_path: ?[]const u8,
+    show_in_discover: bool,
 ) !void {
     const c = db.getClient() orelse return error.NotInitialized;
 
@@ -352,17 +353,18 @@ pub fn insertPublication(
     } else |_| {}
 
     try c.exec(
-        \\INSERT INTO publications (uri, did, rkey, name, description, base_path, indexed_at)
-        \\VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+        \\INSERT INTO publications (uri, did, rkey, name, description, base_path, show_in_discover, indexed_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now'))
         \\ON CONFLICT(uri) DO UPDATE SET
         \\  did = excluded.did,
         \\  rkey = excluded.rkey,
         \\  name = excluded.name,
         \\  description = excluded.description,
         \\  base_path = excluded.base_path,
+        \\  show_in_discover = excluded.show_in_discover,
         \\  indexed_at = strftime('%Y-%m-%dT%H:%M:%S', 'now')
     ,
-        &.{ uri, did, rkey, name, description orelse "", base_path orelse "" },
+        &.{ uri, did, rkey, name, description orelse "", base_path orelse "", if (show_in_discover) "1" else "0" },
     );
 
     // backfill: update documents whose base_path is empty or stale (differs from publication)

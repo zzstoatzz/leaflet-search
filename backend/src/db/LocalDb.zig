@@ -308,7 +308,8 @@ fn createSchema(self: *LocalDb) !void {
         \\  base_path TEXT,
         \\  platform TEXT DEFAULT 'leaflet',
         \\  source_collection TEXT,
-        \\  indexed_at TEXT
+        \\  indexed_at TEXT,
+        \\  show_in_discover INTEGER NOT NULL DEFAULT 1
         \\)
     , .{}) catch |err| {
         std.debug.print("local db: failed to create publications table: {}\n", .{err});
@@ -436,6 +437,7 @@ fn createSchema(self: *LocalDb) !void {
     addColumnIfMissing(c, "documents", "is_bridgyfed", "INTEGER DEFAULT 0");
     addColumnIfMissing(c, "documents", "url_dead", "INTEGER DEFAULT 0");
     addColumnIfMissing(c, "publications", "indexed_at", "TEXT");
+    addColumnIfMissing(c, "publications", "show_in_discover", "INTEGER NOT NULL DEFAULT 1");
 
     // Materialized (did, rkey) for subscriptions so the publication join is a
     // sargable indexed equijoin instead of parsing publication_uri per row (see

@@ -93,23 +93,34 @@ const QUEUE_CAPACITY = 4096;
 
 const IngesterCtx = struct {
     allocator: Allocator,
+    handler: ?*Handler = null,
     drop_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn process(self: *IngesterCtx, _: Io, frame: []u8) void {
         defer self.allocator.free(frame);
         processMessage(self.allocator, frame) catch |err| {
+            // NO ack on failure: the ingester's outbox retransmits the frame
+            // (~60s), so a transient turso error is retried instead of lost.
             logfire.err("message processing error: {}", .{err});
+            return;
         };
+        // ack only after the write batch committed — the ingester releases
+        // the frame from its outbox on this ack (at-least-once, both sides).
+        // this worker is the ONLY ack writer (workers=1); bump workers and
+        // this needs a write lock around the websocket client.
+        if (self.handler) |h| {
+            if (extractMessageId(self.allocator, frame)) |id| h.sendAck(id);
+        }
     }
 
     fn onDrop(self: *IngesterCtx, frame: []u8) void {
         defer self.allocator.free(frame);
-        // every drop is silent loss of an already-ACKed frame — recoverable
-        // only by reconciler/backfill. keep it loud (but bounded) in logs so
-        // the ops dashboard can alert on it.
+        // shed frames were never acked, so the ingester's outbox retransmit
+        // redelivers them — sheds under burst now cost latency, not data.
+        // still loud: sustained shedding means the write path can't keep up.
         const n = self.drop_count.fetchAdd(1, .monotonic) + 1;
         if (n <= 10 or n % 100 == 0) {
-            logfire.warn("ingester: dropped ACKed frame under backpressure ({d} total)", .{n});
+            logfire.warn("ingester: shed unprocessed frame under backpressure ({d} total, outbox will retransmit)", .{n});
         }
     }
 };
@@ -155,20 +166,16 @@ const Handler = struct {
             });
         }
 
-        // extract message ID for ACK
-        const msg_id = extractMessageId(self.allocator, data);
-
-        // ACK immediately — before processing — to keep ingester outbox draining.
-        // processing happens asynchronously in the worker thread.
-        if (msg_id) |id| {
-            self.sendAck(id);
-        } else {
+        if (extractMessageId(self.allocator, data) == null) {
             self.no_id_count += 1;
             if (self.no_id_count <= 5) {
                 logfire.warn("ingester: message has no id, first {d} bytes: {s}", .{ @min(data.len, 100), data[0..@min(data.len, 100)] });
             }
         }
 
+        // NO ack here: the worker acks after its turso batch commits, so the
+        // ingester's outbox holds the frame until it's durably processed —
+        // a shed frame gets retransmitted instead of silently lost.
         // dupe message data (websocket reuses the buffer) and offer to processing pool.
         // drop_oldest shedding means full pool evicts the oldest queued frame, not the new one.
         const data_copy = self.allocator.dupe(u8, data) catch |err| {
@@ -294,6 +301,10 @@ fn connect(allocator: Allocator, io: Io) !void {
     defer pool.shutdown(io);
 
     var handler = Handler{ .allocator = allocator, .io = io, .client = &client, .pool = &pool };
+    // the worker acks through the handler after each commit; safe to set
+    // post-start because no frame arrives until readLoop below begins, and
+    // pool.shutdown (deferred) stops workers before handler leaves scope.
+    ctx.handler = &handler;
 
     var watchdog = Watchdog{ .io = io, .client = &client, .handler = &handler };
     const wd_thread = std.Thread.spawn(.{}, Watchdog.run, .{&watchdog}) catch |err| {

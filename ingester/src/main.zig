@@ -211,7 +211,7 @@ pub fn main() !void {
         break :blk std.fmt.parseInt(u16, s, 10) catch 2480;
     };
 
-    var channel = ch.Channel{ .allocator = allocator };
+    var channel = ch.Channel{ .allocator = allocator, .io = io };
 
     // Both the firehose consumer and the /channel server run as Io-native
     // concurrent tasks sharing one io — zlay's pattern (relay + firehose
@@ -254,10 +254,13 @@ const FirehoseCtx = struct {
 // 20s heartbeat: paired with the backend's ~90s staleness watchdog, so a
 // half-open socket (our restart leaves no RST behind for an idle peer) gets
 // detected and re-dialed instead of hanging the backend's read loop forever.
+// The same cadence drives the outbox retransmit sweep (unacked frames older
+// than the retransmit window get resent; duplicates are idempotent).
 fn runHeartbeat(io: Io, channel: *ch.Channel) void {
     while (true) {
         io.sleep(Io.Duration.fromSeconds(20), .awake) catch {};
         channel.ping();
+        channel.retransmit();
     }
 }
 

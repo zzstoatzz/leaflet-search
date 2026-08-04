@@ -3,6 +3,7 @@
 ## deployment
 - **backend**: push to `main` touching `backend/**` → auto-deploys via GitHub Actions
 - **frontend**: manual deploy via `site/deploy.sh` — regenerates the workbox service worker (precache manifest embeds content hashes) then runs wrangler with `--branch=main`. Don't call wrangler directly or returning visitors get stale precached assets.
+  - ⚠️ `deploy.sh` ships whatever `site/atlas.json` is on disk (gitignored, likely stale) — **always pull the live one first**: `curl -sfo site/atlas.json https://pub-search.waow.tech/atlas.json`. Otherwise you regress prod atlas data until the next 6h `leaflet-atlas` prefect rebuild.
 - **ingester**: manual deploy via `ingester/scripts/deploy.sh` (stages the repo-root `banned-dids.txt` into the build context first, then `fly deploy --app leaflet-search-ingester`). Don't call `fly deploy` directly — the build embeds `../banned-dids.txt` which isn't in `ingester/`'s context without staging.
 - `--app` does NOT protect against deploying from the wrong directory — it only renames the target; the config (ports, env, mounts) still comes from that directory's `fly.toml`. Always `cd` into the app dir first. (2026-06-10: root-dir deploy with `--app leaflet-search-ingester` was stopped only by a volume-name mismatch.)
 

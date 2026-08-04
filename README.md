@@ -69,7 +69,7 @@ a 2D semantic map of the entire document index: [pub-search.waow.tech/atlas](htt
 
 documents are projected from 1024-dim voyage embeddings to 2D via PCA → UMAP, then clustered with HDBSCAN at two granularities. each point is colored by platform. zoom in to see finer cluster labels and individual document titles.
 
-built with `scripts/build-atlas` (batch job, ~20s) → `site/atlas.json` → canvas renderer. see [docs/atlas.md](docs/atlas.md) for details.
+built with `scripts/build-atlas` (batch job; rebuilt every 6h by a prefect flow) → `site/atlas.json` → canvas renderer. see [docs/atlas.md](docs/atlas.md) for details.
 
 ## [stack](https://bsky.app/profile/zzstoatzz.io/post/3mbij5ip4ws2a)
 

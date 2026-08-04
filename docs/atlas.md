@@ -35,11 +35,12 @@ dependencies: `umap-learn`, `hdbscan`, `scikit-learn`, `httpx`, `numpy`, `pydant
 
 `site/atlas.html` + `site/atlas.js` + `site/atlas.css`
 
-- **canvas 2D** renderer — no libraries, sprite-based (pre-rendered offscreen canvas per platform)
-- **pan/zoom** via wheel, drag, touch/pinch (max 15×)
+- **canvas 2D** renderer — no libraries, sprite-based (pre-rendered offscreen canvas per platform); WebGL only for the rotating document planets at deep zoom
+- **pan/zoom** via wheel, drag, touch/pinch (max 500×; documents become rotating planets past ~45×, then flat cards)
 - **semantic zoom**: coarse labels → fine labels → document titles as you zoom in
-- **hover tooltip** with title, author, platform
-- **click** opens document URL
+- **cluster nebulae as lanterns**: one smooth-falloff glow per fine cluster at the weighted center of its members, sized by RMS spread with a bounded peak opacity — wide, translucent, and smooth at every zoom (coarse regions use the same sprite, fading out by ~2.8×)
+- **label economy**: all text competes in one collision pass, placed in priority order — cluster labels (bold landmarks), then document titles ranked by real recommend counts (`/recommended` boost on `popScore`), then publication names with whatever room is left; per-layer caps live in `ATLAS_TUNE.labels`
+- **hover/selection card** with title, publication, platform; **click** opens the document
 - **theme support**: dark (default), light, system — synced with the rest of the site
 
 ## recomputing
@@ -68,7 +69,7 @@ cd site && ./deploy.sh
 
 ## future work
 
-- **outlier fraction**: HDBSCAN calls ~40% of points noise and `assign_outliers` snaps them to a region for display. A `min_samples` sweep (1→25) shows the noise rate never leaves 36-44%, so it's real structure, not a tuning artifact — core points carry median membership probability 0.97-0.99. Labels no longer use these points, but two consumers still do: per-cluster `count` in `atlas.json` is inflated by the snap rate, and fine-cluster nebulae are drawn from post-snap membership. Emitting a core/snapped bit per point would let the frontend fix both.
+- **outlier fraction**: HDBSCAN calls ~40% of points noise and `assign_outliers` snaps them to a region for display. A `min_samples` sweep (1→25) shows the noise rate never leaves 36-44%, so it's real structure, not a tuning artifact — core points carry median membership probability 0.97-0.99. Labels no longer use these points, but two consumers still do: per-cluster `count` in `atlas.json` is inflated by the snap rate, and the fine-cluster lantern centers/spreads are computed from post-snap membership. Emitting a core/snapped bit per point would let the frontend fix both.
 - **exemplar-seeded labels**: feed the LLM the N documents nearest each centroid instead of c-TF-IDF keywords (sembleverse does this) — untested here
 - **hierarchical clustering**: replace the two-strata (coarse/fine) approach with a proper hierarchy (Ward linkage on HDBSCAN centroids + `cut_tree` at multiple levels) for smooth fractal zoom
 - **event-driven rebuild**: trigger off significant index changes instead of the fixed 6h cron

@@ -871,9 +871,11 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
 
 // Tag browse (no FTS text): fully local — document_tags and recommends both
 // live in the replica. Ranked by recency with a recommendation lift: score is
-// months-old minus 3·ln(1+recommenders), so one recommend outranks ~2 months
-// of freshness and heavily-recommended docs sort among themselves, while the
-// ~98% of docs with no recommends keep their newest-first order.
+// months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
+// outranks ~2 months of freshness and heavily-recommended docs sort among
+// themselves, while the ~98% of docs with no recommends keep their
+// newest-first order.
+const RECOMMEND_LIFT = "3.0"; // months of freshness one e-fold of recommenders is worth
 const LOCAL_TAG_BROWSE_SQL =
     \\SELECT d.uri, d.did, d.title, '' as snippet,
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
@@ -891,7 +893,9 @@ const LOCAL_TAG_BROWSE_SQL =
     \\AND (? = '' OR d.created_at >= ?)
     \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
     \\ORDER BY COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0)
-    \\  - 3.0 * ln(1 + COALESCE(r.rc, 0)), d.uri
+    \\  -
+++ RECOMMEND_LIFT ++
+    \\ * ln(1 + COALESCE(r.rc, 0)), d.uri
     \\LIMIT ?
 ;
 

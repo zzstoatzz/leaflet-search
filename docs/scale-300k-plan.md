@@ -5,12 +5,20 @@ onto atproto as standard.site records. planning target: **300k new documents ove
 week** on top of today's ~60k corpus. 300k/week ≈ 0.5 docs/s sustained, but reality is
 bursts — a single publisher may put tens of thousands of records in minutes.
 
-informed by a full audit of this repo's throughput limits and a deep read of
-[typeahead](https://tangled.sh/@zzstoatzz.io/typeahead) (10M+ actors), whose governing
-invariant we adopt as the frame: **no request path may do work proportional to corpus
-size, and ranking work belongs at build time where possible.** typeahead's evidence
-also says FTS5 at 300k–1M docs is squarely inside SQLite's comfort zone — we harden
-the pipeline around FTS, we do not replace it.
+informed by a full audit of this repo's throughput limits and deep reads of two
+sibling systems:
+
+- [typeahead](https://tangled.sh/@zzstoatzz.io/typeahead) (10M+ actors), whose
+  governing invariant we adopt for the serve side: **no request path may do work
+  proportional to corpus size; ranking belongs at build time where possible.**
+  its evidence also says FTS5 at 300k–1M docs is squarely inside SQLite's comfort
+  zone — we harden the pipeline around FTS, we do not replace it.
+- [stream](https://tangled.sh/@zat.dev/stream) (Zig Jetstream V2 reimplementation
+  on zat; 16.7B events archived in its full-network experiment), whose live
+  scheduler is the proven shape for our ingest side: **thin reader thread; verify
+  + DID resolution in a per-DID-FIFO worker pool; per-DID (not global) bounded
+  drop-oldest; durable cursor = min(inflight)−1, committed only after the data it
+  covers is durable.**
 
 ## ranked bottlenecks (from code audit, 2026-08-04)
 
@@ -67,12 +75,35 @@ see which phase grows. (typeahead lesson for later, not now: turso's binary **ex
 endpoint** was ~60× faster than row streaming for them — the escape hatch if paging
 gets slow at 300k+.)
 
-### 1e. take PLC resolution off the firehose thread
-new-DID key resolution must not block readLoop for up to 10s. options, in order of
-preference: (a) park unverified events for that DID in a small pending map and let a
-resolver worker complete them; (b) drop-and-let-reconciler/backfill-catch; (c) at
-minimum cut RESOLVE_DEADLINE_MS to ~2s. an archive influx is exactly the many-new-
-authors case.
+### 1e. restructure the ingester read path on stream's live-scheduler shape
+new-DID key resolution must not block readLoop for up to 10s — and stream shows the
+principled fix rather than a deadline tweak (`stream/src/internal/ingest/pipeline.zig`,
+`verify.zig`, docs/live-scheduler.md):
+
+- **thin reader thread**: readLoop does frame inspection/classification only;
+  verification moves to a worker pool (stream uses 32 for the whole network; a
+  small pool — ~8 — fits our slice).
+- **per-DID FIFO chains**: a worker owns one DID's chain until drained, so events
+  for one author stay ordered while cross-DID work parallelizes. resolution
+  happens *inside* the worker (each worker owns its own keep-alive `zat.DidResolver`),
+  so a slow PLC blocks one worker, not the firehose.
+- **per-DID bounded drop-oldest** (stream: 64/DID) instead of only the global ring:
+  one hot/spammy repo during a burst can't evict everyone else's events. count
+  drops per-DID. beware stream's "workers×2 is one constant" trap: the queue bound
+  and the pool size are coupled — a bounded producer must not outrun its consumer.
+- **LRU key cache, sized generously, never clear-on-full** (stream: 250k entries;
+  clear-on-full causes a resolve stampede — exactly what a many-new-authors influx
+  would trigger). signature mismatch → evict key, re-resolve once (rotation);
+  `#identity` events evict.
+- **typed verify outcomes** (valid / replay / invalid_signature / unverified /
+  needs_resync) with counters, instead of binary pass/drop — this is what makes
+  "dropped ~70% under resync lag" diagnosable, and `needs_resync` becomes a signal
+  the reconciler/backfill can consume instead of silent loss.
+- **cursor semantics**: durable cursor = min(inflight)−1 (monotone, seeded from the
+  stored cursor so replays can't regress it), flushed ~5s, and advanced only after
+  the covered data is durable downstream. today we ACK to the ingester ring before
+  the backend has written turso — under this lens that's an at-most-once gap; the
+  batching work in 1a should move the ACK after the batch commit.
 
 ## phase 2 — during the influx (watch + absorb)
 
@@ -87,7 +118,10 @@ authors case.
 - **recovery playbook**: per-repo catch-up = `/admin/backfill` (single-flight,
   listRecords paging — fine for one publisher, too slow for many). if we drop frames
   across many repos, batch-drive it via `scripts/backfill` overnight rather than
-  hand-triggering.
+  hand-triggering. **do not scale recovery by adding concurrency**: stream measured
+  backfill throughput getting *worse* going 100→200 workers and 200/400 OOM-killing
+  a 15GB box — the lever is per-host accounting/parking (few workers per PDS host),
+  not a bigger pool.
 - **labeler**: 80k puts from one DID is the bulk-generated volume signature.
   archive backfills of composed content (techdirt et al.) must not get flagged —
   pre-exempt known publisher DIDs or gate the volume heuristic on account age /

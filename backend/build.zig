@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     const zqlite = b.dependency("zqlite", .{
         .target = target,
         .optimize = optimize,
-        .sqlite3 = &[_][]const u8{ "-std=c99", "-DSQLITE_ENABLE_FTS5" },
+        .sqlite3 = &[_][]const u8{ "-std=c99", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_MATH_FUNCTIONS" },
     });
 
     const logfire = b.dependency("logfire", .{

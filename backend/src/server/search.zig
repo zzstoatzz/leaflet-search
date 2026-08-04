@@ -869,10 +869,78 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
     return sql ++ "\n" ++ LOCAL_DOC_RECENCY_ORDER;
 }
 
+// Tag browse (no FTS text): fully local — document_tags and recommends both
+// live in the replica. Ranked by recency with a recommendation lift: score is
+// months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
+// outranks ~2 months of freshness and heavily-recommended docs sort among
+// themselves, while the ~98% of docs with no recommends keep their
+// newest-first order.
+const RECOMMEND_LIFT = "3.0"; // months of freshness one e-fold of recommenders is worth
+const LOCAL_TAG_BROWSE_SQL =
+    \\SELECT d.uri, d.did, d.title, '' as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(p.name, '') as publication_name
+    \\FROM document_tags dt
+    \\JOIN documents d ON d.uri = dt.document_uri
+    \\LEFT JOIN publications p ON d.publication_uri = p.uri
+    \\LEFT JOIN (
+    \\  SELECT document_uri, COUNT(DISTINCT did) AS rc
+    \\  FROM recommends GROUP BY document_uri
+    \\) r ON r.document_uri = d.uri
+    \\WHERE dt.tag = ? AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
+    \\AND (? = '' OR d.created_at >= ?)
+    \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
+    \\ORDER BY COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0)
+    \\  -
+++ RECOMMEND_LIFT ++
+    \\ * ln(1 + COALESCE(r.rc, 0)), d.uri
+    \\LIMIT ?
+;
+
+fn searchLocalTagBrowse(alloc: Allocator, local: *db.LocalDb, tag: []const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, options: Options) ![]const u8 {
+    const platform_val: []const u8 = platform_filter orelse "";
+    const author_val: []const u8 = author_filter orelse "";
+    const since_val: []const u8 = since_filter orelse "";
+
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    errdefer output.deinit();
+    var jw: json.Stringify = .{ .writer = &output.writer };
+    try jw.beginArray();
+
+    var seen_authors = std.StringHashMap(void).init(alloc);
+    defer seen_authors.deinit();
+
+    var result_count: usize = 0;
+    var rows = try local.query(LOCAL_TAG_BROWSE_SQL, .{
+        tag,        platform_val, platform_val,
+        author_val, author_val,   since_val,
+        since_val,  queryCandidateLimit(options.max_results),
+    });
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        if (result_count >= options.max_results) break;
+        const doc = Doc.fromLocalRow(row);
+        if (!includeDid(doc.did, options.show_labeled)) continue;
+        if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+        if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
+        try jw.write(doc.toJson(alloc));
+        result_count += 1;
+    }
+
+    try jw.endArray();
+    return try output.toOwnedSlice();
+}
+
 fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filter: ?[]const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, options: Options) ![]const u8 {
     // only handle basic FTS queries for now (most common case)
     // fall back to Turso for complex filter combinations and author-only browse
-    if (query.len == 0 or tag_filter != null) {
+    if (tag_filter) |tag| {
+        if (query.len == 0) return searchLocalTagBrowse(alloc, local, tag, platform_filter, since_filter, author_filter, options);
+        return error.UnsupportedQuery; // FTS text + tag still falls back to Turso
+    }
+    if (query.len == 0) {
         return error.UnsupportedQuery;
     }
 
@@ -1957,4 +2025,117 @@ test "buildDocUrl: path without leading slash gets separator" {
     const url = buildDocUrl(std.testing.allocator, "article", "pckt", "example.com", "posts/hello", "rk", "did:plc:x");
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://example.com/posts/hello", url);
+}
+
+test "local tag browse: recommend-lifted ranking, correct order at corpus scale" {
+    const zqlite = @import("zqlite");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+
+    var path_buf: [64]u8 = undefined;
+    const zpath = std.fmt.bufPrintZ(&path_buf, "/tmp/tag-browse-{d}.db", .{std.c.getpid()}) catch unreachable;
+    const cleanup = struct {
+        fn rm(p: []const u8) void {
+            var b: [80]u8 = undefined;
+            inline for (.{ "", "-wal", "-shm" }) |sfx| {
+                const z = std.fmt.bufPrintZ(&b, "{s}{s}", .{ p, sfx }) catch return;
+                _ = std.c.unlink(z.ptr);
+            }
+        }
+    };
+    cleanup.rm(zpath);
+    defer cleanup.rm(zpath);
+
+    {
+        const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+        defer w.close();
+        try w.exec(
+            \\CREATE TABLE documents (
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  created_at TEXT, publication_uri TEXT, platform TEXT,
+            \\  path TEXT, base_path TEXT, has_publication INTEGER,
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\)
+        , .{});
+        try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, name TEXT)", .{});
+        try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT)", .{});
+        try w.exec("CREATE INDEX idx_document_tags_tag ON document_tags(tag)", .{});
+        try w.exec("CREATE TABLE recommends (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, document_uri TEXT, created_at TEXT, indexed_at TEXT)", .{});
+        try w.exec("CREATE INDEX idx_recommends_document_uri ON recommends(document_uri)", .{});
+
+        // 60k docs spread over ~700 days, every 80th tagged "photography" (~750)
+        try w.exec(
+            \\WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 60000)
+            \\INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image)
+            \\SELECT 'at://doc/' || i, 'did:plc:x' || (i % 500), 'r' || i, 'title ' || i, '',
+            \\  datetime('now', '-' || (i % 700) || ' days'), 'other', '', 0, '', ''
+            \\FROM seq
+        , .{});
+        try w.exec(
+            \\INSERT INTO document_tags SELECT 'at://doc/' || (80 * n), 'photography'
+            \\FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 750) SELECT n FROM s)
+        , .{});
+
+        // four probe docs with chosen ages and recommend counts:
+        //   A: 100d old, 6 recs  -> 3.33 - 3ln7  = -2.51
+        //   C: 200d old, 12 recs -> 6.67 - 3ln13 = -1.03
+        //   D:  40d old, 1 rec   -> 1.33 - 3ln2  = -0.75
+        //   B:  10d old, 0 recs  -> 0.33
+        // expected order: A, C, D, ... B somewhere after (fresh untagged-by-recs
+        // docs can slot between D and B, but never above A/C/D)
+        inline for (.{
+            .{ "A", 100, 6 }, .{ "B", 10, 0 }, .{ "C", 200, 12 }, .{ "D", 40, 1 },
+        }) |probe| {
+            var sql_buf: [512]u8 = undefined;
+            const ins = try std.fmt.bufPrintZ(&sql_buf,
+                "INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) " ++
+                    "VALUES ('at://probe/{s}', 'did:plc:probe{s}', 'rk{s}', 'probe {s}', '', datetime('now', '-{d} days'), 'other', '', 0, '', '')",
+                .{ probe[0], probe[0], probe[0], probe[0], probe[1] });
+            try w.exec(ins, .{});
+            try w.exec("INSERT INTO document_tags VALUES ('at://probe/" ++ probe[0] ++ "', 'photography')", .{});
+            var r: usize = 0;
+            while (r < probe[2]) : (r += 1) {
+                var rec_buf: [256]u8 = undefined;
+                const rec = try std.fmt.bufPrintZ(&rec_buf,
+                    "INSERT INTO recommends VALUES ('at://rec/{s}/{d}', 'did:plc:fan{d}', 'rr{d}', 'at://probe/{s}', '', '')",
+                    .{ probe[0], r, r, r, probe[0] });
+                try w.exec(rec, .{});
+            }
+        }
+    }
+
+    var ldb = db.LocalDb.init(std.testing.allocator, tio);
+    for (&ldb.read_pool) |*slot| slot.* = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadOnly);
+    defer for (&ldb.read_pool) |*slot| {
+        if (slot.*) |c| c.close();
+        slot.* = null;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // warm once, then measure
+    _ = try searchLocalTagBrowse(arena.allocator(), &ldb, "photography", null, null, null, .{ .show_hidden = true });
+    var best_us: i64 = std.math.maxInt(i64);
+    var out: []const u8 = "";
+    var run: usize = 0;
+    while (run < 5) : (run += 1) {
+        const t0 = std.Io.Timestamp.now(tio, .awake).toMicroseconds();
+        out = try searchLocalTagBrowse(arena.allocator(), &ldb, "photography", null, null, null, .{ .show_hidden = true });
+        const us = std.Io.Timestamp.now(tio, .awake).toMicroseconds() - t0;
+        if (us < best_us) best_us = us;
+    }
+    std.debug.print("\nlocal tag browse over 60k docs / 754 tagged: best of 5 = {d} us\n", .{best_us});
+
+    // recommend-lifted order: A, C, D lead in that order; B trails all three
+    const ia = std.mem.indexOf(u8, out, "at://probe/A").?;
+    const ic = std.mem.indexOf(u8, out, "at://probe/C").?;
+    const id_ = std.mem.indexOf(u8, out, "at://probe/D").?;
+    const ib = std.mem.indexOf(u8, out, "at://probe/B") orelse out.len;
+    try std.testing.expect(ia < ic and ic < id_);
+    try std.testing.expect(id_ < ib);
+    // and the three recommended probes beat every unrecommended doc
+    const first_plain = std.mem.indexOf(u8, out, "at://doc/") orelse out.len;
+    try std.testing.expect(id_ < first_plain);
 }

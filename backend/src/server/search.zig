@@ -874,7 +874,9 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
 // months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
 // outranks ~2 months of freshness and heavily-recommended docs sort among
 // themselves, while the ~98% of docs with no recommends keep their
-// newest-first order.
+// newest-first order. recommend_counts is materialized once per boot
+// (LocalDb.createSchema) — a PK-probe join here instead of aggregating all
+// of recommends per request, which was the last O(corpus) request path.
 const RECOMMEND_LIFT = "3.0"; // months of freshness one e-fold of recommenders is worth
 const LOCAL_TAG_BROWSE_SQL =
     \\SELECT d.uri, d.did, d.title, '' as snippet,
@@ -885,10 +887,7 @@ const LOCAL_TAG_BROWSE_SQL =
     \\FROM document_tags dt
     \\JOIN documents d ON d.uri = dt.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\LEFT JOIN (
-    \\  SELECT document_uri, COUNT(DISTINCT did) AS rc
-    \\  FROM recommends GROUP BY document_uri
-    \\) r ON r.document_uri = d.uri
+    \\LEFT JOIN recommend_counts r ON r.document_uri = d.uri
     \\WHERE dt.tag = ? AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
     \\AND (? = '' OR d.created_at >= ?)
     \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
@@ -2109,6 +2108,18 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
             \\FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 750) SELECT n FROM s)
         , .{});
 
+        // corpus-scale recommends (30k rows over 15k docs): the browse query
+        // must NOT aggregate these per request — recommend_counts is
+        // materialized below, and this bulk keeps the perf number honest
+        // about that (with 19 rows the old per-request GROUP BY was free).
+        try w.exec(
+            \\WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 30000)
+            \\INSERT INTO recommends
+            \\SELECT 'at://rec/bulk/' || i, 'did:plc:fan' || (i % 2000), 'rb' || i,
+            \\  'at://doc/' || (2 * (i % 15000) + 1), '', ''
+            \\FROM seq
+        , .{});
+
         // four probe docs with chosen ages and recommend counts:
         //   A: 100d old, 6 recs  -> 3.33 - 3ln7  = -2.51
         //   C: 200d old, 12 recs -> 6.67 - 3ln13 = -1.03
@@ -2141,6 +2152,9 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
         const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadWrite);
         defer w.close();
         try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        // mirrors LocalDb.createSchema's per-boot materialization
+        try w.exec("CREATE TABLE recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER NOT NULL)", .{});
+        try w.exec("INSERT INTO recommend_counts SELECT document_uri, COUNT(DISTINCT did) FROM recommends GROUP BY document_uri", .{});
     }
 
     var ldb = db.LocalDb.init(std.testing.allocator, tio);

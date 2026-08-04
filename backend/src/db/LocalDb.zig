@@ -452,6 +452,23 @@ fn createSchema(self: *LocalDb) !void {
         " WHERE publication_did IS NULL AND publication_uri LIKE 'at://%/%/%'";
     c.exec(sub_backfill_sql, .{}) catch |err| std.debug.print("local db: subscriptions pubkey backfill failed: {}\n", .{err});
     c.exec("CREATE INDEX IF NOT EXISTS idx_subscriptions_pub_did_rkey ON subscriptions(publication_did, publication_rkey)", .{}) catch {};
+
+    // Materialized per-document recommender counts. Tag browse ranks by
+    // ln(1+recommenders); computing that with a GROUP BY over ALL of
+    // recommends on every request was the last O(corpus) request path
+    // (docs/scale-300k-plan.md §3a — typeahead's rule: ranking work belongs
+    // at build time). The replica is frozen between adoptions and adoption
+    // always restarts through here, so one rebuild per boot keeps the table
+    // exactly consistent with the snapshot's recommends at request-time cost
+    // zero. No schema-version bump: the table is server-generated, never
+    // shipped in snapshots.
+    c.exec("CREATE TABLE IF NOT EXISTS recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER NOT NULL)", .{}) catch |err| {
+        std.debug.print("local db: failed to create recommend_counts table: {}\n", .{err});
+    };
+    c.exec("DELETE FROM recommend_counts", .{}) catch {};
+    c.exec("INSERT INTO recommend_counts SELECT document_uri, COUNT(DISTINCT did) FROM recommends GROUP BY document_uri", .{}) catch |err| {
+        std.debug.print("local db: recommend_counts rebuild failed: {}\n", .{err});
+    };
 }
 
 fn hasColumn(c: zqlite.Conn, table: []const u8, column: []const u8) bool {

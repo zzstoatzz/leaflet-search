@@ -33,6 +33,23 @@ key decisions (see [search-syntax.md](search-syntax.md) for the user-facing refe
 - **unicode61 tokenizer** splits on non-alphanumeric (we match this in buildFtsQuery)
 - **recency decay** boosts recent docs: `ORDER BY rank + (days_old / 30)`
 
+### local-first routing (2026-08-04)
+
+`searchKeyword` tries the local replica first (`searchLocal`) and falls back to
+Turso only on error or when the replica isn't ready. Served locally:
+
+- **FTS text queries** (with any of platform/since/author): BM25 + recency
+- **tag browse** (tag, no text): ranked `months_old − RECOMMEND_LIFT·ln(1+recommenders)`
+  — the replica carries `document_tags` and `recommends`, so one recommend
+  outranks ~2 months of freshness while unrecommended docs stay newest-first
+- **text within a tag**: BM25 + recency restricted to the tag's documents.
+  ⚠️ the tag restriction is an `IN` subquery, NOT a join — a join let SQLite
+  drive from the tag index and probe FTS per row (~8s on the real corpus).
+  An `EXPLAIN QUERY PLAN` test asserts the FTS index drives; keep it passing.
+
+Author-only browse still goes to Turso. Before 2026-08-04 every tag query did
+too (2–8s per request); local serving is double-digit ms.
+
 ### what's coupled to FTS5
 
 all in `backend/src/server/search.zig`:

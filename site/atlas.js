@@ -102,7 +102,8 @@
   var platformIdx = null;
   var gridIndex = null;
   var uriToIndex = null; // Map<uri, index> for search matching
-  var clusterFineArr = null; // Uint8Array of fine cluster IDs per point
+  var clusterFineArr = null; // Uint16Array of fine cluster IDs per point
+  var pointHueArr = null; // Uint8Array: hue step for 'other' points, 255 = platform color
 
   // --- popularity / label ranking ---
   // popScore[i] = how "popular" point i is (publication size + real recommend
@@ -316,6 +317,7 @@
   var spriteSize = 0;
   var spriteTheme = null;
   var spriteStarness = -1;
+  var spriteRadius = 0;
 
   function mixHex(hex, target, t) {
     var a = parseHex(hex), b = parseHex(target);
@@ -336,7 +338,9 @@
     spriteSize = size;
     spriteTheme = theme;
     spriteStarness = starness;
+    spriteRadius = radius;
     sprites = [];
+    hueSprites = {}; // hue variants rebuild lazily against the new params
     for (var p = 0; p < PLATFORMS.length; p++) {
       var c = frameColors[PLATFORMS[p]];
       sprites.push({
@@ -344,6 +348,23 @@
         hover:  makeSprite(Math.ceil(size * 1.5), radius * dpr * 1.3, c, 1.0, true, starness * 0.5),
       });
     }
+  }
+
+  // 'other' points take their fine cluster's hue (the same 24-step palette as
+  // the lanterns) so the dominant-platform gray doesn't wash the dense areas
+  // into one monotonous mass. Built lazily per hue step, invalidated whenever
+  // buildSprites rebuilds the platform set.
+  var hueSprites = {};
+  function getHueSprite(step) {
+    var e = hueSprites[step];
+    if (!e) {
+      var c = hueColorsFor(step);
+      e = hueSprites[step] = {
+        normal: makeSprite(spriteSize, spriteRadius * dpr, c, 0.95, false, spriteStarness),
+        hover:  makeSprite(Math.ceil(spriteSize * 1.5), spriteRadius * dpr * 1.3, c, 1.0, true, spriteStarness * 0.5),
+      };
+    }
+    return e;
   }
 
   // progressive disclosure of a world: at distance a document is a point of
@@ -401,31 +422,67 @@
   var dotSprites = null;
   var dotTheme = null;
 
+  function makeDotSprite(colors) {
+    var s = Math.max(4, Math.ceil(2.6 * dpr));
+    var cv = document.createElement('canvas');
+    cv.width = s; cv.height = s;
+    var c = cv.getContext('2d');
+    var half = s / 2;
+    var coreCol = frameDark ? mixHex(colors.core, '#ffffff', 0.38) : colors.mid;
+    var sg = c.createRadialGradient(half, half, 0, half, half, half);
+    sg.addColorStop(0, coreCol);
+    sg.addColorStop(0.4, hexToRgba(colors.mid, 0.5));
+    sg.addColorStop(1, hexToRgba(colors.mid, 0));
+    c.globalAlpha = 0.55;
+    c.fillStyle = sg;
+    c.beginPath();
+    c.arc(half, half, half, 0, Math.PI * 2);
+    c.fill();
+    return cv;
+  }
+
   function buildDotSprites() {
     // the whole-map view: each document is a faint star, not a solid disc
     var theme = frameDark ? 'dark' : 'light';
     if (dotSprites && dotTheme === theme) return;
     dotTheme = theme;
     dotSprites = [];
-    var s = Math.max(4, Math.ceil(2.6 * dpr));
+    hueDotSprites = {};
     for (var p = 0; p < PLATFORMS.length; p++) {
-      var colors = frameColors[PLATFORMS[p]];
-      var cv = document.createElement('canvas');
-      cv.width = s; cv.height = s;
-      var c = cv.getContext('2d');
-      var half = s / 2;
-      var coreCol = frameDark ? mixHex(colors.core, '#ffffff', 0.38) : colors.mid;
-      var sg = c.createRadialGradient(half, half, 0, half, half, half);
-      sg.addColorStop(0, coreCol);
-      sg.addColorStop(0.4, hexToRgba(colors.mid, 0.5));
-      sg.addColorStop(1, hexToRgba(colors.mid, 0));
-      c.globalAlpha = 0.55;
-      c.fillStyle = sg;
-      c.beginPath();
-      c.arc(half, half, half, 0, Math.PI * 2);
-      c.fill();
-      dotSprites.push(cv);
+      dotSprites.push(makeDotSprite(frameColors[PLATFORMS[p]]));
     }
+  }
+
+  var hueDotSprites = {};
+  function getHueDotSprite(step) {
+    var cv = hueDotSprites[step];
+    if (!cv) cv = hueDotSprites[step] = makeDotSprite(hueColorsFor(step));
+    return cv;
+  }
+
+  // --- per-cluster hue palette (shared by lanterns and 'other' points) ---
+  var hueColorCache = null; // { theme, entries: { step: {core, mid, edge} hex } }
+  function rgbToHex(rgb) {
+    return '#' + ((1 << 24) | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]).toString(16).slice(1);
+  }
+  function hueColorsFor(step) {
+    var theme = frameDark ? 'dark' : 'light';
+    if (!hueColorCache || hueColorCache.theme !== theme) hueColorCache = { theme: theme, entries: {} };
+    var e = hueColorCache.entries[step];
+    if (!e) {
+      var h = step / HUE_STEPS;
+      // muted saturation: colored, but still atmospheric
+      e = hueColorCache.entries[step] = frameDark ? {
+        core: rgbToHex(hslToRgb(h, 0.5, 0.72)),
+        mid:  rgbToHex(hslToRgb(h, 0.45, 0.52)),
+        edge: rgbToHex(hslToRgb(h, 0.4, 0.34)),
+      } : {
+        core: rgbToHex(hslToRgb(h, 0.5, 0.5)),
+        mid:  rgbToHex(hslToRgb(h, 0.45, 0.62)),
+        edge: rgbToHex(hslToRgb(h, 0.4, 0.75)),
+      };
+    }
+    return e;
   }
 
   // --- nebula halo sprite cache ---
@@ -482,17 +539,8 @@
       var hueStep = Math.floor(hash01(clusterId) * HUE_STEPS) % HUE_STEPS;
       key = 'hue' + hueStep + '_' + bucket;
       if (!haloSprites.entries[key]) {
-        var h = hueStep / HUE_STEPS;
-        // muted saturation: colored, but still atmospheric
-        if (frameDark) {
-          core = hslToRgb(h, 0.5, 0.72);
-          mid = hslToRgb(h, 0.45, 0.52);
-          edge = hslToRgb(h, 0.4, 0.34);
-        } else {
-          core = hslToRgb(h, 0.5, 0.5);
-          mid = hslToRgb(h, 0.45, 0.62);
-          edge = hslToRgb(h, 0.4, 0.75);
-        }
+        var hc = hueColorsFor(hueStep);
+        core = parseHex(hc.core); mid = parseHex(hc.mid); edge = parseHex(hc.edge);
       }
     } else {
       key = platform + '_' + bucket;
@@ -1142,14 +1190,13 @@
         if (filtering && ((pass === 0 && isActive) || (pass === 1 && !isActive))) continue;
         if (!filtering && pass === 1) continue;
         var sx = cx + px * scale, sy = cy + py * scale;
-        if (i === hoveredIndex && useGlow) {
-          var spr = sprites[pi].hover;
-          ctx.drawImage(spr, sx - spr.width / (2 * dpr), sy - spr.height / (2 * dpr), spr.width / dpr, spr.height / dpr);
-        } else if (useGlow) {
-          var spr = sprites[pi].normal;
+        var hue = pointHueArr ? pointHueArr[i] : 255;
+        if (useGlow) {
+          var set = hue !== 255 ? getHueSprite(hue) : sprites[pi];
+          var spr = i === hoveredIndex ? set.hover : set.normal;
           ctx.drawImage(spr, sx - spr.width / (2 * dpr), sy - spr.height / (2 * dpr), spr.width / dpr, spr.height / dpr);
         } else {
-          var dot = dotSprites[pi];
+          var dot = hue !== 255 ? getHueDotSprite(hue) : dotSprites[pi];
           ctx.drawImage(dot, sx - dot.width / (2 * dpr), sy - dot.height / (2 * dpr), dot.width / dpr, dot.height / dpr);
         }
       }
@@ -1170,11 +1217,12 @@
         if (px < xMin || px > xMax || py < yMin || py > yMax) return;
         var sx = cx + px * scale, sy = cy + py * scale;
         var pi = platformIdx[i];
+        var hue = pointHueArr ? pointHueArr[i] : 255;
         if (useGlow) {
-          var spr = sprites[pi].hover;
+          var spr = hue !== 255 ? getHueSprite(hue).hover : sprites[pi].hover;
           ctx.drawImage(spr, sx - spr.width / (2 * dpr), sy - spr.height / (2 * dpr), spr.width / dpr, spr.height / dpr);
         } else {
-          var dot = dotSprites[pi];
+          var dot = hue !== 255 ? getHueDotSprite(hue) : dotSprites[pi];
           ctx.drawImage(dot, sx - dot.width / (2 * dpr), sy - dot.height / (2 * dpr), dot.width / dpr, dot.height / dpr);
         }
       });
@@ -2099,12 +2147,19 @@
         // truncation aliased distant clusters together (id 300 → 44), which
         // drew connection lines between unrelated documents.
         clusterFineArr = new Uint16Array(n);
+        // 'other' points inherit their fine cluster's lantern hue (255 = use
+        // platform color) so the dense center isn't a monotonous gray mass
+        pointHueArr = new Uint8Array(n);
+        pointHueArr.fill(255);
         var coarsePlatCounts = {};
         var finePlatCounts = {};
         for (var i = 0; i < n; i++) {
           var cc = d.points[i].clusterCoarse;
           var cf = d.points[i].clusterFine;
           clusterFineArr[i] = cf;
+          if (platformIdx[i] === otherIdx) {
+            pointHueArr[i] = Math.floor(hash01(cf) * HUE_STEPS) % HUE_STEPS;
+          }
           if (!coarsePlatCounts[cc]) coarsePlatCounts[cc] = new Uint16Array(PLATFORMS.length);
           if (!finePlatCounts[cf]) finePlatCounts[cf] = new Uint16Array(PLATFORMS.length);
           coarsePlatCounts[cc][platformIdx[i]]++;

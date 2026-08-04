@@ -1669,10 +1669,20 @@ fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
     };
 }
 
-/// Build FTS5 query from user input.
-/// - bare words are OR'd together, prefix `*` on last word
-/// - quoted phrases (`"..."`) are passed through for exact phrase matching
+/// Build FTS5 query from user input, following the Google convention for
+/// quotes (blog.google/products/search/how-were-improving-search-results-
+/// when-you-use-quotes/): a quoted term is REQUIRED and matched exactly.
+/// - bare words are OR'd together, prefix `*` on last word (recall-first)
+/// - user-quoted terms (`"..."`) are required: AND'd with each other, and
+///   with the bare-word group if one exists. Quoting a single word also
+///   disables prefix expansion (Google: quoting disables variant matching).
+/// - punctuation inside quotes tokenizes as spaces (unicode61), matching
+///   Google's documented `"don't"` ≈ "don t" behavior for free
+/// - divergence from Google: bare words alongside quotes stay required as
+///   a group (`"a" AND (b OR c*)`) — FTS5 MATCH has no "optional" operator,
+///   so Google's droppable loose terms aren't expressible
 /// - unclosed quotes are treated as phrases with synthetic closing quote
+/// - AND binds tighter than OR in FTS5, so the bare group is parenthesized
 /// Separators match FTS5 unicode61 tokenizer: any non-alphanumeric character
 pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
     if (query.len == 0) return "";
@@ -1686,8 +1696,10 @@ pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
 
     const trimmed = query[start..end];
 
-    // tokenize into phrases and words
-    const TokenKind = enum { word, phrase };
+    // tokenize. `escaped_word` is a bare word that must be emitted quoted
+    // because it collides with an FTS5 operator (literal "OR") — it belongs
+    // to the bare-word group, NOT the required-phrase group.
+    const TokenKind = enum { word, escaped_word, phrase };
     const Token = struct { kind: TokenKind, text: []const u8 };
 
     var tokens: std.ArrayList(Token) = .empty;
@@ -1717,7 +1729,7 @@ pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
             while (i < trimmed.len and isAlnum(trimmed[i])) : (i += 1) {}
             const word = trimmed[word_start..i];
             // "OR" is an FTS5 operator — quote it so it's searched as a literal word
-            const kind: TokenKind = if (std.mem.eql(u8, word, "OR")) .phrase else .word;
+            const kind: TokenKind = if (std.mem.eql(u8, word, "OR")) .escaped_word else .word;
             try tokens.append(alloc, .{ .kind = kind, .text = word });
         } else {
             i += 1; // skip separator
@@ -1726,27 +1738,49 @@ pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
 
     if (tokens.items.len == 0) return "";
 
-    // build output: join with " OR ", prefix * on last token if it's a bare word
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    for (tokens.items, 0..) |token, idx| {
-        if (idx > 0) {
-            try out.appendSlice(alloc, " OR ");
+    var n_phrases: usize = 0;
+    for (tokens.items) |t| {
+        if (t.kind == .phrase) n_phrases += 1;
+    }
+    const n_bare = tokens.items.len - n_phrases;
+
+    // required group: user-quoted phrases, AND-joined
+    var emitted_phrases: usize = 0;
+    for (tokens.items) |token| {
+        if (token.kind != .phrase) continue;
+        if (emitted_phrases > 0) try out.appendSlice(alloc, " AND ");
+        try out.append(alloc, '"');
+        try out.appendSlice(alloc, token.text);
+        try out.append(alloc, '"');
+        emitted_phrases += 1;
+    }
+
+    // bare-word group: OR-joined, prefix * only when the final token of the
+    // whole query is a bare word (preserves type-ahead behavior)
+    if (n_bare > 0) {
+        if (n_phrases > 0) try out.appendSlice(alloc, " AND (");
+        var emitted_bare: usize = 0;
+        for (tokens.items, 0..) |token, idx| {
+            if (token.kind == .phrase) continue;
+            if (emitted_bare > 0) try out.appendSlice(alloc, " OR ");
+            switch (token.kind) {
+                .word => {
+                    try out.appendSlice(alloc, token.text);
+                    if (idx == tokens.items.len - 1) try out.append(alloc, '*');
+                },
+                .escaped_word => {
+                    try out.append(alloc, '"');
+                    try out.appendSlice(alloc, token.text);
+                    try out.append(alloc, '"');
+                },
+                .phrase => unreachable,
+            }
+            emitted_bare += 1;
         }
-        switch (token.kind) {
-            .word => {
-                try out.appendSlice(alloc, token.text);
-                if (idx == tokens.items.len - 1) {
-                    try out.append(alloc, '*');
-                }
-            },
-            .phrase => {
-                try out.append(alloc, '"');
-                try out.appendSlice(alloc, token.text);
-                try out.append(alloc, '"');
-            },
-        }
+        if (n_phrases > 0) try out.append(alloc, ')');
     }
 
     return try out.toOwnedSlice(alloc);
@@ -1819,19 +1853,19 @@ test "buildFtsQuery: mixed punctuation" {
 test "buildFtsQuery: embedded quoted phrase" {
     const result = try buildFtsQuery(std.testing.allocator, "python \"machine learning\" tutorial");
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("python OR \"machine learning\" OR tutorial*", result);
+    try std.testing.expectEqualStrings("\"machine learning\" AND (python OR tutorial*)", result);
 }
 
 test "buildFtsQuery: quoted phrase at start" {
     const result = try buildFtsQuery(std.testing.allocator, "\"exact phrase\" python");
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("\"exact phrase\" OR python*", result);
+    try std.testing.expectEqualStrings("\"exact phrase\" AND (python*)", result);
 }
 
 test "buildFtsQuery: quoted phrase at end" {
     const result = try buildFtsQuery(std.testing.allocator, "python \"machine learning\"");
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("python OR \"machine learning\"", result);
+    try std.testing.expectEqualStrings("\"machine learning\" AND (python)", result);
 }
 
 test "buildFtsQuery: literal OR quoted to avoid FTS5 operator collision" {
@@ -1884,7 +1918,25 @@ test "buildFtsQuery: empty quotes with word" {
 test "buildFtsQuery: mixed quotes and OR" {
     const result = try buildFtsQuery(std.testing.allocator, "\"exact phrase\" OR python");
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("\"exact phrase\" OR \"OR\" OR python*", result);
+    try std.testing.expectEqualStrings("\"exact phrase\" AND (\"OR\" OR python*)", result);
+}
+
+test "buildFtsQuery: two quoted words are AND'd (google convention — the milk/cee case)" {
+    const result = try buildFtsQuery(std.testing.allocator, "\"milk\" \"cee\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"milk\" AND \"cee\"", result);
+}
+
+test "buildFtsQuery: quoted single word gets no prefix star" {
+    const result = try buildFtsQuery(std.testing.allocator, "\"cee\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"cee\"", result);
+}
+
+test "buildFtsQuery: three quoted phrases all required" {
+    const result = try buildFtsQuery(std.testing.allocator, "\"a b\" \"c\" \"d e\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\"a b\" AND \"c\" AND \"d e\"", result);
 }
 
 test "buildDocUrl: native leaflet doc uses rkey (no path)" {

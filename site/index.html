@@ -260,7 +260,8 @@
             }
 
             .syntax-help .syntax-example {
-                min-width: 110px;
+                min-width: 140px;
+                flex-shrink: 0;
             }
             .syntax-help .syntax-desc {
                 color: var(--text-secondary);
@@ -269,6 +270,12 @@
                 color: var(--text);
                 margin-bottom: 0.6rem;
                 line-height: 1.7;
+            }
+            .empty-state .empty-hint {
+                color: var(--text-secondary);
+                font-size: 0.9em;
+                margin-top: 0.5rem;
+                line-height: 1.6;
             }
             .syntax-help .about-blurb + .syntax-row {
                 border-top: 1px solid var(--row-border);
@@ -1371,12 +1378,26 @@
                 </p>
                 <div class="syntax-row">
                     <span class="syntax-example"><code>cat dog</code></span
-                    ><span class="syntax-desc">matches either term</span>
+                    ><span class="syntax-desc"
+                        >matches either term; last word matches as you type
+                        (<code>dog</code> also finds <code>dogs</code>)</span
+                    >
                 </div>
                 <div class="syntax-row">
                     <span class="syntax-example"
                         ><code>"exact phrase"</code></span
-                    ><span class="syntax-desc">matches exact phrase</span>
+                    ><span class="syntax-desc"
+                        >required, matched exactly &mdash; every quoted term
+                        must appear (<code>"cat" "dog"</code> needs both)</span
+                    >
+                </div>
+                <div class="syntax-row">
+                    <span class="syntax-example"
+                        ><code>"cat" dog fox</code></span
+                    ><span class="syntax-desc"
+                        >quoted terms required, plus at least one of the
+                        rest</span
+                    >
                 </div>
                 <div class="syntax-row">
                     <span class="syntax-example"
@@ -1650,6 +1671,7 @@
                         resultsDiv.innerHTML = `
             <div class="empty-state">
               <p>no results${query ? ` for ${formatQueryForDisplay(query)}` : ""}${tag ? ` in #${escapeHtml(tag)}` : ""}${platform ? ` on ${escapeHtml(platform)}` : ""}</p>
+              ${emptyStateExplanation(query)}
             </div>
           `;
                         statsDiv.textContent = "";
@@ -1918,6 +1940,30 @@
             }
 
             // display query without adding redundant quotes
+            // explain what the keyword matcher required, so an empty page
+            // says WHY. quoted terms are required (AND); bare words need at
+            // least one match. mirrors backend buildFtsQuery semantics.
+            function emptyStateExplanation(query) {
+                if (!query || currentMode !== "keyword") return "";
+                const quoted = [...query.matchAll(/"([^"]*)"/g)]
+                    .map((m) => m[1].trim())
+                    .filter((t) => /[a-zA-Z0-9]/.test(t));
+                const bare = query
+                    .replace(/"[^"]*"?/g, " ")
+                    .split(/[^a-zA-Z0-9]+/)
+                    .filter(Boolean);
+                if (quoted.length === 0) {
+                    if (bare.length <= 1) return "";
+                    return `<p class="empty-hint">searched for documents matching <em>any</em> of these terms &mdash; none appear in the corpus</p>`;
+                }
+                const req = quoted.map((t) => `<code>"${escapeHtml(t)}"</code>`).join(" and ");
+                const also = bare.length
+                    ? ` plus at least one of ${bare.map((t) => `<code>${escapeHtml(t)}</code>`).join(", ")}`
+                    : "";
+                const unquoted = escapeHtml(query.replace(/"/g, ""));
+                return `<p class="empty-hint">quoted terms are required: looked for documents containing ${req}${also}. <a href="#" onclick="event.preventDefault(); document.getElementById('query').value = ${JSON.stringify(unquoted).replace(/"/g, "&quot;")}; doSearch();">try without quotes</a> for broader matching</p>`;
+            }
+
             function formatQueryForDisplay(query) {
                 if (!query) return "";
                 const escaped = escapeHtml(query);

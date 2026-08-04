@@ -901,7 +901,9 @@ const LOCAL_TAG_BROWSE_SQL =
 
 // FTS text within a tag: the standard BM25 + recency ranking (text relevance
 // stays primary; the recommend lift is the tag-BROWSE ranking), restricted to
-// the tag's documents.
+// the tag's documents. The tag restriction is an IN subquery, NOT a join —
+// a join let SQLite drive from the tag index and probe FTS per row, which
+// took ~8s on the real corpus (2026-08-04). The FTS index must drive.
 const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
     \\SELECT f.uri, d.did, d.title,
     \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
@@ -911,9 +913,9 @@ const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
     \\  COALESCE(p.name, '') as publication_name
     \\FROM documents_fts f
     \\JOIN documents d ON f.uri = d.uri
-    \\JOIN document_tags dt ON d.uri = dt.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\WHERE documents_fts MATCH ? AND dt.tag = ?
+    \\WHERE documents_fts MATCH ?
+    \\AND d.uri IN (SELECT document_uri FROM document_tags WHERE tag = ?)
     \\AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
     \\AND (? = '' OR d.created_at >= ?)
     \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
@@ -2194,4 +2196,22 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     const fa = std.mem.indexOf(u8, fts_out, "at://probe/A").?;
     const fc = std.mem.indexOf(u8, fts_out, "at://probe/C").?;
     try std.testing.expect(fb < fd and fd < fa and fa < fc);
+
+    // regression: the FTS index must DRIVE the tag-filtered text query. A
+    // plain join let SQLite drive from the tag index and probe FTS per row —
+    // ~8s on the real corpus (2026-08-04). The first SCAN in the plan must
+    // be the FTS table, never document_tags.
+    {
+        var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_TAG_FTS_SQL, .{
+            "probe", "photography", "", "", "", "", "", "", @as(usize, 50),
+        });
+        defer plan.deinit();
+        while (plan.next()) |prow| {
+            const detail = prow.text(3);
+            if (std.mem.startsWith(u8, detail, "SCAN") or std.mem.startsWith(u8, detail, "SEARCH")) {
+                try std.testing.expect(std.mem.indexOf(u8, detail, "VIRTUAL TABLE") != null);
+                break;
+            }
+        }
+    }
 }

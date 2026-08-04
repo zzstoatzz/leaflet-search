@@ -28,7 +28,16 @@ const r2 = @import("r2.zig");
 pub const MANIFEST_VERSION = 1;
 
 const Channel = enum { staging, prod };
-const DEFAULT_TIMEOUT_SECS: u64 = 45 * 60;
+// builds were ~40min at a 60k-doc corpus with a 45min default — no headroom.
+// export, VACUUM, sha256, and upload all scale ~linearly with corpus size, so
+// give the watchdog room for 5x growth; BUILDER_TIMEOUT_SECS still overrides.
+const DEFAULT_TIMEOUT_SECS: u64 = 120 * 60;
+
+/// wall-clock seconds since `since_s`, for per-phase timing logs
+fn secondsSince(io: Io, since_s: i64) i64 {
+    const now_s: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+    return now_s - since_s;
+}
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
@@ -101,6 +110,7 @@ pub fn run(allocator: Allocator, io: Io) !void {
     try local.openAt(db_path);
 
     const counts = try sync.buildSnapshot(turso, &local, watermark);
+    const export_s = secondsSince(io, started_s);
     logfire.info("builder: built {d} docs, {d} pubs, {d} tags, {d} popular, {d} recommends, {d} subscriptions", .{
         counts.documents, counts.publications, counts.tags, counts.popular, counts.recommends, counts.subscriptions,
     });
@@ -150,6 +160,7 @@ pub fn run(allocator: Allocator, io: Io) !void {
     // leaving WAL mode requires being the ONLY connection — close LocalDb's
     // write conn + read pool first, then compact on a fresh solo connection
     local.deinit();
+    const verify_done_s = secondsSince(io, started_s);
 
     {
         logfire.info("builder: phase=compact", .{});
@@ -176,9 +187,12 @@ pub fn run(allocator: Allocator, io: Io) !void {
         } else return error.QuickCheckGate;
     }
 
+    const compact_done_s = secondsSince(io, started_s);
+
     // hash + size of the exact bytes that will be served
     var sha_hex: [64]u8 = undefined;
     const byte_size = try sha256File(allocator, io, db_path, &sha_hex);
+    const hash_done_s = secondsSince(io, started_s);
     logfire.info("builder: replica.db {d} bytes sha256={s}", .{ byte_size, sha_hex });
 
     const prefix = switch (channel) {
@@ -232,7 +246,12 @@ pub fn run(allocator: Allocator, io: Io) !void {
     // latest pointer LAST — readers can never see a pointer to a partial build
     try r2.upload(allocator, io, cfg, manifest_path, latest_key);
 
-    const took_s: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s) - started_s);
+    const took_s = secondsSince(io, started_s);
+    // per-phase wall-clock: which stage grows as the corpus does. deltas
+    // between the checkpoints above; upload is everything after the hash.
+    logfire.info("builder: timings export={d}s verify={d}s compact={d}s hash={d}s upload={d}s total={d}s", .{
+        export_s, verify_done_s - export_s, compact_done_s - verify_done_s, hash_done_s - compact_done_s, took_s - hash_done_s, took_s,
+    });
     logfire.info("builder: published {s} to {s} channel ({d} docs, {d}s)", .{ build_id, @tagName(channel), counts.documents, took_s });
 }
 

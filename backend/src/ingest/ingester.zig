@@ -240,7 +240,9 @@ fn connect(allocator: Allocator, io: Io) !void {
         .host = host,
         .port = port,
         .tls = tls,
-        .max_size = 1024 * 1024, // 1MB
+        // must cover the channel server's max_message_size (5MB,
+        // ingester/src/channel.zig) or oversized doc frames error the read loop
+        .max_size = 5 * 1024 * 1024,
     }) catch |err| {
         logfire.err("websocket client init failed: {}", .{err});
         return err;

@@ -17,7 +17,7 @@
     // cluster's member points so the cloud hugs the real shape and reads
     // continuous as you zoom in. Per-stamp alpha accumulates into the nebula.
     nebula: {
-      alpha: 0.05,         // per-stamp globalAlpha (overlaps build the cloud)
+      alpha: 0.03,         // per-stamp globalAlpha (overlaps build the cloud)
       stampFrac: 0.34,     // stamp radius as a fraction of cluster radius
       minStampPx: 10,      // floor so tiny clusters still read
       maxStampPx: 60,      // cap so sparse clusters don't bloom into giant flares at high zoom

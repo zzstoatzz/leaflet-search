@@ -1,12 +1,14 @@
 //! commit verification — DID signing-key resolution + signature/MST check.
 //!
-//! simplified from zlay's validator (zat.dev/zlay src/internal/validator.zig):
-//! zlay validates the whole relay firehose so it needs an LRU cache and
-//! background resolver threads; we only verify commits that touch our tracked
-//! collections (~tens per minute, a few thousand distinct authors total), so a
-//! plain grow-only cache and a synchronous resolve on first encounter per DID
-//! is fine — the firehose read loop stalls one PLC roundtrip per new author
-//! and we resume from the persisted cursor if anything goes wrong.
+//! simplified from zlay's validator (zat.dev/zlay src/internal/validator.zig).
+//! since the pipeline restructure (docs/scale-300k-plan.md §1e) this runs on
+//! the verify worker pool, NOT the firehose read thread: a slow PLC resolve
+//! stalls one worker while other authors keep verifying. one shared Verifier
+//! serves all workers — the key cache is lock-guarded and bounded (evict-one
+//! on overflow, NEVER clear-all: a cache reset mid-burst multiplies PLC
+//! traffic into a resolve stampede — stream's verify.zig learned this at
+//! network scale), counters are atomic, and signature crypto runs outside
+//! the cache lock so workers actually parallelize.
 
 const std = @import("std");
 const Io = std.Io;
@@ -39,12 +41,19 @@ pub const Verdict = enum {
     rejected,
 };
 
-/// how long the firehose thread waits for a DID resolution before giving up
-/// on the commit. zig 0.16's http client has NO timeouts, so a wedged PLC
-/// connection would otherwise freeze the read loop forever (it did, in prod,
-/// 2026-06-09 22:33 UTC — ~6 min of zero ingestion until a restart).
+/// how long a verify worker waits for a DID resolution before giving up on
+/// the commit. zig 0.16's http client has NO timeouts, so a wedged PLC
+/// connection would otherwise freeze the worker forever (pre-pipeline it
+/// froze the whole read loop: 2026-06-09 22:33 UTC — ~6 min of zero
+/// ingestion until a restart). now it costs one worker one deadline.
 const RESOLVE_DEADLINE_MS: u64 = 10_000;
 const RESOLVE_POLL_MS: u64 = 50;
+
+/// key-cache bound. ~100k entries ≈ 15MB. an archive-backfill influx means
+/// many new authors; the bound is generous enough that eviction is rare, and
+/// overflow evicts ONE arbitrary entry (a re-resolve for one author) rather
+/// than clearing (a stampede for every author).
+const MAX_CACHED_KEYS: usize = 100_000;
 
 const TASK_RUNNING: u8 = 0;
 const TASK_DONE: u8 = 1;
@@ -106,15 +115,27 @@ pub const Verifier = struct {
     io: Io,
     allocator: std.mem.Allocator,
     cache: std.StringHashMapUnmanaged(CachedKey) = .empty,
-    verified: u64 = 0,
-    sig_only: u64 = 0,
-    bridged: u64 = 0,
-    rejected: u64 = 0,
-    unresolvable: u64 = 0,
+    // spinlock guarding `cache` only — critical sections are map lookups and
+    // inserts, never network or crypto (channel.zig's idiom; Io.Mutex works
+    // here too but the sections are tiny and uncontended).
+    cache_locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    verified: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sig_only: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    bridged: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    unresolvable: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // racy by design: @errorName returns static strings, a stale read is fine
     last_err: []const u8 = "none",
 
     pub fn init(io: Io, allocator: std.mem.Allocator) Verifier {
         return .{ .io = io, .allocator = allocator };
+    }
+
+    fn lockCache(self: *Verifier) void {
+        while (self.cache_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    fn unlockCache(self: *Verifier) void {
+        self.cache_locked.store(false, .release);
     }
 
     pub fn deinit(self: *Verifier) void {
@@ -128,18 +149,18 @@ pub const Verifier = struct {
     pub fn verifyCommit(self: *Verifier, commit: zat.firehose.CommitEvent) Verdict {
         if (commit.blocks.len == 0) {
             // no CAR to verify (e.g. legacy tooBig frames strip blocks).
-            self.rejected += 1;
+            _ = self.rejected.fetchAdd(1, .monotonic);
             logfire.warn("verifier: no blocks for did={s} seq={d} too_big={}", .{ commit.repo, commit.seq, commit.too_big });
             return .rejected;
         }
 
         const key = self.signingKey(commit.repo, false) orelse {
-            self.unresolvable += 1;
+            _ = self.unresolvable.fetchAdd(1, .monotonic);
             return .rejected;
         };
 
         if (key.bridged) {
-            self.bridged += 1;
+            _ = self.bridged.fetchAdd(1, .monotonic);
             return .bridged;
         }
 
@@ -149,24 +170,24 @@ pub const Verifier = struct {
         // re-resolve once and retry before rejecting (sync spec guidance,
         // same as zlay's evict + re-resolve, but inline since we're low-volume).
         const fresh = self.signingKey(commit.repo, true) orelse {
-            self.unresolvable += 1;
+            _ = self.unresolvable.fetchAdd(1, .monotonic);
             return .rejected;
         };
         if (fresh.bridged) {
-            self.bridged += 1;
+            _ = self.bridged.fetchAdd(1, .monotonic);
             return .bridged;
         }
         if (self.verifyWithKey(commit, fresh)) |verdict| return self.count(verdict);
 
-        self.rejected += 1;
+        _ = self.rejected.fetchAdd(1, .monotonic);
         logfire.warn("verifier: rejected commit did={s} seq={d} rev={s} err={s}", .{ commit.repo, commit.seq, commit.rev, self.last_err });
         return .rejected;
     }
 
     fn count(self: *Verifier, verdict: Verdict) Verdict {
         switch (verdict) {
-            .full => self.verified += 1,
-            .sig_only => self.sig_only += 1,
+            .full => _ = self.verified.fetchAdd(1, .monotonic),
+            .sig_only => _ = self.sig_only.fetchAdd(1, .monotonic),
             .bridged, .rejected => unreachable,
         }
         return verdict;
@@ -224,7 +245,10 @@ pub const Verifier = struct {
     /// kernel finally gives up on its socket.
     fn signingKey(self: *Verifier, did: []const u8, force: bool) ?CachedKey {
         if (!force) {
-            if (self.cache.get(did)) |cached| return cached;
+            self.lockCache();
+            const hit = self.cache.get(did);
+            self.unlockCache();
+            if (hit) |cached| return cached;
         }
         if (did.len > 512) return null;
 
@@ -257,6 +281,17 @@ pub const Verifier = struct {
         if (!task.ok) return null;
         const cached = task.key;
 
+        self.lockCache();
+        defer self.unlockCache();
+        if (self.cache.count() >= MAX_CACHED_KEYS) {
+            // evict ONE arbitrary entry; never clear-all (resolve stampede)
+            var it = self.cache.iterator();
+            if (it.next()) |victim| {
+                const victim_key = victim.key_ptr.*;
+                _ = self.cache.remove(victim_key);
+                self.allocator.free(victim_key);
+            }
+        }
         const gop = self.cache.getOrPut(self.allocator, did) catch return cached;
         if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, did) catch {
@@ -270,6 +305,8 @@ pub const Verifier = struct {
 
     /// drop a DID's cached key (on #identity events — key may have rotated).
     pub fn evict(self: *Verifier, did: []const u8) void {
+        self.lockCache();
+        defer self.unlockCache();
         if (self.cache.fetchRemove(did)) |kv| self.allocator.free(kv.key);
     }
 };

@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .websocket = .{
-            .url = "https://tangled.org/zzstoatzz.io/websocket.zig/archive/v0.1.8.tar.gz",
-            .hash = "websocket-0.1.8-ZPISdZ1cBADCBRYrCAZ8ueTIEN2T9ns7U7rtDE-IAvkr",
+            .url = "https://tangled.org/zzstoatzz.io/websocket.zig/archive/v0.1.11.tar.gz",
+            .hash = "websocket-0.1.10-ZPISdUowBQAXIl_X9VpZozIxBLVf_o5wYjOMMdobrXF5",
         },
         .zat = .{
-            .url = "https://tangled.org/zat.dev/zat/archive/v0.3.8.tar.gz",
-            .hash = "zat-0.3.8-5PuC7glgCgCVn18R0k6AuXiNok-jjqDRGgaBFj5JsI_N",
+            .url = "https://tangled.org/zat.dev/zat/archive/v0.3.23.tar.gz",
+            .hash = "zat-0.3.23-5PuC7lHLCwBaCfw70KN-79Hgz2_icC83h7HGHfp789G-",
         },
         .logfire = .{
             .url = "https://tangled.sh/@zzstoatzz.io/logfire-zig/archive/v0.2.2.tar.gz",

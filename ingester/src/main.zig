@@ -14,20 +14,7 @@ const logfire = @import("logfire");
 const zat = @import("zat");
 const ch = @import("channel.zig");
 const vf = @import("verifier.zig");
-
-// Collections we index — mirrors the backend's ingester collection filters.
-const COLLECTIONS = [_][]const u8{
-    "pub.leaflet.document",
-    "pub.leaflet.publication",
-    "pub.leaflet.interactions.recommend",
-    "site.standard.document",
-    "site.standard.publication",
-    "site.standard.graph.recommend",
-    // pckt sidecar: marks which site.standard.publication is a pckt blog so the
-    // backend can platform-tag custom-domain pckt docs (their host lacks pckt.blog).
-    "blog.pckt.publication",
-    "com.whtwnd.blog.entry",
-};
+const pl = @import("pipeline.zig");
 
 // banned repos: bulk-archive bots that flood the corpus. Single source of
 // truth is /banned-dids.txt (repo root), shared with backend/src/policy.zig
@@ -57,12 +44,6 @@ fn isBanned(did: []const u8) bool {
     return false;
 }
 
-fn isTracked(collection: []const u8) bool {
-    for (COLLECTIONS) |c| {
-        if (std.mem.eql(u8, c, collection)) return true;
-    }
-    return false;
-}
 
 // Persist the firehose cursor every this many events so we resume across our
 // OWN restarts (zat only keeps last_seq in memory). ~every few seconds at
@@ -105,45 +86,42 @@ fn persistCursor(path: [:0]const u8, seq: i64) void {
     _ = std.c.rename(tmp.ptr, path.ptr);
 }
 
+/// Thin reader (stream's live-scheduler shape, docs/scale-300k-plan.md §1e):
+/// decode for CLASSIFICATION only — banned/tracked checks — then hand the raw
+/// frame bytes to the verify pipeline. All expensive work (signature + MST
+/// verification, DID key resolution) happens on the worker pool, so nothing
+/// here ever blocks on the network.
 const Handler = struct {
     allocator: std.mem.Allocator,
-    channel: *ch.Channel,
     verifier: *vf.Verifier,
+    pipeline: *pl.Pipeline,
+    channel: *ch.Channel,
     matched: u64 = 0,
     events: u64 = 0,
     last_seq: i64 = 0,
     cursor_path: [:0]const u8,
 
-    pub fn onEvent(self: *Handler, event: zat.FirehoseEvent) void {
-        if (event.seq()) |s| self.last_seq = s;
+    pub fn onRawFrame(self: *Handler, data: []const u8) void {
         self.events += 1;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const event = zat.firehose.decodeFrame(arena.allocator(), data) catch |err| {
+            logfire.debug("frame decode error: {s}", .{@errorName(err)});
+            return;
+        };
+        if (event.seq()) |s| self.last_seq = s;
 
         switch (event) {
             .commit => |commit| {
                 if (isBanned(commit.repo)) return;
                 var tracked_ops: usize = 0;
                 for (commit.ops) |op| {
-                    if (isTracked(op.collection)) tracked_ops += 1;
+                    if (pl.isTracked(op.collection)) tracked_ops += 1;
                 }
                 if (tracked_ops > 0) {
-                    // verify the commit before emitting any of its records.
-                    // rejected/bridged commits are still logged as captured so
-                    // coverage stays auditable, but they never reach /channel.
-                    const verdict = self.verifier.verifyCommit(commit);
-                    for (commit.ops) |op| {
-                        if (!isTracked(op.collection)) continue;
-                        self.matched += 1;
-
-                        // comparison signal (uri = at://{did}/{collection}/{rkey}).
-                        logfire.info("ingester.captured action={s} collection={s} did={s} rkey={s} seq={d} verified={s}", .{
-                            @tagName(op.action), op.collection, commit.repo, op.rkey, commit.seq, @tagName(verdict),
-                        });
-
-                        switch (verdict) {
-                            .full, .sig_only => self.emit(op, commit.repo, commit.seq),
-                            .bridged, .rejected => {},
-                        }
-                    }
+                    self.matched += tracked_ops;
+                    self.pipeline.submit(commit.repo, commit.seq, data);
                 }
             },
             .identity => |id| self.verifier.evict(id.did),
@@ -151,30 +129,35 @@ const Handler = struct {
         }
 
         if (self.events % CURSOR_PERSIST_EVERY == 0) {
-            // checkpoint = delivery position, not read position (event-stream
-            // spec: "last sequence number received and successfully
-            // processed"). While frames sit undelivered in the ring, pin the
-            // durable cursor just before the oldest one so a restart replays
-            // them from the relay; the backend's upserts absorb duplicates.
-            const checkpoint = if (self.channel.pendingSeq()) |pending| pending - 1 else self.last_seq;
-            persistCursor(self.cursor_path, checkpoint);
-            logfire.debug("ingester progress: events={d} matched={d} seq={d} checkpoint={d} verified={d} sig_only={d} bridged={d} rejected={d} unresolvable={d}", .{
-                self.events,            self.matched,            self.last_seq,          checkpoint,
-                self.verifier.verified, self.verifier.sig_only, self.verifier.bridged, self.verifier.rejected, self.verifier.unresolvable,
-            });
+            self.checkpoint();
         }
     }
 
-    fn emit(self: *Handler, op: zat.firehose.RepoOp, did: []const u8, seq: i64) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        var out: std.Io.Writer.Allocating = .init(a);
-        ch.buildRecordFrame(&out, a, seq, @tagName(op.action), did, op.collection, op.rkey, op.cid, op.record) catch |err| {
-            logfire.warn("channel: frame build failed: {s}", .{@errorName(err)});
-            return;
-        };
-        _ = self.channel.broadcast(out.written(), seq);
+    /// checkpoint = delivery position, not read position (event-stream spec:
+    /// "last sequence number received and successfully processed"). Two kinds
+    /// of work may still be behind the read position: commits inflight in the
+    /// verify pipeline, and frames buffered undelivered in the channel ring.
+    /// Pin the durable cursor just before the oldest of either so a restart
+    /// replays them from the relay; the backend's upserts absorb duplicates
+    /// (stream's cursor = min(inflight)−1 rule).
+    fn checkpoint(self: *Handler) void {
+        var floor: i64 = self.last_seq + 1;
+        if (self.pipeline.minInflight()) |s| floor = @min(floor, s);
+        if (self.channel.pendingSeq()) |s| floor = @min(floor, s);
+        const cp = floor - 1;
+        persistCursor(self.cursor_path, cp);
+        logfire.debug("ingester progress: events={d} matched={d} seq={d} checkpoint={d} verified={d} sig_only={d} bridged={d} rejected={d} unresolvable={d} pool_dropped={d}", .{
+            self.events,
+            self.matched,
+            self.last_seq,
+            cp,
+            self.verifier.verified.load(.monotonic),
+            self.verifier.sig_only.load(.monotonic),
+            self.verifier.bridged.load(.monotonic),
+            self.verifier.rejected.load(.monotonic),
+            self.verifier.unresolvable.load(.monotonic),
+            self.pipeline.dropped.load(.monotonic),
+        });
     }
 
     pub fn onError(_: *Handler, err: anyerror) void {
@@ -283,8 +266,33 @@ fn runFirehose(ctx: FirehoseCtx) void {
     defer client.deinit();
     var verifier = vf.Verifier.init(ctx.io, ctx.allocator);
     defer verifier.deinit();
-    var handler = Handler{ .allocator = ctx.allocator, .channel = ctx.channel, .verifier = &verifier, .cursor_path = ctx.cursor_path };
+    var pipeline = pl.Pipeline{
+        .allocator = ctx.allocator,
+        .io = ctx.io,
+        .channel = ctx.channel,
+        .verifier = &verifier,
+    };
+    pipeline.start() catch |err| {
+        logfire.err("pipeline start failed: {s}", .{@errorName(err)});
+        return;
+    };
+    var handler = Handler{
+        .allocator = ctx.allocator,
+        .verifier = &verifier,
+        .pipeline = &pipeline,
+        .channel = ctx.channel,
+        .cursor_path = ctx.cursor_path,
+    };
     client.subscribe(&handler) catch |err| {
         logfire.err("firehose subscribe ended: {s}", .{@errorName(err)});
     };
+}
+
+// test root: `_ = @import` forces analysis of each file's test blocks (lazy
+// analysis skips them otherwise — same pattern as backend/src/main.zig).
+test {
+    _ = @import("channel.zig");
+    _ = @import("pipeline.zig");
+    _ = @import("verifier.zig");
+    _ = @import("cbor_json.zig");
 }

@@ -20,6 +20,7 @@
       alpha: 0.05,         // per-stamp globalAlpha (overlaps build the cloud)
       stampFrac: 0.34,     // stamp radius as a fraction of cluster radius
       minStampPx: 10,      // floor so tiny clusters still read
+      maxStampPx: 60,      // cap so sparse clusters don't bloom into giant flares at high zoom
       varBase: 0.6, varRange: 0.5, // per-cluster opacity variation (stained-glass)
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
       outStart: 45, outRange: 15,  // fade out approaching card zoom
@@ -875,7 +876,9 @@
     // Soft platform-tinted clouds at region centroids. Full when zoomed all the
     // way out, then hand off to the FINE nebulae below as you zoom in — same
     // visual language, finer granularity, so the experience is continuous.
-    var coarseHaloAlpha = fadeOut(zoom, 2.5, 1.5);
+    // gone by ~2.8 — once fine cluster labels are readable, the giant
+    // region-scale flares read as extreme rather than atmospheric
+    var coarseHaloAlpha = fadeOut(zoom, 1.8, 1.0);
     if (coarseHaloAlpha > 0.01) {
       var coarse = data.clusters.coarse;
       var baseAlpha = (dark ? 0.06 : 0.05) * coarseHaloAlpha;
@@ -910,7 +913,8 @@
         if (!pts || pts.length < 2) continue;
         if (cl.cx + cl.radius < xMin || cl.cx - cl.radius > xMax ||
             cl.cy + cl.radius < yMin || cl.cy - cl.radius > yMax) continue;
-        var rPx = Math.max(neb.minStampPx, (cl.radius || 0.05) * neb.stampFrac * scale);
+        var rPx = Math.min(neb.maxStampPx,
+          Math.max(neb.minStampPx, (cl.radius || 0.05) * neb.stampFrac * scale));
         var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx);
         var drawSize2 = halo2.sprite.width * (rPx / halo2.bucket) * (smallViewport ? 0.85 : 1);
         var v = neb.varBase + hash01(cl.id) * neb.varRange; // per-cloud opacity variation

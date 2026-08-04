@@ -439,14 +439,12 @@
     return HALO_BUCKETS[HALO_BUCKETS.length - 1];
   }
 
-  function buildHaloSprite(platform, bucket) {
+  function buildHaloSprite(core, mid, edge, bucket) {
     var size = bucket * 2 + 4;
     var cv = document.createElement('canvas');
     cv.width = size; cv.height = size;
     var c = cv.getContext('2d');
     var half = size / 2;
-    var nc = frameColors[platform];
-    var core = parseHex(nc.core), mid = parseHex(nc.mid), edge = parseHex(nc.edge);
     // gaussian-style falloff sampled densely — no piecewise tiers, the light
     // just dissipates. Hue drifts core -> mid -> edge as it fades.
     var K = 3.0, floor = Math.exp(-K);
@@ -467,15 +465,44 @@
     return cv;
   }
 
-  function getHaloSprite(platform, radiusPx) {
+  // 'other' covers ~70% of the corpus, so platform hue makes most of the map
+  // one gray fog. Those clusters instead get a deterministic hue of their own
+  // (seeded by cluster id, quantized to bound the sprite cache) — different
+  // lanterns, not one gray floodlight. Real platform majorities keep their
+  // platform color: that's meaningful signal.
+  var HUE_STEPS = 24;
+  function getHaloSprite(platform, radiusPx, clusterId) {
     var theme = frameDark ? 'dark' : 'light';
     if (!haloSprites || haloSprites.theme !== theme) {
       haloSprites = { theme: theme, entries: {} };
     }
     var bucket = getHaloBucket(radiusPx);
-    var key = platform + '_' + bucket;
+    var key, core, mid, edge;
+    if (platform === 'other' && clusterId != null) {
+      var hueStep = Math.floor(hash01(clusterId) * HUE_STEPS) % HUE_STEPS;
+      key = 'hue' + hueStep + '_' + bucket;
+      if (!haloSprites.entries[key]) {
+        var h = hueStep / HUE_STEPS;
+        // muted saturation: colored, but still atmospheric
+        if (frameDark) {
+          core = hslToRgb(h, 0.5, 0.72);
+          mid = hslToRgb(h, 0.45, 0.52);
+          edge = hslToRgb(h, 0.4, 0.34);
+        } else {
+          core = hslToRgb(h, 0.5, 0.5);
+          mid = hslToRgb(h, 0.45, 0.62);
+          edge = hslToRgb(h, 0.4, 0.75);
+        }
+      }
+    } else {
+      key = platform + '_' + bucket;
+      if (!haloSprites.entries[key]) {
+        var nc = frameColors[platform];
+        core = parseHex(nc.core); mid = parseHex(nc.mid); edge = parseHex(nc.edge);
+      }
+    }
     if (!haloSprites.entries[key]) {
-      haloSprites.entries[key] = buildHaloSprite(platform, bucket);
+      haloSprites.entries[key] = buildHaloSprite(core, mid, edge, bucket);
     }
     return { sprite: haloSprites.entries[key], bucket: bucket };
   }
@@ -898,7 +925,7 @@
         if (r < 2) continue;
         var sx = cx + cl.cx * scale, sy = cy + cl.cy * scale;
         if (sx + r < 0 || sx - r > W || sy + r < 0 || sy - r > H) continue;
-        var halo = getHaloSprite(cl.dominantPlatform || 'other', r);
+        var halo = getHaloSprite(cl.dominantPlatform || 'other', r, cl.id);
         var drawSize = halo.sprite.width * (r / halo.bucket) * haloShrink;
         ctx.globalAlpha = baseAlpha * 2;
         ctx.drawImage(halo.sprite, sx - drawSize / 2, sy - drawSize / 2, drawSize, drawSize);
@@ -926,7 +953,7 @@
           Math.max(rFloor, L.r * neb.spread * scale)) * (smallViewport ? 0.85 : 1);
         var nsx = cx + L.x * scale, nsy = cy + L.y * scale;
         if (nsx + rPx < 0 || nsx - rPx > W || nsy + rPx < 0 || nsy - rPx > H) continue;
-        var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx);
+        var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx, cl.id);
         var drawSize2 = halo2.sprite.width * (rPx / halo2.bucket);
         var v = neb.varBase + hash01(cl.id) * neb.varRange; // per-lantern brightness variation
         ctx.globalAlpha = neb.alpha * v * nebAlpha;

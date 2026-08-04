@@ -85,11 +85,15 @@ fn useTls() bool {
 /// Bounded queue for decoupling websocket readLoop from turso writes.
 /// ACKs are sent immediately in the readLoop; processing happens in a worker thread.
 /// If the queue is full (turso is slow), the OLDEST queued frame is dropped
-/// (already ACK'd) so the freshest data wins.
-const QUEUE_CAPACITY = 256;
+/// (already ACK'd) so the freshest data wins. Sized to absorb archive-backfill
+/// bursts (a publisher re-putting tens of thousands of records in minutes) —
+/// frames are small; the real defense is write-path throughput (batched
+/// pipeline requests in indexer.zig), this buffer is insurance.
+const QUEUE_CAPACITY = 4096;
 
 const IngesterCtx = struct {
     allocator: Allocator,
+    drop_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn process(self: *IngesterCtx, _: Io, frame: []u8) void {
         defer self.allocator.free(frame);
@@ -99,7 +103,14 @@ const IngesterCtx = struct {
     }
 
     fn onDrop(self: *IngesterCtx, frame: []u8) void {
-        self.allocator.free(frame);
+        defer self.allocator.free(frame);
+        // every drop is silent loss of an already-ACKed frame — recoverable
+        // only by reconciler/backfill. keep it loud (but bounded) in logs so
+        // the ops dashboard can alert on it.
+        const n = self.drop_count.fetchAdd(1, .monotonic) + 1;
+        if (n <= 10 or n % 100 == 0) {
+            logfire.warn("ingester: dropped ACKed frame under backpressure ({d} total)", .{n});
+        }
     }
 };
 

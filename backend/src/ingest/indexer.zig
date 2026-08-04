@@ -69,49 +69,67 @@ pub fn insertDocument(
         return;
     }
 
-    // dedupe: if (did, rkey) exists with different uri, clean up old record first
-    // this handles cross-collection duplicates (e.g., pub.leaflet.document + site.standard.document)
-    var doc_exists = false;
-    if (c.query("SELECT uri FROM documents WHERE did = ? AND rkey = ?", &.{ did, rkey })) |result_val| {
-        var result = result_val;
-        defer result.deinit();
-        if (result.first()) |row| {
-            const old_uri = row.text(0);
-            if (!std.mem.eql(u8, old_uri, uri)) {
-                c.exec("DELETE FROM documents_fts WHERE rowid = (SELECT rowid FROM documents WHERE uri = ?)", &.{old_uri}) catch {};
-                c.exec("DELETE FROM document_tags WHERE document_uri = ?", &.{old_uri}) catch {};
-                c.exec("DELETE FROM documents WHERE uri = ?", &.{old_uri}) catch {};
-            } else {
-                doc_exists = true;
-            }
-        }
-    } else |_| {}
-
-    // cross-platform content dedup: if same author already has a document with
-    // identical title+content (different rkey from a different platform), skip it.
     const content_hash: [16]u8 = computeContentHash(title, content);
-    var content_unchanged = false;
-    if (c.query("SELECT uri FROM documents WHERE did = ? AND content_hash = ?", &.{ did, &content_hash })) |res| {
-        var result = res;
-        defer result.deinit();
-        if (result.first()) |row| {
-            const existing_uri = row.text(0);
-            if (!std.mem.eql(u8, existing_uri, uri)) {
-                logfire.debug("indexer: skipping dupe for {s} (existing: {s})", .{ uri, existing_uri });
-                logfire.span("ingest.dropped", .{ .reason = "content_hash_dupe", .uri = uri, .existing_uri = existing_uri }).end();
-                return;
-            }
-            content_unchanged = true;
-        }
-    } else |_| {}
-
-    // compute denormalized fields
     const pub_uri = publication_uri orelse "";
     const has_pub: []const u8 = if (pub_uri.len > 0) "1" else "0";
 
+    // all point-lookup reads go over the wire as ONE pipeline request; the
+    // conditional ones simply return no rows when their premise doesn't hold.
+    // (was: up to 5 serial round trips per document — the ingest worker's
+    // throughput ceiling under archive-backfill bursts.)
+    const platform_pattern: []const u8 = if (std.mem.eql(u8, platform, "greengale"))
+        "%greengale.app%"
+    else if (std.mem.eql(u8, platform, "pckt"))
+        "%pckt.blog%"
+    else if (std.mem.eql(u8, platform, "offprint"))
+        "%offprint.app%"
+    else if (std.mem.eql(u8, platform, "leaflet"))
+        "%leaflet.pub%"
+    else
+        "%";
+
+    var reads = try c.queryBatch(&.{
+        .{ .sql = "SELECT uri FROM documents WHERE did = ? AND rkey = ?", .args = &.{ did, rkey } },
+        .{ .sql = "SELECT uri FROM documents WHERE did = ? AND content_hash = ?", .args = &.{ did, &content_hash } },
+        .{ .sql = "SELECT base_path, platform FROM publications WHERE uri = ?", .args = &.{pub_uri} },
+        .{ .sql = "SELECT base_path FROM publications WHERE did = ? AND base_path LIKE ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{ did, platform_pattern } },
+        .{ .sql = "SELECT base_path FROM publications WHERE did = ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{did} },
+    });
+    defer reads.deinit();
+
+    // dedupe: if (did, rkey) exists with different uri, clean up old record first
+    // this handles cross-collection duplicates (e.g., pub.leaflet.document + site.standard.document)
+    var doc_exists = false;
+    var old_uri_buf: [512]u8 = undefined;
+    var stale_uri: []const u8 = "";
+    if (reads.getFirst(0)) |row| {
+        const old_uri = row.text(0);
+        if (!std.mem.eql(u8, old_uri, uri)) {
+            if (old_uri.len <= old_uri_buf.len) {
+                @memcpy(old_uri_buf[0..old_uri.len], old_uri);
+                stale_uri = old_uri_buf[0..old_uri.len];
+            }
+        } else {
+            doc_exists = true;
+        }
+    }
+
+    // cross-platform content dedup: if same author already has a document with
+    // identical title+content (different rkey from a different platform), skip it.
+    var content_unchanged = false;
+    if (reads.getFirst(1)) |row| {
+        const existing_uri = row.text(0);
+        if (!std.mem.eql(u8, existing_uri, uri)) {
+            logfire.debug("indexer: skipping dupe for {s} (existing: {s})", .{ uri, existing_uri });
+            logfire.span("ingest.dropped", .{ .reason = "content_hash_dupe", .uri = uri, .existing_uri = existing_uri }).end();
+            return;
+        }
+        content_unchanged = true;
+    }
+
     // look up base_path from publication (or fallback to DID lookup)
     // use a stack buffer because row.text() returns a slice into result memory
-    // which gets freed by result.deinit()
+    // which gets freed by reads.deinit()
     var base_path_buf: [256]u8 = undefined;
     var base_path: []const u8 = "";
     // pckt blogs on custom domains carry no `pckt.blog` in their host, so we
@@ -120,18 +138,14 @@ pub fn insertDocument(
     var pub_is_pckt = false;
 
     if (pub_uri.len > 0) {
-        if (c.query("SELECT base_path, platform FROM publications WHERE uri = ?", &.{pub_uri})) |res| {
-            var result = res;
-            defer result.deinit();
-            if (result.first()) |row| {
-                const val = row.text(0);
-                if (val.len > 0 and val.len <= base_path_buf.len) {
-                    @memcpy(base_path_buf[0..val.len], val);
-                    base_path = base_path_buf[0..val.len];
-                }
-                pub_is_pckt = std.mem.eql(u8, row.text(1), "pckt");
+        if (reads.getFirst(2)) |row| {
+            const val = row.text(0);
+            if (val.len > 0 and val.len <= base_path_buf.len) {
+                @memcpy(base_path_buf[0..val.len], val);
+                base_path = base_path_buf[0..val.len];
             }
-        } else |_| {}
+            pub_is_pckt = std.mem.eql(u8, row.text(1), "pckt");
+        }
     }
     // prefer the document's own `site` root host (read into publication_uri) over
     // a DID-guessed publication. authors can run BOTH a known-platform publication
@@ -146,45 +160,18 @@ pub fn insertDocument(
             }
         }
     }
-    // fallback: find publication by DID, preferring platform-specific matches
+    // fallback: find publication by DID, preferring platform-specific matches,
+    // then any publication (batch indices 3 and 4)
     if (base_path.len == 0) {
-        // try platform-specific publication first
-        const platform_pattern: []const u8 = if (std.mem.eql(u8, platform, "greengale"))
-            "%greengale.app%"
-        else if (std.mem.eql(u8, platform, "pckt"))
-            "%pckt.blog%"
-        else if (std.mem.eql(u8, platform, "offprint"))
-            "%offprint.app%"
-        else if (std.mem.eql(u8, platform, "leaflet"))
-            "%leaflet.pub%"
-        else
-            "%";
-
-        if (c.query("SELECT base_path FROM publications WHERE did = ? AND base_path LIKE ? ORDER BY LENGTH(base_path) DESC LIMIT 1", &.{ did, platform_pattern })) |res| {
-            var result = res;
-            defer result.deinit();
-            if (result.first()) |row| {
+        for ([_]usize{ 3, 4 }) |idx| {
+            if (reads.getFirst(idx)) |row| {
                 const val = row.text(0);
                 if (val.len > 0 and val.len <= base_path_buf.len) {
                     @memcpy(base_path_buf[0..val.len], val);
                     base_path = base_path_buf[0..val.len];
+                    break;
                 }
             }
-        } else |_| {}
-
-        // if no platform-specific match, fall back to any publication
-        if (base_path.len == 0) {
-            if (c.query("SELECT base_path FROM publications WHERE did = ? ORDER BY LENGTH(base_path) DESC LIMIT 1", &.{did})) |res| {
-                var result = res;
-                defer result.deinit();
-                if (result.first()) |row| {
-                    const val = row.text(0);
-                    if (val.len > 0 and val.len <= base_path_buf.len) {
-                        @memcpy(base_path_buf[0..val.len], val);
-                        base_path = base_path_buf[0..val.len];
-                    }
-                }
-            } else |_| {}
         }
     }
 
@@ -253,32 +240,129 @@ pub fn insertDocument(
     // `site` field, so it dropped real content like blog.mainasara.dev.)
     const is_bridgyfed: []const u8 = "0";
 
-    // use ON CONFLICT to preserve embedded_at (INSERT OR REPLACE would nuke it)
-    // indexed_at means "content last changed", not "record last seen": platforms
-    // mass re-put whole archives over the firehose, and re-stamping unchanged
-    // docs churns the below-watermark set the snapshot builder's count gate
-    // assumes immutable (2026-07-21 crash-loop). Metadata-only updates still
-    // apply; the snapshot copies full rows, so they propagate regardless.
-    try c.exec(DOC_UPSERT_SQL,
-        &.{ uri, did, rkey, title, content, created_at orelse "", pub_uri, actual_platform, source_collection, path orelse "", base_path, has_pub, &content_hash, cover_image orelse "", is_bridgyfed, content_type orelse "", source_cid orelse "" },
-    );
-
-    // FTS holds exactly title+content — what content_hash covers — so an
-    // unchanged re-put has nothing to rewrite there. Skipping it saves the
-    // delete+insert pair on turso for every doc of a re-put archive.
-    if (!content_unchanged) {
-        updateDocumentFts(c, uri, title, content, doc_exists);
-    }
-
-    // update tags
-    c.exec("DELETE FROM document_tags WHERE document_uri = ?", &.{uri}) catch {};
-    for (tags) |tag| {
-        c.exec(
-            "INSERT OR IGNORE INTO document_tags (document_uri, tag) VALUES (?, ?)",
-            &.{ uri, tag },
-        ) catch {};
-    }
+    // all writes ship as ONE pipeline request (was: up to 8 serial round trips).
+    // per-statement semantics match the old code's `catch {}` tolerance; a
+    // failed HTTP request (turso down) still propagates.
+    //
+    // upsert uses ON CONFLICT to preserve embedded_at (INSERT OR REPLACE would
+    // nuke it). indexed_at means "content last changed", not "record last
+    // seen": platforms mass re-put whole archives over the firehose, and
+    // re-stamping unchanged docs churns the below-watermark set the snapshot
+    // builder's count gate assumes immutable (2026-07-21 crash-loop).
+    // Metadata-only updates still apply; the snapshot copies full rows, so
+    // they propagate regardless.
+    var batch = DocWriteBatch{};
+    defer batch.deinit(c.allocator);
+    const write_stmts = try batch.build(c.allocator, .{
+        .uri = uri,
+        .did = did,
+        .rkey = rkey,
+        .title = title,
+        .content = content,
+        .created_at = created_at orelse "",
+        .pub_uri = pub_uri,
+        .platform = actual_platform,
+        .source_collection = source_collection,
+        .path = path orelse "",
+        .base_path = base_path,
+        .has_pub = has_pub,
+        .content_hash = &content_hash,
+        .cover_image = cover_image orelse "",
+        .is_bridgyfed = is_bridgyfed,
+        .content_type = content_type orelse "",
+        .source_cid = source_cid orelse "",
+        .stale_uri = stale_uri,
+        .doc_exists = doc_exists,
+        .content_unchanged = content_unchanged,
+        .tags = tags,
+    });
+    var writes = try c.queryBatch(write_stmts);
+    writes.deinit();
 }
+
+pub const DocWriteParams = struct {
+    uri: []const u8,
+    did: []const u8,
+    rkey: []const u8,
+    title: []const u8,
+    content: []const u8,
+    created_at: []const u8,
+    pub_uri: []const u8,
+    platform: []const u8,
+    source_collection: []const u8,
+    path: []const u8,
+    base_path: []const u8,
+    has_pub: []const u8,
+    content_hash: []const u8,
+    cover_image: []const u8,
+    is_bridgyfed: []const u8,
+    content_type: []const u8,
+    source_cid: []const u8,
+    /// prior uri under the same (did, rkey), when it differs from `uri`
+    stale_uri: []const u8,
+    doc_exists: bool,
+    content_unchanged: bool,
+    tags: []const []const u8,
+};
+
+/// Builds the single-pipeline write batch for one document. Owns the arg
+/// storage the returned statements point into — must stay pinned (not moved)
+/// until the batch has been executed.
+pub const DocWriteBatch = struct {
+    stmts: std.ArrayList(db.Client.Statement) = .empty,
+    tag_args: std.ArrayList([2][]const u8) = .empty,
+    stale_args: [1][]const u8 = undefined,
+    uri_args: [1][]const u8 = undefined,
+    fts_args: [4][]const u8 = undefined,
+    upsert_args: [17][]const u8 = undefined,
+
+    pub fn deinit(self: *DocWriteBatch, allocator: std.mem.Allocator) void {
+        self.stmts.deinit(allocator);
+        self.tag_args.deinit(allocator);
+    }
+
+    pub fn build(self: *DocWriteBatch, allocator: std.mem.Allocator, p: DocWriteParams) ![]const db.Client.Statement {
+        self.stale_args = .{p.stale_uri};
+        self.uri_args = .{p.uri};
+        self.fts_args = .{ p.uri, p.uri, p.title, p.content };
+        self.upsert_args = .{ p.uri, p.did, p.rkey, p.title, p.content, p.created_at, p.pub_uri, p.platform, p.source_collection, p.path, p.base_path, p.has_pub, p.content_hash, p.cover_image, p.is_bridgyfed, p.content_type, p.source_cid };
+
+        if (p.stale_uri.len > 0) {
+            // FTS is keyed by documents.rowid: drop the FTS row BEFORE the
+            // documents row (the rowid lookup needs it to still exist).
+            try self.stmts.append(allocator, .{ .sql = "DELETE FROM documents_fts WHERE rowid = (SELECT rowid FROM documents WHERE uri = ?)", .args = &self.stale_args });
+            try self.stmts.append(allocator, .{ .sql = "DELETE FROM document_tags WHERE document_uri = ?", .args = &self.stale_args });
+            try self.stmts.append(allocator, .{ .sql = "DELETE FROM documents WHERE uri = ?", .args = &self.stale_args });
+        }
+
+        try self.stmts.append(allocator, .{ .sql = DOC_UPSERT_SQL, .args = &self.upsert_args });
+
+        // FTS holds exactly title+content — what content_hash covers — so an
+        // unchanged re-put has nothing to rewrite there. `uri` is UNINDEXED in
+        // documents_fts, so deletes go through documents.rowid (a PK seek),
+        // and only when this uri already has a row to replace.
+        if (!p.content_unchanged) {
+            if (p.doc_exists) {
+                try self.stmts.append(allocator, .{ .sql = "DELETE FROM documents_fts WHERE rowid = (SELECT rowid FROM documents WHERE uri = ?)", .args = &self.uri_args });
+            }
+            try self.stmts.append(allocator, .{ .sql = "INSERT INTO documents_fts (rowid, uri, title, content) VALUES ((SELECT rowid FROM documents WHERE uri = ?), ?, ?, ?)", .args = &self.fts_args });
+        }
+
+        // per-tag arg pairs live in tag_args, reserved up front so appended
+        // pointers never move.
+        try self.stmts.append(allocator, .{ .sql = "DELETE FROM document_tags WHERE document_uri = ?", .args = &self.uri_args });
+        try self.tag_args.ensureTotalCapacityPrecise(allocator, p.tags.len);
+        for (p.tags) |tag| {
+            self.tag_args.appendAssumeCapacity(.{ p.uri, tag });
+            try self.stmts.append(allocator, .{
+                .sql = "INSERT OR IGNORE INTO document_tags (document_uri, tag) VALUES (?, ?)",
+                .args = &self.tag_args.items[self.tag_args.items.len - 1],
+            });
+        }
+
+        return self.stmts.items;
+    }
+};
 
 pub const DOC_UPSERT_SQL =
     \\INSERT INTO documents (uri, did, rkey, title, content, created_at, publication_uri, platform, source_collection, path, base_path, has_publication, content_hash, cover_image, indexed_at, is_bridgyfed, content_type, source_cid)
@@ -305,21 +389,6 @@ pub const DOC_UPSERT_SQL =
     \\  source_cid = excluded.source_cid,
     \\  embedded_at = documents.embedded_at
 ;
-
-// update FTS index. `uri` is UNINDEXED in documents_fts, so deleting by it
-// would full-scan the FTS table on remote turso. Instead we key the FTS
-// rowid to documents.rowid (a PK seek on `uri`), so deletes are O(1). Only
-// pay the delete when this uri already has a row to replace; creates skip
-// it. (One-time alignment of pre-existing rows: scripts/rebuild-fts.)
-fn updateDocumentFts(c: *db.Client, uri: []const u8, title: []const u8, content: []const u8, doc_exists: bool) void {
-    if (doc_exists) {
-        c.exec("DELETE FROM documents_fts WHERE rowid = (SELECT rowid FROM documents WHERE uri = ?)", &.{uri}) catch {};
-    }
-    c.exec(
-        "INSERT INTO documents_fts (rowid, uri, title, content) VALUES ((SELECT rowid FROM documents WHERE uri = ?), ?, ?, ?)",
-        &.{ uri, uri, title, content },
-    ) catch {};
-}
 
 pub fn insertPublication(
     uri: []const u8,
@@ -538,6 +607,140 @@ test "httpSiteRootHost: root URL → host, deep link → null" {
     try t.expect(httpSiteRootHost("https://example.com/posts/x") == null);
     // not http
     try t.expect(httpSiteRootHost("at://did:plc:abc/foo") == null);
+}
+
+test "DocWriteBatch: stale-uri cleanup, FTS, and tags replay correctly against sqlite" {
+    const t = std.testing;
+    const zqlite = @import("zqlite");
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+    defer conn.close();
+    try conn.exec(
+        \\CREATE TABLE documents (
+        \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+        \\  created_at TEXT, publication_uri TEXT, platform TEXT, source_collection TEXT,
+        \\  path TEXT, base_path TEXT, has_publication INTEGER, content_hash TEXT,
+        \\  cover_image TEXT, indexed_at TEXT, is_bridgyfed INTEGER, content_type TEXT,
+        \\  source_cid TEXT, embedded_at TEXT
+        \\)
+    , .{});
+    try conn.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+    try conn.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT, PRIMARY KEY (document_uri, tag))", .{});
+
+    // seed the OLD record under the same (did, rkey): a cross-collection re-put
+    try conn.exec("INSERT INTO documents (uri, did, rkey, title, content) VALUES ('at://x/old/1', 'did:plc:x', '1', 'old title', 'old body')", .{});
+    try conn.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
+    try conn.exec("INSERT INTO document_tags (document_uri, tag) VALUES ('at://x/old/1', 'stale-tag')", .{});
+
+    var batch = DocWriteBatch{};
+    defer batch.deinit(t.allocator);
+    const stmts = try batch.build(t.allocator, .{
+        .uri = "at://x/new/1",
+        .did = "did:plc:x",
+        .rkey = "1",
+        .title = "new title",
+        .content = "new body",
+        .created_at = "2026-01-01",
+        .pub_uri = "",
+        .platform = "other",
+        .source_collection = "site.standard.document",
+        .path = "",
+        .base_path = "",
+        .has_pub = "0",
+        .content_hash = "hash-new",
+        .cover_image = "",
+        .is_bridgyfed = "0",
+        .content_type = "",
+        .source_cid = "",
+        .stale_uri = "at://x/old/1",
+        .doc_exists = false,
+        .content_unchanged = false,
+        .tags = &.{ "zig", "search" },
+    });
+
+    // replay the batch in order, exactly as turso's pipeline would.
+    // if the FTS delete were ordered AFTER the documents delete, its
+    // rowid subquery would find nothing and the stale FTS row would
+    // survive — the assertions below catch that reordering.
+    for (stmts) |stmt| {
+        const prepared = try conn.prepare(stmt.sql);
+        defer prepared.deinit();
+        for (stmt.args, 0..) |arg, i| try prepared.bindValue(arg, i);
+        try prepared.stepToCompletion();
+    }
+
+    {
+        const row = (try conn.row("SELECT COUNT(*) FROM documents", .{})).?;
+        defer row.deinit();
+        try t.expectEqual(@as(i64, 1), row.int(0));
+    }
+    {
+        const row = (try conn.row("SELECT uri, title FROM documents", .{})).?;
+        defer row.deinit();
+        try t.expectEqualStrings("at://x/new/1", row.text(0));
+        try t.expectEqualStrings("new title", row.text(1));
+    }
+    { // stale FTS row purged, new one searchable
+        const stale = (try conn.row("SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'old'", .{})).?;
+        defer stale.deinit();
+        try t.expectEqual(@as(i64, 0), stale.int(0));
+        const fresh = (try conn.row("SELECT uri FROM documents_fts WHERE documents_fts MATCH 'new'", .{})).?;
+        defer fresh.deinit();
+        try t.expectEqualStrings("at://x/new/1", fresh.text(0));
+    }
+    { // stale tag purged, new tags in place
+        const row = (try conn.row("SELECT COUNT(*), GROUP_CONCAT(tag) FROM document_tags WHERE document_uri = 'at://x/new/1'", .{})).?;
+        defer row.deinit();
+        try t.expectEqual(@as(i64, 2), row.int(0));
+        const none = (try conn.row("SELECT COUNT(*) FROM document_tags WHERE document_uri = 'at://x/old/1'", .{})).?;
+        defer none.deinit();
+        try t.expectEqual(@as(i64, 0), none.int(0));
+    }
+}
+
+test "DocWriteBatch: unchanged content skips FTS rewrite; changed existing doc replaces FTS in place" {
+    const t = std.testing;
+    // unchanged: no FTS statements at all
+    var unchanged = DocWriteBatch{};
+    defer unchanged.deinit(t.allocator);
+    const p_base = DocWriteParams{
+        .uri = "at://x/doc/1",
+        .did = "did:plc:x",
+        .rkey = "1",
+        .title = "t",
+        .content = "c",
+        .created_at = "",
+        .pub_uri = "",
+        .platform = "other",
+        .source_collection = "site.standard.document",
+        .path = "",
+        .base_path = "",
+        .has_pub = "0",
+        .content_hash = "h",
+        .cover_image = "",
+        .is_bridgyfed = "0",
+        .content_type = "",
+        .source_cid = "",
+        .stale_uri = "",
+        .doc_exists = true,
+        .content_unchanged = true,
+        .tags = &.{},
+    };
+    for (try unchanged.build(t.allocator, p_base)) |stmt| {
+        try t.expect(std.mem.indexOf(u8, stmt.sql, "documents_fts") == null);
+    }
+
+    // changed content on an existing doc: FTS delete precedes FTS insert
+    var changed = DocWriteBatch{};
+    defer changed.deinit(t.allocator);
+    var p = p_base;
+    p.content_unchanged = false;
+    var fts_delete_at: ?usize = null;
+    var fts_insert_at: ?usize = null;
+    for (try changed.build(t.allocator, p), 0..) |stmt, i| {
+        if (std.mem.startsWith(u8, stmt.sql, "DELETE FROM documents_fts")) fts_delete_at = i;
+        if (std.mem.startsWith(u8, stmt.sql, "INSERT INTO documents_fts")) fts_insert_at = i;
+    }
+    try t.expect(fts_delete_at.? < fts_insert_at.?);
 }
 
 test "DOC_UPSERT_SQL: unchanged content keeps indexed_at, changed content bumps it" {

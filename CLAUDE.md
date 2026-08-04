@@ -28,6 +28,7 @@
 - hybrid BM25 + recency: `ORDER BY rank + (days_old / 30)`
 - OR between terms for recall, prefix on last word
 - unicode61 tokenizer (non-alphanumeric = separator)
+- tag browse (empty query + tag): served from the local replica, ranked by `months_old - RECOMMEND_LIFT·ln(1+recommenders)`; text+tag combos still fall back to Turso (slow, ~6s — known follow-up)
 
 ## snapshot builder (replica freshness)
 - runs OFF fly since 2026-07-25: prefect deployment `pub-search-snapshot` on heavypad (`my-prefect-server/flows/pub_search_snapshot.py`), every 2h — see `docs/builder-offbox-plan.md`

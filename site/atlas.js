@@ -26,8 +26,10 @@
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
       outStart: 45, outRange: 15,  // fade out approaching card zoom
     },
-    // max on-screen labels per layer
-    labels:    { titles: { s: 5, l: 22 }, coarse: { s: 5, l: 12 }, fine: { s: 6, l: 16 } },
+    // max on-screen labels per layer. One shared collision economy, placed in
+    // priority order: cluster labels (landmarks) first, then doc titles
+    // (recommendation-ranked), then publication names with whatever's left.
+    labels:    { titles: { s: 4, l: 12 }, coarse: { s: 5, l: 12 }, fine: { s: 6, l: 16 }, pubNames: { s: 3, l: 8 } },
     avatars:   { budget: { s: 6, l: 22 }, cull: { s: 6, l: 4 }, imgThreshold: { s: 16, l: 11 } },
     recommend: { limit: 250, boostFloor: 6 }, // popularity boost from /recommended
   };
@@ -1010,6 +1012,7 @@
     // radius = sqrt(count) * zoom * 0.35, capped at 28px
     // at zoom 1: sqrt(236)≈15 → 5.4px (visible), sqrt(30)≈5.5 → 1.9px (culled)
     // smaller than before — publications accent the map, not dominate it
+    var pubLabelCands = []; // deferred to the label economy below
     if (pubData && pubData.length > 0) {
       var pubLabelZoom = 3;
       var pubRendered = 0;
@@ -1052,8 +1055,9 @@
           ctx.arc(psx, psy, pr, 0, Math.PI * 2);
           ctx.fillStyle = pColors.edge;
           ctx.fill();
-          // letter only when circle is large enough to read
-          if (pr >= 10) {
+          // letter only once the circle is a real landmark — smaller pubs
+          // stay quiet rings so dense regions read as dots, not glyphs
+          if (pr >= 14) {
             var letter = (pub.name || '?').charAt(0).toUpperCase();
             var letterSize = Math.max(8, pr * 0.9);
             ctx.font = 'bold ' + Math.round(letterSize) + 'px monospace';
@@ -1065,24 +1069,18 @@
           }
         }
 
-        // border ring
-        ctx.globalAlpha = 0.6;
+        // border ring — quiet on small circles, assertive only as they grow
+        ctx.globalAlpha = 0.2 + Math.min(0.4, pr / 35);
         ctx.beginPath();
         ctx.arc(psx, psy, pr, 0, Math.PI * 2);
         ctx.strokeStyle = pColors.mid;
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // name label at higher zoom
-        if (zoom >= pubLabelZoom && pr >= 10) {
-          var labelSize = Math.max(8, Math.min(12, pr * 0.5));
-          ctx.font = Math.round(labelSize) + 'px monospace';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'top';
-          ctx.globalAlpha = Math.min(0.8, fadeIn(zoom, pubLabelZoom, 1.0));
-          ctx.fillStyle = dark ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.75)';
-          var pubLabel = pub.name.length > 20 ? pub.name.substring(0, 18) + '\u2026' : pub.name;
-          drawLabel(pubLabel, psx, psy + pr + 4, dark);
+        // name labels no longer draw here \u2014 they queue for the shared label
+        // economy below, where cluster labels and doc titles place first
+        if (zoom >= pubLabelZoom && pr >= 10 && pubLabelCands.length < 40) {
+          pubLabelCands.push({ name: pub.name, x: psx, y: psy + pr + 9 });
         }
       }
       ctx.globalAlpha = 1;
@@ -1458,10 +1456,12 @@
     }
 
     if (fineAlpha > 0.01) {
-      ctx.font = (small ? '8px' : '11px') + ' monospace';
-      ctx.globalAlpha = 0.9 * fineAlpha;
+      // bold: cluster labels are the landmarks of this zoom range — they must
+      // read above the per-node text, not blend into it
+      ctx.font = 'bold ' + (small ? '9px' : '12px') + ' monospace';
+      ctx.globalAlpha = 0.95 * fineAlpha;
       ctx.fillStyle = dark ? 'rgba(255,255,255,0.95)' : 'rgba(0,0,0,0.88)';
-      var fontSize = small ? 8 : 11;
+      var fontSize = small ? 9 : 12;
       var maxFine = ATLAS_TUNE.labels.fine[small ? 's' : 'l'];
       var shownFine = 0;
       var sorted = data.clusters.fine.slice().sort(function(a, b) { return b.count - a.count; });
@@ -1534,6 +1534,26 @@
           }
           shown++;
         }
+      }
+    }
+
+    // --- publication name labels: last claim on the label economy ---
+    // candidates were collected biggest-first in the pub circle pass; they
+    // only place where cluster labels and doc titles left room
+    if (pubLabelCands.length) {
+      var maxPubNames = ATLAS_TUNE.labels.pubNames[small ? 's' : 'l'];
+      var pubFont = small ? 8 : 10;
+      ctx.font = pubFont + 'px monospace';
+      ctx.globalAlpha = Math.min(0.8, fadeIn(zoom, 3, 1.0));
+      ctx.fillStyle = dark ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.75)';
+      var shownPub = 0;
+      for (var pc = 0; pc < pubLabelCands.length && shownPub < maxPubNames; pc++) {
+        var cand = pubLabelCands[pc];
+        if (cand.y < LABEL_MARGIN || cand.y > H - 40) continue;
+        var pubName = cand.name.length > 20 ? cand.name.substring(0, 18) + '…' : cand.name;
+        var pw = ctx.measureText(pubName).width;
+        if (!fitsHoriz(cand.x, pw / 2)) continue;
+        if (canPlace(cand.x, cand.y, pw, pubFont)) { drawLabel(pubName, cand.x, cand.y, dark); shownPub++; }
       }
     }
 

@@ -80,7 +80,6 @@ pub const Pipeline = struct {
     /// seqs submitted but not yet delivered to the channel
     inflight: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
-    submitted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -147,7 +146,6 @@ pub const Pipeline = struct {
         chain.tail = item;
         chain.len += 1;
         self.inflight.put(self.allocator, seq, {}) catch {};
-        _ = self.submitted.fetchAdd(1, .monotonic);
 
         const in_ready = chain.next_ready != null or self.ready_tail == chain;
         if (!chain.owned and !in_ready) {

@@ -59,9 +59,9 @@ const TASK_RUNNING: u8 = 0;
 const TASK_DONE: u8 = 1;
 const TASK_ABANDONED: u8 = 2;
 
-/// one in-flight DID resolution, heap-owned so it can outlive the firehose
-/// thread's patience: whoever loses the state race (resolver thread finishing
-/// vs firehose thread abandoning) is responsible for freeing it.
+/// one in-flight DID resolution, heap-owned so it can outlive the verify
+/// worker's patience: whoever loses the state race (resolver thread finishing
+/// vs worker abandoning) is responsible for freeing it.
 const ResolveTask = struct {
     io: Io,
     allocator: std.mem.Allocator,

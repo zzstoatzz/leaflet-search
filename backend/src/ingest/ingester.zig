@@ -83,18 +83,20 @@ fn useTls() bool {
 }
 
 /// Bounded queue for decoupling websocket readLoop from turso writes.
-/// ACKs are sent immediately in the readLoop; processing happens in a worker thread.
-/// If the queue is full (turso is slow), the OLDEST queued frame is dropped
-/// (already ACK'd) so the freshest data wins. Sized to absorb archive-backfill
-/// bursts (a publisher re-putting tens of thousands of records in minutes) —
-/// frames are small; the real defense is write-path throughput (batched
-/// pipeline requests in indexer.zig), this buffer is insurance.
+/// Processing (and the post-commit ACK) happens in the worker thread. If the
+/// queue is full (turso is slow), the OLDEST queued frame is shed — it was
+/// never ACKed, so the ingester's outbox retransmits it (~60s). Sized to
+/// absorb archive-backfill bursts (a publisher re-putting tens of thousands
+/// of records in minutes) — frames are small; the real defense is write-path
+/// throughput (batched pipeline requests in indexer.zig), this buffer is
+/// insurance.
 const QUEUE_CAPACITY = 4096;
 
 const IngesterCtx = struct {
     allocator: Allocator,
     handler: ?*Handler = null,
     drop_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    no_id_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn process(self: *IngesterCtx, _: Io, frame: []u8) void {
         defer self.allocator.free(frame);
@@ -108,9 +110,14 @@ const IngesterCtx = struct {
         // the frame from its outbox on this ack (at-least-once, both sides).
         // this worker is the ONLY ack writer (workers=1); bump workers and
         // this needs a write lock around the websocket client.
-        if (self.handler) |h| {
-            if (extractMessageId(self.allocator, frame)) |id| h.sendAck(id);
-        }
+        const msg_id = extractMessageId(self.allocator, frame) orelse {
+            const n = self.no_id_count.fetchAdd(1, .monotonic) + 1;
+            if (n <= 5) {
+                logfire.warn("ingester: message has no id, first {d} bytes: {s}", .{ @min(frame.len, 100), frame[0..@min(frame.len, 100)] });
+            }
+            return;
+        };
+        if (self.handler) |h| h.sendAck(msg_id);
     }
 
     fn onDrop(self: *IngesterCtx, frame: []u8) void {
@@ -154,7 +161,6 @@ const Handler = struct {
     // atomic: read by the staleness watchdog thread
     msg_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     ack_count: usize = 0,
-    no_id_count: usize = 0,
     ack_buf: [64]u8 = undefined,
 
     pub fn serverMessage(self: *Handler, data: []const u8) !void {
@@ -166,16 +172,10 @@ const Handler = struct {
             });
         }
 
-        if (extractMessageId(self.allocator, data) == null) {
-            self.no_id_count += 1;
-            if (self.no_id_count <= 5) {
-                logfire.warn("ingester: message has no id, first {d} bytes: {s}", .{ @min(data.len, 100), data[0..@min(data.len, 100)] });
-            }
-        }
-
-        // NO ack here: the worker acks after its turso batch commits, so the
-        // ingester's outbox holds the frame until it's durably processed —
-        // a shed frame gets retransmitted instead of silently lost.
+        // NO ack here: the worker acks after its turso batch commits (and owns
+        // the no-id diagnostic), so the ingester's outbox holds the frame until
+        // it's durably processed — a shed frame gets retransmitted instead of
+        // silently lost. no JSON parse on the read thread at all.
         // dupe message data (websocket reuses the buffer) and offer to processing pool.
         // drop_oldest shedding means full pool evicts the oldest queued frame, not the new one.
         const data_copy = self.allocator.dupe(u8, data) catch |err| {

@@ -40,7 +40,6 @@ pub const Channel = struct {
     // (one backend client, a few broadcasts/sec), so a spinlock is fine.
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     conns: [MAX_CLIENTS]?*ws.Conn = .{null} ** MAX_CLIENTS,
-    acks: u64 = 0,
     // FIFO outbox (linked list): appended by broadcast, pruned by acks,
     // evicted oldest-first under budget pressure. Entries keep their firehose
     // seq so the cursor checkpoint can refuse to advance past unacked work
@@ -147,7 +146,6 @@ pub const Channel = struct {
     pub fn ack(self: *Channel, seq: i64) void {
         self.lock();
         defer self.unlock();
-        self.acks += 1;
         var prev: ?*Entry = null;
         var cur = self.head;
         while (cur) |entry| {

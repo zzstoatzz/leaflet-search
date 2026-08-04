@@ -127,31 +127,34 @@ fn unlinkZ(allocator: Allocator, path: []const u8) void {
     _ = std.c.unlink(z.ptr);
 }
 
-/// Read a sidecar manifest's build_id ("" if absent/unparseable).
-fn sidecarBuildId(allocator: Allocator, io: Io, path: []const u8, buf: []u8) []const u8 {
-    const bytes = readFileAlloc(allocator, io, path, 64 * 1024) catch return "";
+/// Sidecar manifest fields the watcher compares against (copied out so the
+/// parse can be freed). Zero-valued when the sidecar is absent/unparseable.
+const SidecarInfo = struct {
+    build_id_buf: [64]u8 = undefined,
+    build_id_len: usize = 0,
+    doc_count: u64 = 0,
+
+    fn buildId(self: *const SidecarInfo) []const u8 {
+        return self.build_id_buf[0..self.build_id_len];
+    }
+};
+
+fn readSidecar(allocator: Allocator, io: Io, path: []const u8) SidecarInfo {
+    var info = SidecarInfo{};
+    const bytes = readFileAlloc(allocator, io, path, 64 * 1024) catch return info;
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }) catch return "";
+    }) catch return info;
     defer parsed.deinit();
     const id = parsed.value.build_id;
-    if (id.len > buf.len) return "";
-    @memcpy(buf[0..id.len], id);
-    return buf[0..id.len];
-}
-
-/// Read a sidecar manifest's doc_count (0 if absent/unparseable).
-fn sidecarDocCount(allocator: Allocator, io: Io, path: []const u8) u64 {
-    const bytes = readFileAlloc(allocator, io, path, 64 * 1024) catch return 0;
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch return 0;
-    defer parsed.deinit();
-    return parsed.value.doc_count;
+    if (id.len <= info.build_id_buf.len) {
+        @memcpy(info.build_id_buf[0..id.len], id);
+        info.build_id_len = id.len;
+    }
+    info.doc_count = parsed.value.doc_count;
+    return info;
 }
 
 /// Shrink floor: refuse a candidate whose doc_count is less than half the
@@ -214,17 +217,16 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
     const live = localDbPath();
     const live_sidecar = try std.fmt.allocPrint(arena, "{s}.manifest.json", .{live});
     const staged_sidecar = try std.fmt.allocPrint(arena, "{s}.new.manifest.json", .{live});
-    var id_buf_a: [64]u8 = undefined;
-    var id_buf_b: [64]u8 = undefined;
-    if (std.mem.eql(u8, sidecarBuildId(arena, io, live_sidecar, &id_buf_a), m.build_id)) return;
-    if (std.mem.eql(u8, sidecarBuildId(arena, io, staged_sidecar, &id_buf_b), m.build_id)) {
+    const live_info = readSidecar(arena, io, live_sidecar);
+    if (std.mem.eql(u8, live_info.buildId(), m.build_id)) return;
+    const staged_info = readSidecar(arena, io, staged_sidecar);
+    if (std.mem.eql(u8, staged_info.buildId(), m.build_id)) {
         logfire.info("promote: build {s} already staged, awaiting restart", .{m.build_id});
         return;
     }
 
-    const live_docs = sidecarDocCount(arena, io, live_sidecar);
-    if (!passesShrinkFloor(m.doc_count, live_docs)) {
-        logfire.err("promote: GATE FAIL shrink floor: candidate {s} has {d} docs, serving {d} — refusing (set PROMOTE_ALLOW_SHRINK=1 if intentional)", .{ m.build_id, m.doc_count, live_docs });
+    if (!passesShrinkFloor(m.doc_count, live_info.doc_count)) {
+        logfire.err("promote: GATE FAIL shrink floor: candidate {s} has {d} docs, serving {d} — refusing (set PROMOTE_ALLOW_SHRINK=1 if intentional)", .{ m.build_id, m.doc_count, live_info.doc_count });
         return error.ShrinkFloorGate;
     }
 

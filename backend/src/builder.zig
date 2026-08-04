@@ -145,6 +145,24 @@ pub fn run(allocator: Allocator, io: Io) !void {
         }
     }
 
+    // gate 1b: recommends + subscriptions counts vs turso, watermark-pinned
+    // like documents. these walks are keyset-paginated (sync.copyPaged); the
+    // gate is what proves a paging bug can't silently ship a partial copy.
+    inline for (.{
+        .{ sync.BUILD_REC_COUNT_SQL, "recommends" },
+        .{ sync.BUILD_SUB_COUNT_SQL, "subscriptions" },
+    }, .{ counts.recommends, counts.subscriptions }) |gate, built| {
+        var result = try turso.query(gate[0], &.{watermark});
+        defer result.deinit();
+        const expected: usize = if (result.first()) |row| @intCast(row.int(0)) else 0;
+        const tolerance = @max(expected / 1000, 10); // deletes mid-build only
+        const diff = if (expected > built) expected - built else built - expected;
+        if (diff > tolerance) {
+            logfire.err("builder: GATE FAIL {s} count: built {d}, turso expects {d} (±{d})", .{ gate[1], built, expected, tolerance });
+            return error.CountGate;
+        }
+    }
+
     // gate 2: FTS answers a query
     {
         const row = try conn.row("SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'the'", .{});

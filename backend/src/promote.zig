@@ -142,6 +142,31 @@ fn sidecarBuildId(allocator: Allocator, io: Io, path: []const u8, buf: []u8) []c
     return buf[0..id.len];
 }
 
+/// Read a sidecar manifest's doc_count (0 if absent/unparseable).
+fn sidecarDocCount(allocator: Allocator, io: Io, path: []const u8) u64 {
+    const bytes = readFileAlloc(allocator, io, path, 64 * 1024) catch return 0;
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return 0;
+    defer parsed.deinit();
+    return parsed.value.doc_count;
+}
+
+/// Shrink floor: refuse a candidate whose doc_count is less than half the
+/// currently-served build's. Every gate downstream checks the snapshot
+/// against ITS OWN manifest — internally consistent but drastically smaller
+/// (stale pointer, wrong-channel copy, a builder bug the build-side gates
+/// missed) would still pass. Legitimate mass shrinks (a ban-wave purge) set
+/// PROMOTE_ALLOW_SHRINK=1 for one adoption. (typeahead's "stale-but-correct
+/// over fresh-but-suspect" count floor, docs/scale-300k-plan.md §4.)
+fn passesShrinkFloor(candidate_docs: u64, live_docs: u64) bool {
+    if (live_docs == 0) return true; // nothing served yet / legacy sidecar
+    if (std.c.getenv("PROMOTE_ALLOW_SHRINK") != null) return true;
+    return candidate_docs >= live_docs / 2;
+}
+
 fn checkOnce(allocator: Allocator, io: Io) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -195,6 +220,12 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
     if (std.mem.eql(u8, sidecarBuildId(arena, io, staged_sidecar, &id_buf_b), m.build_id)) {
         logfire.info("promote: build {s} already staged, awaiting restart", .{m.build_id});
         return;
+    }
+
+    const live_docs = sidecarDocCount(arena, io, live_sidecar);
+    if (!passesShrinkFloor(m.doc_count, live_docs)) {
+        logfire.err("promote: GATE FAIL shrink floor: candidate {s} has {d} docs, serving {d} — refusing (set PROMOTE_ALLOW_SHRINK=1 if intentional)", .{ m.build_id, m.doc_count, live_docs });
+        return error.ShrinkFloorGate;
     }
 
     logfire.info("promote: new build {s} on {s} channel ({d} docs, watermark {s})", .{
@@ -373,6 +404,15 @@ pub fn sha256File(io: Io, path: []const u8, out_hex: *[64]u8) !u64 {
     const hex = std.fmt.bytesToHex(digest, .lower);
     @memcpy(out_hex, &hex);
     return total;
+}
+
+test "shrink floor: refuses <50% of serving count, tolerates growth and empty live" {
+    try std.testing.expect(passesShrinkFloor(60_000, 60_000)); // steady
+    try std.testing.expect(passesShrinkFloor(300_000, 60_000)); // influx growth
+    try std.testing.expect(passesShrinkFloor(30_000, 60_000)); // exactly half: allowed
+    try std.testing.expect(!passesShrinkFloor(29_999, 60_000)); // below half: refused
+    try std.testing.expect(!passesShrinkFloor(0, 60_000)); // empty candidate: refused
+    try std.testing.expect(passesShrinkFloor(10, 0)); // no live sidecar: allowed
 }
 
 test "latestKeyForChannel maps channels to pointer keys" {

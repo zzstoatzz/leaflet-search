@@ -11,11 +11,15 @@ const pubkey = @import("../server/pubkey.zig");
 const LocalDb = @This();
 
 /// Local replica schema generation. Bump when createSchema changes shape
-/// (new column/table/index the serving code depends on). The builder stamps
-/// it into the manifest; the promote watcher rejects a mismatch — a snapshot
-/// built by an out-of-date builder image must stall freshness, not break
-/// serving. (Scheduled builder machines pin their creation image: recreate
-/// them after bumping this.)
+/// (new column/table/index the serving code depends on) — AND when the FTS
+/// tokenizer or query normalization changes: a snapshot tokenized one way
+/// searched by a server normalizing another serves wrong results with no
+/// error (typeahead's normalize_version lesson — the stamp is the only
+/// thing that surfaces the divergence). The builder stamps it into the
+/// manifest; the promote watcher rejects a mismatch — a snapshot built by
+/// an out-of-date builder image must stall freshness, not break serving.
+/// (Scheduled builder machines pin their creation image: recreate them
+/// after bumping this.)
 pub const SCHEMA_VERSION: u32 = 4; // v4: documents.source_cid for source-attested reconciliation
 
 const READ_POOL_SIZE = 12;

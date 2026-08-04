@@ -49,7 +49,7 @@ not at risk: doc-count gate (watermark-pinned both sides), FTS query paths with 
 tests, keyset doc export (linear + paced), ingester ring (evicts but pins cursor —
 relay replay recovers).
 
-## phase 1 — before the influx (must-land)
+## phase 1 — before the influx (SHIPPED 2026-08-04)
 
 ### 1a. batch the ingest write path
 replace per-doc serial RTTs with batched writes: accumulate N docs (or T ms), then
@@ -127,7 +127,7 @@ principled fix rather than a deadline tweak (`stream/src/internal/ingest/pipelin
   pre-exempt known publisher DIDs or gate the volume heuristic on account age /
   platform.
 
-## phase 3 — request-path hardening (lands with or shortly after)
+## phase 3 — request-path hardening (3a SHIPPED 2026-08-04; 3b audit pending)
 
 ### 3a. precompute tag-browse ranking (typeahead's core idea, applied narrowly)
 tag browse currently aggregates all of `recommends` per request. move the recommend
@@ -141,7 +141,7 @@ aggregation. this is the one place we adopt "ranking at build time" now.
 - rerun `turso db inspect --queries` after the influx settles (access-pattern audit
   playbook) and kill anything corpus-proportional that appeared.
 
-## phase 4 — adopt typeahead's promotion-gate refinements (cheap, whenever)
+## phase 4 — promotion-gate refinements (SHIPPED 2026-08-04 — most already existed; added shrink floor + tokenizer-version rule)
 
 - stamp tokenizer/normalizer + scoring version into snapshot meta; server refuses a
   snapshot with a mismatched version.

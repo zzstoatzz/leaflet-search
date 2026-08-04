@@ -899,7 +899,27 @@ const LOCAL_TAG_BROWSE_SQL =
     \\LIMIT ?
 ;
 
-fn searchLocalTagBrowse(alloc: Allocator, local: *db.LocalDb, tag: []const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, options: Options) ![]const u8 {
+// FTS text within a tag: the standard BM25 + recency ranking (text relevance
+// stays primary; the recommend lift is the tag-BROWSE ranking), restricted to
+// the tag's documents.
+const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
+    \\SELECT f.uri, d.did, d.title,
+    \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(p.name, '') as publication_name
+    \\FROM documents_fts f
+    \\JOIN documents d ON f.uri = d.uri
+    \\JOIN document_tags dt ON d.uri = dt.document_uri
+    \\LEFT JOIN publications p ON d.publication_uri = p.uri
+    \\WHERE documents_fts MATCH ? AND dt.tag = ?
+    \\AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
+    \\AND (? = '' OR d.created_at >= ?)
+    \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
+);
+
+fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: []const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, options: Options) ![]const u8 {
     const platform_val: []const u8 = platform_filter orelse "";
     const author_val: []const u8 = author_filter orelse "";
     const since_val: []const u8 = since_filter orelse "";
@@ -913,11 +933,21 @@ fn searchLocalTagBrowse(alloc: Allocator, local: *db.LocalDb, tag: []const u8, p
     defer seen_authors.deinit();
 
     var result_count: usize = 0;
-    var rows = try local.query(LOCAL_TAG_BROWSE_SQL, .{
-        tag,        platform_val, platform_val,
-        author_val, author_val,   since_val,
-        since_val,  queryCandidateLimit(options.max_results),
-    });
+    const candidate_limit = queryCandidateLimit(options.max_results);
+    var rows = if (query.len == 0)
+        try local.query(LOCAL_TAG_BROWSE_SQL, .{
+            tag,        platform_val, platform_val,
+            author_val, author_val,   since_val,
+            since_val,  candidate_limit,
+        })
+    else blk: {
+        const fts_query = try buildFtsQuery(alloc, query);
+        break :blk try local.query(LOCAL_TAG_FTS_SQL, .{
+            fts_query,  tag,        platform_val, platform_val,
+            author_val, author_val, since_val,    since_val,
+            candidate_limit,
+        });
+    };
     defer rows.deinit();
     while (rows.next()) |row| {
         if (result_count >= options.max_results) break;
@@ -937,8 +967,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
     // only handle basic FTS queries for now (most common case)
     // fall back to Turso for complex filter combinations and author-only browse
     if (tag_filter) |tag| {
-        if (query.len == 0) return searchLocalTagBrowse(alloc, local, tag, platform_filter, since_filter, author_filter, options);
-        return error.UnsupportedQuery; // FTS text + tag still falls back to Turso
+        return searchLocalTag(alloc, local, query, tag, platform_filter, since_filter, author_filter, options);
     }
     if (query.len == 0) {
         return error.UnsupportedQuery;
@@ -2062,6 +2091,7 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
         try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT)", .{});
         try w.exec("CREATE INDEX idx_document_tags_tag ON document_tags(tag)", .{});
         try w.exec("CREATE TABLE recommends (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, document_uri TEXT, created_at TEXT, indexed_at TEXT)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
         try w.exec("CREATE INDEX idx_recommends_document_uri ON recommends(document_uri)", .{});
 
         // 60k docs spread over ~700 days, every 80th tagged "photography" (~750)
@@ -2105,6 +2135,12 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
         }
     }
 
+    {
+        const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadWrite);
+        defer w.close();
+        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+    }
+
     var ldb = db.LocalDb.init(std.testing.allocator, tio);
     for (&ldb.read_pool) |*slot| slot.* = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadOnly);
     defer for (&ldb.read_pool) |*slot| {
@@ -2116,13 +2152,13 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     defer arena.deinit();
 
     // warm once, then measure
-    _ = try searchLocalTagBrowse(arena.allocator(), &ldb, "photography", null, null, null, .{ .show_hidden = true });
+    _ = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .show_hidden = true });
     var best_us: i64 = std.math.maxInt(i64);
     var out: []const u8 = "";
     var run: usize = 0;
     while (run < 5) : (run += 1) {
         const t0 = std.Io.Timestamp.now(tio, .awake).toMicroseconds();
-        out = try searchLocalTagBrowse(arena.allocator(), &ldb, "photography", null, null, null, .{ .show_hidden = true });
+        out = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .show_hidden = true });
         const us = std.Io.Timestamp.now(tio, .awake).toMicroseconds() - t0;
         if (us < best_us) best_us = us;
     }
@@ -2138,4 +2174,24 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     // and the three recommended probes beat every unrecommended doc
     const first_plain = std.mem.indexOf(u8, out, "at://doc/") orelse out.len;
     try std.testing.expect(id_ < first_plain);
+
+    // --- FTS text within the tag: BM25 + recency, restricted to tagged docs ---
+    var fts_best_us: i64 = std.math.maxInt(i64);
+    var fts_out: []const u8 = "";
+    var fts_run: usize = 0;
+    while (fts_run < 5) : (fts_run += 1) {
+        const t1 = std.Io.Timestamp.now(tio, .awake).toMicroseconds();
+        fts_out = try searchLocal(arena.allocator(), &ldb, "probe", "photography", null, null, null, .{ .show_hidden = true });
+        const us = std.Io.Timestamp.now(tio, .awake).toMicroseconds() - t1;
+        if (us < fts_best_us) fts_best_us = us;
+    }
+    std.debug.print("local fts+tag over 60k docs: best of 5 = {d} us\n", .{fts_best_us});
+
+    // only the four probes match 'probe'; equal BM25 -> recency decides: B, D, A, C
+    try std.testing.expect(std.mem.indexOf(u8, fts_out, "at://doc/") == null);
+    const fb = std.mem.indexOf(u8, fts_out, "at://probe/B").?;
+    const fd = std.mem.indexOf(u8, fts_out, "at://probe/D").?;
+    const fa = std.mem.indexOf(u8, fts_out, "at://probe/A").?;
+    const fc = std.mem.indexOf(u8, fts_out, "at://probe/C").?;
+    try std.testing.expect(fb < fd and fd < fa and fa < fc);
 }

@@ -20,7 +20,7 @@
       alpha: 0.05,         // per-stamp globalAlpha (overlaps build the cloud)
       stampFrac: 0.34,     // stamp radius as a fraction of cluster radius
       minStampPx: 10,      // floor so tiny clusters still read
-      varBase: 0.6, varRange: 0.8, // per-cluster opacity variation (stained-glass)
+      varBase: 0.6, varRange: 0.5, // per-cluster opacity variation (stained-glass)
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
       outStart: 45, outRange: 15,  // fade out approaching card zoom
       trim: 1.0,           // keep member pts within this × cluster radius

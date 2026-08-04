@@ -12,20 +12,19 @@
   // each — no presets, no settings UI; if a value is wrong, fix it here.
   // {s,l} = value for a {small, large} viewport (the W<600 split).
   var ATLAS_TUNE = {
-    // cluster nebulae — soft translucent clouds (NOT polygons). The same
-    // platform-tinted halo sprite the zoomed-out view uses, stamped across each
-    // cluster's member points so the cloud hugs the real shape and reads
-    // continuous as you zoom in. Per-stamp alpha accumulates into the nebula.
+    // cluster nebulae — lanterns. One soft light source per cluster, sitting
+    // at the weighted center of its members (a lantern in the middle of a
+    // group in a dark forest). A single smooth-falloff sprite per cluster
+    // means peak opacity is a bounded constant — wide and translucent at
+    // every zoom, never accumulating into an opaque core.
     nebula: {
-      alpha: 0.03,         // per-stamp globalAlpha (overlaps build the cloud)
-      stampFrac: 0.34,     // stamp radius as a fraction of cluster radius
-      minStampPx: 10,      // floor so tiny clusters still read
-      maxStampPx: 60,      // cap so sparse clusters don't bloom into giant flares at high zoom
-      varBase: 0.6, varRange: 0.5, // per-cluster opacity variation (stained-glass)
+      alpha: 0.22,         // peak opacity at the lantern's center
+      spread: 3.0,         // lantern radius as a multiple of the cluster's RMS spread
+      minHaloPx: 44,       // floor so tiny clusters still glow
+      maxHaloPx: 380,      // cap so no lantern swallows the screen at high zoom
+      varBase: 0.7, varRange: 0.3, // per-cluster brightness variation
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
       outStart: 45, outRange: 15,  // fade out approaching card zoom
-      trim: 1.0,           // keep member pts within this × cluster radius
-      sample: 28,          // max points sampled per cluster (load-time)
     },
     // max on-screen labels per layer
     labels:    { titles: { s: 5, l: 22 }, coarse: { s: 5, l: 12 }, fine: { s: 6, l: 16 } },
@@ -445,15 +444,24 @@
     var c = cv.getContext('2d');
     var half = size / 2;
     var nc = frameColors[platform];
+    var core = parseHex(nc.core), mid = parseHex(nc.mid), edge = parseHex(nc.edge);
+    // gaussian-style falloff sampled densely — no piecewise tiers, the light
+    // just dissipates. Hue drifts core -> mid -> edge as it fades.
+    var K = 3.0, floor = Math.exp(-K);
     var grad = c.createRadialGradient(half, half, 0, half, half, bucket);
-    grad.addColorStop(0, hexToRgba(nc.core, 1));
-    grad.addColorStop(0.3, hexToRgba(nc.mid, 0.5));
-    grad.addColorStop(0.7, hexToRgba(nc.edge, 0.2));
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    for (var s = 0; s <= 10; s++) {
+      var t = s / 10;
+      var a = (Math.exp(-K * t * t) - floor) / (1 - floor);
+      var from = t < 0.5 ? core : mid;
+      var to = t < 0.5 ? mid : edge;
+      var f = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+      var rr = Math.round(from[0] + (to[0] - from[0]) * f);
+      var gg = Math.round(from[1] + (to[1] - from[1]) * f);
+      var bb = Math.round(from[2] + (to[2] - from[2]) * f);
+      grad.addColorStop(t, 'rgba(' + rr + ',' + gg + ',' + bb + ',' + a.toFixed(4) + ')');
+    }
     c.fillStyle = grad;
-    c.beginPath();
-    c.arc(half, half, bucket, 0, Math.PI * 2);
-    c.fill();
+    c.fillRect(0, 0, size, size);
     return cv;
   }
 
@@ -896,33 +904,31 @@
       ctx.globalAlpha = 1;
     }
 
-    // --- fine cluster nebulae (the zoomed-IN view) ---
-    // NOT polygons. We stamp the SAME soft platform-tinted halo sprite across a
-    // sample of each cluster's member points, so overlapping soft stamps build
-    // an organic translucent cloud that hugs the cluster's actual shape. Fades
-    // in as the coarse nebulae fade out and persists through the zoomed-in
-    // range, where the fine cluster labels (below) name each cloud — continuous
-    // with the zoomed-out look, just finer.
+    // --- fine cluster nebulae: lanterns (the zoomed-IN view) ---
+    // One soft light per cluster at the weighted center of its members. A
+    // single smooth-falloff sprite means the center never exceeds neb.alpha —
+    // wide, translucent, and smooth at every zoom. Fades in as the coarse
+    // nebulae fade out; the fine cluster labels (below) name each glow.
     var neb = ATLAS_TUNE.nebula;
     var nebAlpha = fadeIn(zoom, neb.inStart, neb.inRange) * fadeOut(zoom, neb.outStart, neb.outRange);
     if (nebAlpha > 0.01 && data.clusters.fine) {
       var fine = data.clusters.fine;
       for (var c = 0; c < fine.length; c++) {
         var cl = fine[c];
-        var pts = cl.cloudPts;
-        if (!pts || pts.length < 2) continue;
-        if (cl.cx + cl.radius < xMin || cl.cx - cl.radius > xMax ||
-            cl.cy + cl.radius < yMin || cl.cy - cl.radius > yMax) continue;
-        var rPx = Math.min(neb.maxStampPx,
-          Math.max(neb.minStampPx, (cl.radius || 0.05) * neb.stampFrac * scale));
+        var L = cl.lantern;
+        if (!L) continue;
+        // the floor grows with sqrt(zoom): walking toward a lantern makes its
+        // aura wider, but never balloons the way linear scaling did
+        var rFloor = neb.minHaloPx * Math.sqrt(Math.max(1, zoom / neb.inStart));
+        var rPx = Math.min(neb.maxHaloPx,
+          Math.max(rFloor, L.r * neb.spread * scale)) * (smallViewport ? 0.85 : 1);
+        var nsx = cx + L.x * scale, nsy = cy + L.y * scale;
+        if (nsx + rPx < 0 || nsx - rPx > W || nsy + rPx < 0 || nsy - rPx > H) continue;
         var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx);
-        var drawSize2 = halo2.sprite.width * (rPx / halo2.bucket) * (smallViewport ? 0.85 : 1);
-        var v = neb.varBase + hash01(cl.id) * neb.varRange; // per-cloud opacity variation
+        var drawSize2 = halo2.sprite.width * (rPx / halo2.bucket);
+        var v = neb.varBase + hash01(cl.id) * neb.varRange; // per-lantern brightness variation
         ctx.globalAlpha = neb.alpha * v * nebAlpha;
-        for (var s = 0; s < pts.length; s += 2) {
-          var nsx = cx + pts[s] * scale, nsy = cy + pts[s + 1] * scale;
-          ctx.drawImage(halo2.sprite, nsx - drawSize2 / 2, nsy - drawSize2 / 2, drawSize2, drawSize2);
-        }
+        ctx.drawImage(halo2.sprite, nsx - drawSize2 / 2, nsy - drawSize2 / 2, drawSize2, drawSize2);
       }
       ctx.globalAlpha = 1;
     }
@@ -2111,33 +2117,36 @@
         // (see render) spends on the most prominent ones — the rest stay quiet.
         pubData.sort(function(a, b) { return (b.count || 0) - (a.count || 0); });
 
-        // --- fine-cluster nebula sample points ---
-        // Gather each fine cluster's member coords, trim far-flung outliers so
-        // the cloud hugs the dense core, then stride-sample down to a small cap.
-        // The render pass stamps a soft halo sprite at each of these to build an
-        // organic translucent nebula.
+        // --- fine-cluster lanterns ---
+        // Each cluster's glow is a single light source at the weighted center
+        // of its members (outliers beyond cl.radius trimmed), sized by the RMS
+        // spread of the group — so the lantern sits where the people are and
+        // reaches as far as they do, not as far as the farthest straggler.
         var finePts = {};
         for (var i = 0; i < n; i++) {
           var cf = d.points[i].clusterFine;
           (finePts[cf] || (finePts[cf] = [])).push([pointsX[i], pointsY[i]]);
         }
-        var nebSample = ATLAS_TUNE.nebula.sample, nebTrim = ATLAS_TUNE.nebula.trim;
         for (var c = 0; c < d.clusters.fine.length; c++) {
           var cl = d.clusters.fine[c];
           var pts = finePts[cl.id];
-          if (!pts) { cl.cloudPts = null; continue; }
-          var maxR = (cl.radius || 0.05) * nebTrim;
+          if (!pts) { cl.lantern = null; continue; }
+          var maxR = cl.radius || 0.05;
           var kept = [];
           for (var k = 0; k < pts.length; k++) {
             var ddx = pts[k][0] - cl.cx, ddy = pts[k][1] - cl.cy;
             if (ddx * ddx + ddy * ddy <= maxR * maxR) kept.push(pts[k]);
           }
-          if (kept.length < 2) kept = pts;
-          // stride-sample to <= nebSample so big clusters don't cost more
-          var stride = Math.max(1, Math.ceil(kept.length / nebSample));
-          var flat = [];
-          for (var k = 0; k < kept.length; k += stride) { flat.push(kept[k][0], kept[k][1]); }
-          cl.cloudPts = new Float32Array(flat);
+          if (!kept.length) kept = pts;
+          var mx = 0, my = 0;
+          for (var k = 0; k < kept.length; k++) { mx += kept[k][0]; my += kept[k][1]; }
+          mx /= kept.length; my /= kept.length;
+          var sum2 = 0;
+          for (var k = 0; k < kept.length; k++) {
+            var dx2 = kept[k][0] - mx, dy2 = kept[k][1] - my;
+            sum2 += dx2 * dx2 + dy2 * dy2;
+          }
+          cl.lantern = { x: mx, y: my, r: Math.max(0.008, Math.sqrt(sum2 / kept.length)) };
         }
 
         // --- popularity score per point ---

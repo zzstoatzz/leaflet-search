@@ -20,11 +20,35 @@
     nebula: {
       alpha: 0.22,         // peak opacity at the lantern's center
       spread: 3.0,         // lantern radius as a multiple of the cluster's RMS spread
-      minHaloPx: 44,       // floor so tiny clusters still glow
+      minHaloPx: 44,       // pixel floor at growRefZoom so tiny clusters still glow
+      growRefZoom: 2,      // zoom where the floor is exactly minHaloPx; grows as sqrt(zoom/this)
       maxHaloPx: 380,      // cap so no lantern swallows the screen at high zoom
+      smallShrink: 0.85,   // small-viewport lantern shrink
       varBase: 0.7, varRange: 0.3, // per-cluster brightness variation
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
       outStart: 45, outRange: 15,  // fade out approaching card zoom
+    },
+    // coarse region nebulae (the zoomed-OUT layer): the same sprite at region
+    // centroids. Ends early — once fine cluster labels are readable, the
+    // region-scale flares read as extreme rather than atmospheric.
+    coarse: {
+      alphaDark: 0.12, alphaLight: 0.10, // peak opacity
+      outStart: 1.8, outRange: 1.0,      // fully gone by ~2.8
+      smallShrink: 0.6,                  // small-viewport halo shrink
+    },
+    // per-cluster hue palette ('other'-dominated lanterns + their points):
+    // muted saturation — colored, but still atmospheric. [saturation, lightness]
+    hue: {
+      steps: 24, // hue quantization; bounds the sprite cache
+      dark:  { core: [0.5, 0.72], mid: [0.45, 0.52], edge: [0.4, 0.34] },
+      light: { core: [0.5, 0.5],  mid: [0.45, 0.62], edge: [0.4, 0.75] },
+    },
+    // publication circles: progressive disclosure gates
+    pubCircle: {
+      letterMinPx: 14, // letter glyph only once the circle is a real landmark
+      nameMinPx: 10,   // name-label candidacy (drawn via the label economy)
+      nameCandCap: 40, // max queued name candidates per frame
+      ringAlphaBase: 0.2, ringAlphaMax: 0.4, ringAlphaPerPx: 35, // alpha = base + min(max, pr/perPx)
     },
     // max on-screen labels per layer. One shared collision economy, placed in
     // priority order: cluster labels (landmarks) first, then doc titles
@@ -471,15 +495,11 @@
     var e = hueColorCache.entries[step];
     if (!e) {
       var h = step / HUE_STEPS;
-      // muted saturation: colored, but still atmospheric
-      e = hueColorCache.entries[step] = frameDark ? {
-        core: rgbToHex(hslToRgb(h, 0.5, 0.72)),
-        mid:  rgbToHex(hslToRgb(h, 0.45, 0.52)),
-        edge: rgbToHex(hslToRgb(h, 0.4, 0.34)),
-      } : {
-        core: rgbToHex(hslToRgb(h, 0.5, 0.5)),
-        mid:  rgbToHex(hslToRgb(h, 0.45, 0.62)),
-        edge: rgbToHex(hslToRgb(h, 0.4, 0.75)),
+      var pal = frameDark ? ATLAS_TUNE.hue.dark : ATLAS_TUNE.hue.light;
+      e = hueColorCache.entries[step] = {
+        core: rgbToHex(hslToRgb(h, pal.core[0], pal.core[1])),
+        mid:  rgbToHex(hslToRgb(h, pal.mid[0], pal.mid[1])),
+        edge: rgbToHex(hslToRgb(h, pal.edge[0], pal.edge[1])),
       };
     }
     return e;
@@ -527,7 +547,7 @@
   // (seeded by cluster id, quantized to bound the sprite cache) — different
   // lanterns, not one gray floodlight. Real platform majorities keep their
   // platform color: that's meaningful signal.
-  var HUE_STEPS = 24;
+  var HUE_STEPS = ATLAS_TUNE.hue.steps;
   function getHaloSprite(platform, radiusPx, clusterId) {
     var theme = frameDark ? 'dark' : 'light';
     if (!haloSprites || haloSprites.theme !== theme) {
@@ -955,18 +975,17 @@
     var yMin = tl[1] - pad, yMax = br[1] + pad;
 
     var smallViewport = W < 600;
-    var haloShrink = smallViewport ? 0.6 : 1.0;
 
     // --- coarse cluster nebulae (the zoomed-OUT view) ---
     // Soft platform-tinted clouds at region centroids. Full when zoomed all the
     // way out, then hand off to the FINE nebulae below as you zoom in — same
     // visual language, finer granularity, so the experience is continuous.
-    // gone by ~2.8 — once fine cluster labels are readable, the giant
-    // region-scale flares read as extreme rather than atmospheric
-    var coarseHaloAlpha = fadeOut(zoom, 1.8, 1.0);
+    var coarseTune = ATLAS_TUNE.coarse;
+    var haloShrink = smallViewport ? coarseTune.smallShrink : 1.0;
+    var coarseHaloAlpha = fadeOut(zoom, coarseTune.outStart, coarseTune.outRange);
     if (coarseHaloAlpha > 0.01) {
       var coarse = data.clusters.coarse;
-      var baseAlpha = (dark ? 0.06 : 0.05) * coarseHaloAlpha;
+      var coarseAlphaNow = (dark ? coarseTune.alphaDark : coarseTune.alphaLight) * coarseHaloAlpha;
       for (var c = 0; c < coarse.length; c++) {
         var cl = coarse[c];
         var r = (cl.radius || 0.05) * scale;
@@ -975,7 +994,7 @@
         if (sx + r < 0 || sx - r > W || sy + r < 0 || sy - r > H) continue;
         var halo = getHaloSprite(cl.dominantPlatform || 'other', r, cl.id);
         var drawSize = halo.sprite.width * (r / halo.bucket) * haloShrink;
-        ctx.globalAlpha = baseAlpha * 2;
+        ctx.globalAlpha = coarseAlphaNow;
         ctx.drawImage(halo.sprite, sx - drawSize / 2, sy - drawSize / 2, drawSize, drawSize);
       }
       ctx.globalAlpha = 1;
@@ -996,9 +1015,9 @@
         if (!L) continue;
         // the floor grows with sqrt(zoom): walking toward a lantern makes its
         // aura wider, but never balloons the way linear scaling did
-        var rFloor = neb.minHaloPx * Math.sqrt(Math.max(1, zoom / neb.inStart));
+        var rFloor = neb.minHaloPx * Math.sqrt(Math.max(1, zoom / neb.growRefZoom));
         var rPx = Math.min(neb.maxHaloPx,
-          Math.max(rFloor, L.r * neb.spread * scale)) * (smallViewport ? 0.85 : 1);
+          Math.max(rFloor, L.r * neb.spread * scale)) * (smallViewport ? neb.smallShrink : 1);
         var nsx = cx + L.x * scale, nsy = cy + L.y * scale;
         if (nsx + rPx < 0 || nsx - rPx > W || nsy + rPx < 0 || nsy - rPx > H) continue;
         var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx, cl.id);
@@ -1132,7 +1151,7 @@
           ctx.fill();
           // letter only once the circle is a real landmark — smaller pubs
           // stay quiet rings so dense regions read as dots, not glyphs
-          if (pr >= 14) {
+          if (pr >= ATLAS_TUNE.pubCircle.letterMinPx) {
             var letter = (pub.name || '?').charAt(0).toUpperCase();
             var letterSize = Math.max(8, pr * 0.9);
             ctx.font = 'bold ' + Math.round(letterSize) + 'px monospace';
@@ -1145,7 +1164,8 @@
         }
 
         // border ring — quiet on small circles, assertive only as they grow
-        ctx.globalAlpha = 0.2 + Math.min(0.4, pr / 35);
+        ctx.globalAlpha = ATLAS_TUNE.pubCircle.ringAlphaBase +
+          Math.min(ATLAS_TUNE.pubCircle.ringAlphaMax, pr / ATLAS_TUNE.pubCircle.ringAlphaPerPx);
         ctx.beginPath();
         ctx.arc(psx, psy, pr, 0, Math.PI * 2);
         ctx.strokeStyle = pColors.mid;
@@ -1154,7 +1174,8 @@
 
         // name labels no longer draw here \u2014 they queue for the shared label
         // economy below, where cluster labels and doc titles place first
-        if (zoom >= pubLabelZoom && pr >= 10 && pubLabelCands.length < 40) {
+        if (zoom >= pubLabelZoom && pr >= ATLAS_TUNE.pubCircle.nameMinPx &&
+            pubLabelCands.length < ATLAS_TUNE.pubCircle.nameCandCap) {
           pubLabelCands.push({ name: pub.name, x: psx, y: psy + pr + 9 });
         }
       }

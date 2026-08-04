@@ -1,0 +1,135 @@
+# scale plan: +300k docs in one week (5x corpus)
+
+context: large publications (e.g. techdirt's ~80k archive) are starting to backfill
+onto atproto as standard.site records. planning target: **300k new documents over one
+week** on top of today's ~60k corpus. 300k/week ≈ 0.5 docs/s sustained, but reality is
+bursts — a single publisher may put tens of thousands of records in minutes.
+
+informed by a full audit of this repo's throughput limits and a deep read of
+[typeahead](https://tangled.sh/@zzstoatzz.io/typeahead) (10M+ actors), whose governing
+invariant we adopt as the frame: **no request path may do work proportional to corpus
+size, and ranking work belongs at build time where possible.** typeahead's evidence
+also says FTS5 at 300k–1M docs is squarely inside SQLite's comfort zone — we harden
+the pipeline around FTS, we do not replace it.
+
+## ranked bottlenecks (from code audit, 2026-08-04)
+
+1. **backend ingest worker** — 1 worker, 256-frame drop-oldest queue, ~6–10 serial
+   turso RTTs per doc (`backend/src/ingest/ingester.zig:89,264`, `ingest/indexer.zig:47-281`).
+   sustains ~1–3 docs/s; any burst of thousands overflows the queue and drops
+   **already-ACKed** frames. the #1 pre-influx fix.
+2. **builder's unpaginated table dumps** — `document_tags`, `recommends`,
+   `subscriptions`, `publications`, `popular_searches` each fetched in ONE giant
+   SELECT (`db/sync.zig:124-205`). memory-unbounded single turso scans: the exact
+   pattern that has wedged turso before.
+3. **builder watchdog 2700s** vs builds already ~40min at 60k (`builder.zig:31`).
+   doc paging + VACUUM + sha256 + R2 upload all scale ~linearly; builds start
+   getting killed at 5x.
+4. **tag-browse recommends aggregate per request** — full
+   `GROUP BY document_uri` over all of `recommends` on every browse
+   (`server/search.zig` LOCAL_TAG_BROWSE_SQL). O(corpus) on the request path.
+5. **ingester sync PLC resolve** — up to 10s blocking the firehose thread per new
+   author (`ingester/src/verifier.zig:46`). archive backfills = many new DIDs.
+6. **embedder drain** — 1 worker, batch 20, 20 serial turso UPDATEs per batch
+   (`ingest/embedder.zig`). 300k docs = 15,000 sequential batches; 429 backoff
+   escalates 300s×n. multi-day drain concurrent with ingest write load.
+7. **frame-size mismatch** — channel sends up to 5MB (`channel.zig:257`), backend
+   consumer caps reads at 1MB (`ingest/ingester.zig:243`). large long-form docs
+   error the read loop.
+
+not at risk: doc-count gate (watermark-pinned both sides), FTS query paths with plan
+tests, keyset doc export (linear + paced), ingester ring (evicts but pins cursor —
+relay replay recovers).
+
+## phase 1 — before the influx (must-land)
+
+### 1a. batch the ingest write path
+replace per-doc serial RTTs with batched writes: accumulate N docs (or T ms), then
+one turso pipeline/transaction for dedupe checks + upserts + FTS + tags. this is the
+search-mutex incident's lesson generalized: drain the queue fast, do I/O in bulk.
+targets: queue drains at ≥50 docs/s; keep `drop_oldest` as backstop but it should
+never fire. consider raising QUEUE_CAPACITY (256 → 4096 frames) since frames are
+small; the fix is throughput, the buffer is insurance.
+
+### 1b. fix the 1MB/5MB frame mismatch
+raise the backend consumer's websocket `max_size` to match the channel's 5MB.
+one-line-ish; do it first.
+
+### 1c. paginate the builder's table dumps
+keyset-paginate `document_tags`, `recommends`, `subscriptions`, `publications` the
+same way docs are paged (LIMIT 500 + pacing). removes the unbounded turso scans and
+the memory cliff.
+
+### 1d. raise builder timeout + measure
+bump `BUILDER_TIMEOUT_SECS` (2700 → 7200) via the prefect deployment env, and emit
+per-phase timings (export / vacuum / hash / upload) in ops.snapshot telemetry so we
+see which phase grows. (typeahead lesson for later, not now: turso's binary **export
+endpoint** was ~60× faster than row streaming for them — the escape hatch if paging
+gets slow at 300k+.)
+
+### 1e. take PLC resolution off the firehose thread
+new-DID key resolution must not block readLoop for up to 10s. options, in order of
+preference: (a) park unverified events for that DID in a small pending map and let a
+resolver worker complete them; (b) drop-and-let-reconciler/backfill-catch; (c) at
+minimum cut RESOLVE_DEADLINE_MS to ~2s. an archive influx is exactly the many-new-
+authors case.
+
+## phase 2 — during the influx (watch + absorb)
+
+- **watch the ingest queue**: add a gauge/log for queue depth + drop count; alert on
+  any drop (drops are silent data loss of ACKed frames).
+- **turso canary discipline**: the embedder drain + ingest batches are OUR load; if
+  turso degrades, throttle ourselves first (feedback: bulk scans ARE the outage).
+- **embedder**: let it drain; it's days, not hours, and that's fine — keyword search
+  is live immediately, semantic lags. add an index-friendly backlog query
+  (partial index on `embedded_at IS NULL`) so the per-minute scan doesn't grow with
+  the backlog. if voyage 429s, cap the escalating backoff at ~10min instead of 1h.
+- **recovery playbook**: per-repo catch-up = `/admin/backfill` (single-flight,
+  listRecords paging — fine for one publisher, too slow for many). if we drop frames
+  across many repos, batch-drive it via `scripts/backfill` overnight rather than
+  hand-triggering.
+- **labeler**: 80k puts from one DID is the bulk-generated volume signature.
+  archive backfills of composed content (techdirt et al.) must not get flagged —
+  pre-exempt known publisher DIDs or gate the volume heuristic on account age /
+  platform.
+
+## phase 3 — request-path hardening (lands with or shortly after)
+
+### 3a. precompute tag-browse ranking (typeahead's core idea, applied narrowly)
+tag browse currently aggregates all of `recommends` per request. move the recommend
+count to build time: materialize `document_recommend_counts` (or bake a ranked
+per-tag top-N) into the snapshot. browse becomes an index lookup; zero request-time
+aggregation. this is the one place we adopt "ranking at build time" now.
+
+### 3b. audit remaining O(corpus) request work
+- dashboard fallback STATS_SQL: five COUNT(*) full scans against turso — cache
+  harder or serve counts from snapshot meta.
+- rerun `turso db inspect --queries` after the influx settles (access-pattern audit
+  playbook) and kill anything corpus-proportional that appeared.
+
+## phase 4 — adopt typeahead's promotion-gate refinements (cheap, whenever)
+
+- stamp tokenizer/normalizer + scoring version into snapshot meta; server refuses a
+  snapshot with a mismatched version.
+- verify byte_size + sha256 on adoption (we hash at build; check at adopt too).
+- count floor on adoption: refuse a snapshot <50% of the previous build's doc count.
+- keep the previous snapshot on the volume for one-manifest-rewrite rollback.
+
+## explicitly NOT doing
+
+- **not replacing FTS5.** typeahead abandoned FTS at 5.9M tiny records with a fixed
+  prefix-query shape; document BM25 over bodies is what FTS5 is for, and 300k–1M is
+  comfortable. our plan-test guards already cover the pathological plans.
+- **not building an overlay layer yet.** the frozen-replica + 2h snapshot cadence
+  keeps working at 300k; overlay (typeahead's live-freshness-on-immutable-base
+  pattern) is the documented next step if 2h staleness ever hurts, not part of this.
+- **no sharding, no new datastore.** disk/RAM at 5x is single-digit GB; the fly
+  volume math holds.
+
+## success criteria
+
+- zero ingest-queue drops through the influx (gauge proves it, not absence of alarms)
+- builds complete inside the (raised) watchdog throughout; snapshot adoption cadence
+  holds at 2h
+- keyword + tag + semantic search all pass /check-prod during and after
+- turso stays healthy under our own write load (canary, not vibes)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Literal
 
+import httpx
 from fastmcp import FastMCP
 
 from pub_search._types import (
@@ -177,6 +178,52 @@ async def search(
     return [SearchResult(**r) for r in results[:limit]]
 
 
+async def _resolve_pds(did: str) -> str:
+    """resolve a DID to its PDS endpoint via plc.directory or did:web."""
+    if did.startswith("did:plc:"):
+        doc_url = f"https://plc.directory/{did}"
+    elif did.startswith("did:web:"):
+        host = did.removeprefix("did:web:").replace("%3A", ":")
+        doc_url = f"https://{host}/.well-known/did.json"
+    else:
+        raise ValueError(f"unsupported DID method: {did}")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(doc_url)
+        response.raise_for_status()
+        doc = response.json()
+
+    for service in doc.get("service", []):
+        if service.get("id", "").endswith("#atproto_pds"):
+            return service["serviceEndpoint"]
+    raise ValueError(f"no PDS endpoint in DID document for {did}")
+
+
+def _extract_content(value: dict[str, Any]) -> str:
+    """pull plaintext out of a document record, whatever its shape.
+
+    pub.leaflet.document: pages[].blocks[].block.plaintext
+    site.standard.document: content.pages[].blocks[].block.plaintext
+    com.whtwnd.blog.entry: content is the markdown string itself
+    """
+    content_obj = value.get("content")
+    if isinstance(content_obj, str):
+        return content_obj
+
+    pages = value.get("pages") or []
+    if not pages and isinstance(content_obj, dict):
+        pages = content_obj.get("pages") or []
+
+    content_parts = []
+    for page in pages:
+        for block_wrapper in page.get("blocks") or []:
+            block = block_wrapper.get("block") or {}
+            plaintext = block.get("plaintext", "")
+            if plaintext:
+                content_parts.append(plaintext)
+    return "\n\n".join(content_parts)
+
+
 @mcp.tool
 async def get_document(uri: str) -> Document:
     """get the full content of a document by its AT-URI.
@@ -190,62 +237,32 @@ async def get_document(uri: str) -> Document:
     returns:
         document with full content, title, tags, and metadata
     """
-    # use pdsx to fetch the actual record from ATProto
-    try:
-        from pdsx._internal.operations import get_record
-        from pdsx.mcp.client import get_atproto_client
-    except ImportError as e:
-        raise RuntimeError(
-            "pdsx is required for fetching full documents. install with: uv add pdsx"
-        ) from e
-
-    # extract repo from URI for PDS discovery
     # at://did:plc:xxx/collection/rkey
-    parts = uri.replace("at://", "").split("/")
+    parts = uri.removeprefix("at://").split("/")
     if len(parts) < 3:
         raise ValueError(f"invalid AT-URI: {uri}")
+    repo, collection, rkey = parts[0], parts[1], parts[2]
 
-    repo = parts[0]
+    pds = await _resolve_pds(repo)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{pds}/xrpc/com.atproto.repo.getRecord",
+            params={"repo": repo, "collection": collection, "rkey": rkey},
+        )
+        response.raise_for_status()
+        record = response.json()
 
-    async with get_atproto_client(target_repo=repo) as client:
-        record = await get_record(client, uri)
-
-    value = record.value
-    # DotDict doesn't have a working .get(), convert to dict first
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        value = value.to_dict()
-    elif not isinstance(value, dict):
-        value = dict(value)
-
-    # extract content from leaflet's block structure
-    # pub.leaflet.document: pages[].blocks[].block.plaintext
-    # site.standard.document: content.pages[].blocks[].block.plaintext
-    content_parts = []
-
-    # handle both formats: top-level pages (pub.leaflet.document)
-    # or nested under content (site.standard.document)
-    pages = value.get("pages", [])
-    if not pages:
-        content_obj = value.get("content", {})
-        if isinstance(content_obj, dict):
-            pages = content_obj.get("pages", [])
-
-    for page in pages:
-        for block_wrapper in page.get("blocks", []):
-            block = block_wrapper.get("block", {})
-            plaintext = block.get("plaintext", "")
-            if plaintext:
-                content_parts.append(plaintext)
-
-    content = "\n\n".join(content_parts)
+    value = record.get("value") or {}
 
     return Document(
-        uri=record.uri,
+        uri=record.get("uri", uri),
         title=value.get("title", ""),
-        content=content,
-        createdAt=value.get("publishedAt", "") or value.get("createdAt", ""),
-        tags=value.get("tags", []),
-        publicationUri=value.get("publication", ""),
+        content=_extract_content(value),
+        createdAt=value.get("publishedAt") or value.get("createdAt") or "",
+        # records can carry an explicit null for tags — never pass None through
+        tags=value.get("tags") or [],
+        # leaflet names its parent `publication`; site.standard names it `site`
+        publicationUri=value.get("publication") or value.get("site") or "",
     )
 
 

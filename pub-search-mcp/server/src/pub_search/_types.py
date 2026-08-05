@@ -20,7 +20,6 @@ class SearchResult(BaseModel):
     platform: Literal["leaflet", "pckt", "offprint", "greengale", "whitewind", "other"] = "leaflet"
     path: str = ""
     source: str = ""
-    score: float = 0.0
     publicationName: str = ""
     url: str = ""
     # populated by /recommended (windowed count and all-time count); 0 elsewhere.

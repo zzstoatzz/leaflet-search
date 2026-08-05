@@ -920,7 +920,10 @@ name = "pub-search"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "fastmcp-slim", extra = ["client"] },
     { name = "httpx" },
+    { name = "mcp" },
+    { name = "mcp-types" },
 ]
 
 [package.dev-dependencies]
@@ -934,7 +937,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = "==4.0.0a1" },
+    { name = "fastmcp-slim", extras = ["client"], specifier = "==4.0.0a1" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "mcp", specifier = "==2.0.0b2" },
+    { name = "mcp-types", specifier = "==2.0.0b2" },
 ]
 
 [package.metadata.requires-dev]

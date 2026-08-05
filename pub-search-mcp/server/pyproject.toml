@@ -22,6 +22,14 @@ classifiers = [
 
 dependencies = [
     "fastmcp==4.0.0a1",
+    # the next three are transitive pre-release pins of fastmcp made explicit:
+    # uv's default pre-release strategy only accepts a pre-release the user
+    # requested directly, so as purely transitive pins they fail the
+    # fastmcp.app builder's `uv pip install` (pdsx used to make the resolution
+    # work by accident until it was removed, 2026-08-05)
+    "fastmcp-slim[client]==4.0.0a1",
+    "mcp-types==2.0.0b2",
+    "mcp==2.0.0b2",
     "httpx>=0.28",
 ]
 

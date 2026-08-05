@@ -15,7 +15,10 @@ pub const BatchResult = result.BatchResult;
 // global state
 const allocator = std.heap.smp_allocator;
 var client: ?Client = null;
-var local_db: ?LocalDb = null;
+// Heap-allocated behind an atomic pointer so the promote watcher can hot-swap
+// an adopted snapshot without a restart: readers load the pointer once per
+// query and the displaced instance drains in the background (retireAsync).
+var local_db: std.atomic.Value(?*LocalDb) = .init(null);
 
 /// Initialize Turso client only (fast, call synchronously at startup).
 /// Schema migrations run separately via initSchema() in the background thread
@@ -54,8 +57,26 @@ fn initLocal(io: Io) !void {
         }
     }
 
-    local_db = LocalDb.init(allocator, io);
-    try local_db.?.open();
+    const l = try allocator.create(LocalDb);
+    errdefer allocator.destroy(l);
+    l.* = LocalDb.init(allocator, io);
+    try l.open();
+    local_db.store(l, .release);
+}
+
+/// Hot snapshot adoption (promote watcher): open a fresh instance at the same
+/// path — openAt's adoptPending renames the staged `.new` over the live file
+/// first, while the displaced instance keeps serving its open FDs — then swap
+/// the pointer and retire the old instance once its readers drain. No restart,
+/// no serving gap.
+pub fn swapLocalDb(io: Io) !void {
+    const fresh = try allocator.create(LocalDb);
+    errdefer allocator.destroy(fresh);
+    fresh.* = LocalDb.init(allocator, io);
+    try fresh.open();
+    fresh.setReady(true);
+    const old = local_db.swap(fresh, .acq_rel);
+    if (old) |o| o.retireAsync();
 }
 
 pub fn getClient() ?*Client {
@@ -69,16 +90,14 @@ pub fn startKeepalive() void {
 
 /// Get local db if ready (synced and available)
 pub fn getLocalDb() ?*LocalDb {
-    if (local_db) |*l| {
-        if (l.isReady()) return l;
-    }
+    const l = local_db.load(.acquire) orelse return null;
+    if (l.isReady()) return l;
     return null;
 }
 
 /// Get local db even if not ready (for sync operations)
 pub fn getLocalDbRaw() ?*LocalDb {
-    if (local_db) |*l| return l;
-    return null;
+    return local_db.load(.acquire);
 }
 
 /// Mark the local replica ready to serve. In-place Turso→replica sync was

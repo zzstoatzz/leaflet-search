@@ -2,13 +2,16 @@
 //!
 //! Behind ENABLE_SNAPSHOT_PROMOTE (absent = inert). Polls the channel's
 //! latest pointer, and when a new build appears: downloads to a `.part`
-//! file on the volume, verifies EVERYTHING the manifest claims (size,
-//! sha256, doc count) plus semantic sentinels the manifest can't claim
-//! (no banned DIDs, no bridgy rows, FTS answers, platforms present),
-//! stages it as `local.db.new` + manifest sidecar, and exits 0 so the
-//! machine restarts into LocalDb.adoptPending() — the same boot-adopt
-//! path every deploy already exercises. The previous snapshot is kept as
-//! `local.db.prev` for one-command rollback.
+//! file on the volume (bandwidth-capped — see downloadBwlimit), verifies
+//! EVERYTHING the manifest claims (size, sha256, doc count) plus semantic
+//! sentinels the manifest can't claim (no banned DIDs, no bridgy rows,
+//! FTS answers, platforms present), stages it as `local.db.new` +
+//! manifest sidecar, and adopts it IN-PROCESS: db.swapLocalDb opens a
+//! fresh instance (whose openAt runs the same LocalDb.adoptPending rename
+//! the boot path uses) and swaps the serving pointer with no restart.
+//! Deploy boots still adopt any staged .new via adoptPending, and a
+//! failed swap falls back to exit(0)+restart. The previous snapshot is
+//! kept as `local.db.prev` for one-command rollback.
 //!
 //! Promotion REJECTS, it never best-effort attaches: any gate failure
 //! deletes the .part and logs; serving continues on the current snapshot.
@@ -25,6 +28,7 @@ const zqlite = @import("zqlite");
 const logfire = @import("logfire");
 const r2 = @import("r2.zig");
 const policy = @import("policy.zig");
+const db = @import("db.zig");
 const LocalDb = @import("db/LocalDb.zig");
 
 pub const MANIFEST_VERSION = 1;
@@ -238,7 +242,7 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
     //    final rename must be atomic)
     const part_path = try std.fmt.allocPrint(arena, "{s}.part", .{live});
     unlinkZ(arena, part_path); // stale partials from prior failed attempts
-    try r2.download(arena, io, cfg, m.snapshot_key, part_path);
+    try r2.downloadPaced(arena, io, cfg, m.snapshot_key, part_path, downloadBwlimit());
     errdefer unlinkZ(arena, part_path);
 
     // 5. verify bytes: exact size + sha256 against the manifest
@@ -270,11 +274,25 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
         unlinkZ(arena, aux);
     }
 
-    // 8. adopt via the boot path every deploy already exercises. Requires
-    //    the machine's restart policy to be `always` — exit(0) under
-    //    `on-failure` strands the machine.
-    logfire.info("promote: staged build {s}; exiting to adopt (boot takes ~25s)", .{m.build_id});
-    std.process.exit(0);
+    // 8. adopt in-process: open a fresh LocalDb (its openAt runs the same
+    //    adoptPending rename the boot path uses), swap the serving pointer,
+    //    and let the displaced instance drain. Serving never stops — the
+    //    scheduled exit(0) reboot was a ~25s outage plus minutes of
+    //    staging-contention brownout, every 2 hours (2026-08-05).
+    //    Fallback: if the swap fails the staged .new is intact, so the old
+    //    restart path still adopts it correctly.
+    logfire.info("promote: staged build {s}; hot-swapping replica", .{m.build_id});
+    db.swapLocalDb(io) catch |err| {
+        logfire.err("promote: hot swap failed ({s}); exiting to adopt via boot path", .{@errorName(err)});
+        std.process.exit(0);
+    };
+    logfire.info("promote: adopted build {s} in-process", .{m.build_id});
+}
+
+/// Cap for the snapshot pull (rclone --bwlimit units). Default trades a
+/// slower staging download for an unstarved serving path on the shared vCPU.
+fn downloadBwlimit() []const u8 {
+    return getenv("PROMOTE_BWLIMIT") orelse "12M";
 }
 
 /// Structural + semantic sentinels on the downloaded snapshot. The manifest

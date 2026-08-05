@@ -253,6 +253,39 @@ pub fn deinit(self: *LocalDb) void {
     self.conn = null;
 }
 
+/// Retire a heap-allocated instance displaced by a hot snapshot swap: wait
+/// out requests that loaded this instance before the pointer swap, then close
+/// and free it off-thread. If the thread can't spawn, the instance is leaked
+/// — one stale read pool is recoverable, a close under a live reader is not.
+pub fn retireAsync(self: *LocalDb) void {
+    const t = std.Thread.spawn(.{}, retireThread, .{self}) catch {
+        logfire.warn("local db: retire thread spawn failed; leaking displaced instance", .{});
+        return;
+    };
+    t.detach();
+}
+
+fn retireThread(self: *LocalDb) void {
+    const io = self.io;
+    self.setReady(false);
+    // grace: a request that fetched this instance just before the swap may
+    // not have checked out a pool connection yet
+    io.sleep(Io.Duration.fromSeconds(60), .awake) catch {};
+    // drain: wait for every checked-out read connection to come home
+    var waited: usize = 0;
+    while (waited < 300) : (waited += 1) {
+        self.pool_mutex.lockUncancelable(io);
+        var busy = false;
+        for (self.read_in_use) |in_use| busy = busy or in_use;
+        self.pool_mutex.unlock(io);
+        if (!busy) break;
+        io.sleep(Io.Duration.fromSeconds(1), .awake) catch break;
+    }
+    self.deinit();
+    logfire.info("local db: retired displaced snapshot instance", .{});
+    self.allocator.destroy(self);
+}
+
 pub fn isReady(self: *LocalDb) bool {
     return self.is_ready.load(.acquire);
 }

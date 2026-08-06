@@ -42,6 +42,18 @@ pub const RuntimeValue = union(enum) {
 const URL_BUF_SIZE = 512;
 const AUTH_BUF_SIZE = 512;
 
+/// Wall-clock second of the most recent turso request COMPLETION (success or
+/// error — either proves the connection isn't hung). The builder's stall
+/// watchdog reads this to tell "slow but progressing" from "hung forever":
+/// zig's HTTP client has no read timeout, so a socket that dies after the
+/// request write blocks doRequest indefinitely (2026-08-06: export sat silent
+/// for 94min at 35k docs until the wall-clock watchdog killed the build).
+pub var last_request_completed_s: std.atomic.Value(i64) = .init(0);
+
+fn nowSeconds(io: Io) i64 {
+    return @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
 allocator: Allocator,
 url: []const u8,
 token: []const u8,
@@ -201,6 +213,7 @@ fn executeRawTyped(self: *Client, sql: []const u8, args: []const RuntimeValue) !
 fn doRequest(self: *Client, span: logfire.Span, span_name: []const u8, sql_for_log: []const u8, body: []const u8) ![]const u8 {
     const truncated = truncateSql(sql_for_log);
     defer span.end();
+    defer last_request_completed_s.store(nowSeconds(self.io), .monotonic);
 
     var url_buf: [URL_BUF_SIZE]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "https://{s}/v2/pipeline", .{self.url}) catch

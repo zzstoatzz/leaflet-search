@@ -32,6 +32,10 @@ const Channel = enum { staging, prod };
 // export, VACUUM, sha256, and upload all scale ~linearly with corpus size, so
 // give the watchdog room for 5x growth; BUILDER_TIMEOUT_SECS still overrides.
 const DEFAULT_TIMEOUT_SECS: u64 = 120 * 60;
+// turso pages complete in seconds normally, ~1-3min when turso is degraded
+// (2026-08-06 00:40 run: 850s per 5k docs = ~85s/page and still finished).
+// 10min of NO completed request is a hang, not slowness.
+const DEFAULT_STALL_SECS: u64 = 10 * 60;
 
 /// wall-clock seconds since `since_s`, for per-phase timing logs
 fn secondsSince(io: Io, since_s: i64) i64 {
@@ -43,10 +47,10 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
-fn parseTimeoutSeconds(raw: ?[]const u8) u64 {
-    const value = std.fmt.parseInt(u64, raw orelse return DEFAULT_TIMEOUT_SECS, 10) catch
-        return DEFAULT_TIMEOUT_SECS;
-    return if (value == 0) DEFAULT_TIMEOUT_SECS else value;
+fn parseSeconds(raw: ?[]const u8, default: u64) u64 {
+    const value = std.fmt.parseInt(u64, raw orelse return default, 10) catch
+        return default;
+    return if (value == 0) default else value;
 }
 
 fn timeoutWatchdog(io: Io, timeout_s: u64) void {
@@ -55,12 +59,36 @@ fn timeoutWatchdog(io: Io, timeout_s: u64) void {
     std.process.exit(1);
 }
 
+/// Armed only while the build is talking to turso (export + remote gates).
+/// Zig's HTTP client has no read timeout, so a hung turso request blocks
+/// forever with zero log output; without this, the only bound was the
+/// wall-clock watchdog — a 94min silent stall on 2026-08-06. Exiting fast
+/// instead lets the prefect task retry into fresh scratch within minutes.
+var stall_armed: std.atomic.Value(bool) = .init(false);
+
+fn stallWatchdog(io: Io, stall_s: u64) void {
+    while (true) {
+        io.sleep(Io.Duration.fromSeconds(30), .awake) catch return;
+        if (!stall_armed.load(.monotonic)) continue;
+        const last = db.Client.last_request_completed_s.load(.monotonic);
+        if (last == 0) continue;
+        const now_s: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+        if (now_s - last > @as(i64, @intCast(stall_s))) {
+            logfire.err("builder: no turso request completed in {d}s (last at epoch {d}) — hung connection; terminating for retry", .{ stall_s, last });
+            std.process.exit(1);
+        }
+    }
+}
+
 pub fn run(allocator: Allocator, io: Io) !void {
     const started_s: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
-    const timeout_s = parseTimeoutSeconds(getenv("BUILDER_TIMEOUT_SECS"));
+    const timeout_s = parseSeconds(getenv("BUILDER_TIMEOUT_SECS"), DEFAULT_TIMEOUT_SECS);
     const watchdog = try std.Thread.spawn(.{}, timeoutWatchdog, .{ io, timeout_s });
     watchdog.detach();
-    logfire.info("builder: watchdog armed ({d}s)", .{timeout_s});
+    const stall_s = parseSeconds(getenv("BUILDER_STALL_SECS"), DEFAULT_STALL_SECS);
+    const stall_watchdog = try std.Thread.spawn(.{}, stallWatchdog, .{ io, stall_s });
+    stall_watchdog.detach();
+    logfire.info("builder: watchdog armed ({d}s wall-clock, {d}s turso stall)", .{ timeout_s, stall_s });
 
     const channel: Channel = blk: {
         const raw = getenv("BUILDER_CHANNEL") orelse "staging";
@@ -94,6 +122,12 @@ pub fn run(allocator: Allocator, io: Io) !void {
 
     try db.initTurso(io);
     const turso = db.getClient() orelse return error.TursoNotInitialized;
+
+    // arm the stall watchdog for everything that talks to turso (export +
+    // remote count gates); seed the heartbeat so a hang on the very first
+    // request still trips it
+    db.Client.last_request_completed_s.store(@intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s)), .monotonic);
+    stall_armed.store(true, .monotonic);
 
     // watermark BEFORE paging: docs indexed mid-build land in the next
     // snapshot; the overlay/promote side uses this as its freshness cutoff
@@ -162,6 +196,10 @@ pub fn run(allocator: Allocator, io: Io) !void {
             return error.CountGate;
         }
     }
+
+    // turso is done — everything below is local (or rclone, which bounds
+    // itself); an unarmed watchdog can't false-fire during a long VACUUM/upload
+    stall_armed.store(false, .monotonic);
 
     // gate 2: FTS answers a query
     {
@@ -274,11 +312,12 @@ pub fn run(allocator: Allocator, io: Io) !void {
 }
 
 test "builder timeout parser uses a safe nonzero default" {
-    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseTimeoutSeconds(null));
-    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseTimeoutSeconds(""));
-    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseTimeoutSeconds("nope"));
-    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseTimeoutSeconds("0"));
-    try std.testing.expectEqual(@as(u64, 90), parseTimeoutSeconds("90"));
+    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseSeconds(null, DEFAULT_TIMEOUT_SECS));
+    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseSeconds("", DEFAULT_TIMEOUT_SECS));
+    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseSeconds("nope", DEFAULT_TIMEOUT_SECS));
+    try std.testing.expectEqual(DEFAULT_TIMEOUT_SECS, parseSeconds("0", DEFAULT_TIMEOUT_SECS));
+    try std.testing.expectEqual(@as(u64, 90), parseSeconds("90", DEFAULT_TIMEOUT_SECS));
+    try std.testing.expectEqual(DEFAULT_STALL_SECS, parseSeconds(null, DEFAULT_STALL_SECS));
 }
 
 fn writeFile(io: Io, path: []const u8, content: []const u8) !void {

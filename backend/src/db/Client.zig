@@ -41,6 +41,8 @@ pub const RuntimeValue = union(enum) {
 
 const URL_BUF_SIZE = 512;
 const AUTH_BUF_SIZE = 512;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
+const FETCH_TICK_MS: u64 = 250;
 
 /// Wall-clock second of the most recent turso request COMPLETION (success or
 /// error — either proves the connection isn't hung). The builder's stall
@@ -63,6 +65,10 @@ io: Io,
 // each acquires its own connection. nothing else on this struct is mutable
 // after init, so no caller-side serialization is needed.
 http_client: http.Client,
+/// Per-request wall-clock bound in seconds (TURSO_REQUEST_TIMEOUT_SECS,
+/// default 180, 0 disables). Generous on purpose: degraded-but-alive turso
+/// has served pages in ~85s; only a hung connection should ever hit this.
+request_timeout_s: u64,
 
 pub fn init(allocator_param: Allocator, io: Io) !Client {
     const url = if (std.c.getenv("TURSO_URL")) |p| std.mem.span(p) else {
@@ -88,6 +94,10 @@ pub fn init(allocator_param: Allocator, io: Io) !Client {
         .token = token,
         .io = io,
         .http_client = .{ .allocator = allocator_param, .io = io },
+        .request_timeout_s = blk: {
+            const raw = std.c.getenv("TURSO_REQUEST_TIMEOUT_SECS") orelse break :blk DEFAULT_REQUEST_TIMEOUT_SECS;
+            break :blk std.fmt.parseInt(u64, mem.span(raw), 10) catch DEFAULT_REQUEST_TIMEOUT_SECS;
+        },
     };
 }
 
@@ -223,48 +233,104 @@ fn doRequest(self: *Client, span: logfire.Span, span_name: []const u8, sql_for_l
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{self.token}) catch
         return error.AuthTooLong;
 
-    var response_body: std.Io.Writer.Allocating = .init(self.allocator);
-    errdefer response_body.deinit();
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        var response_body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_body.deinit();
 
-    const res = fetchEvictRetry(&self.http_client, self.io, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = auth },
-        },
-        .payload = body,
-        .response_writer = &response_body.writer,
-        // Batch builders favor bounded completion over connection reuse. Zig's
-        // HTTP client has no read timeout, so a silently-dead pooled socket can
-        // accept the request write and then wait forever for a response.
-        .keep_alive = std.c.getenv("TURSO_DISABLE_KEEPALIVE") == null,
-    }) catch |err| {
-        logfire.err("{s} http failed: {s} | sql: {s}", .{ span_name, @errorName(err), truncated });
-        span.recordError(error.HttpError);
-        return error.HttpError;
-    };
+        const res = fetchBounded(&self.http_client, self.io, .{
+            .location = .{ .url = url },
+            .method = .POST,
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = auth },
+            },
+            .payload = body,
+            .response_writer = &response_body.writer,
+            // Batch builders favor bounded completion over connection reuse. Zig's
+            // HTTP client has no read timeout, so a silently-dead pooled socket can
+            // accept the request write and then wait forever for a response.
+            .keep_alive = std.c.getenv("TURSO_DISABLE_KEEPALIVE") == null,
+        }, self.request_timeout_s) catch |err| {
+            if (err == error.RequestTimeout and attempt == 0) {
+                // the hung request's own connection was closed by the cancel;
+                // evict idle pool mates that shared its fate, then one fresh try
+                // (fresh response_body each iteration, so no duplicated bytes)
+                logfire.err("{s} request exceeded {d}s — canceled hung connection, retrying | sql: {s}", .{ span_name, self.request_timeout_s, truncated });
+                evictIdleConnections(&self.http_client, self.io);
+                continue;
+            }
+            logfire.err("{s} http failed: {s} | sql: {s}", .{ span_name, @errorName(err), truncated });
+            span.recordError(error.HttpError);
+            return error.HttpError;
+        };
 
-    if (res.status != .ok) {
-        // `catch ""` is intentional: response_body is only consumed here for
-        // the diagnostic log/span attribute. If OOM strikes during
-        // toOwnedSlice we still want to surface the TursoError with whatever
-        // context we have (empty preview is better than swallowing the
-        // status code).
-        const resp_text = response_body.toOwnedSlice() catch "";
-        defer if (resp_text.len > 0) self.allocator.free(resp_text);
-        const resp_preview = if (resp_text.len > 200) resp_text[0..200] else resp_text;
-        logfire.err("{s} turso error: {} | sql: {s} | response: {s}", .{ span_name, res.status, truncated, resp_preview });
-        span.recordError(error.TursoError);
-        span.setAttribute("turso.status", @intFromEnum(res.status));
-        // NEVER attach resp_preview to the span: it's freed by the defer
-        // above before `defer span.end()` (declared earlier, runs later)
-        // deep-copies attributes — use-after-free, segfault, process death.
-        // The log line above carries the preview; the span gets the status.
-        return error.TursoError;
+        if (res.status != .ok) {
+            // `catch ""` is intentional: response_body is only consumed here for
+            // the diagnostic log/span attribute. If OOM strikes during
+            // toOwnedSlice we still want to surface the TursoError with whatever
+            // context we have (empty preview is better than swallowing the
+            // status code).
+            const resp_text = response_body.toOwnedSlice() catch "";
+            defer if (resp_text.len > 0) self.allocator.free(resp_text);
+            const resp_preview = if (resp_text.len > 200) resp_text[0..200] else resp_text;
+            logfire.err("{s} turso error: {} | sql: {s} | response: {s}", .{ span_name, res.status, truncated, resp_preview });
+            span.recordError(error.TursoError);
+            span.setAttribute("turso.status", @intFromEnum(res.status));
+            // NEVER attach resp_preview to the span: it's freed by the defer
+            // above before `defer span.end()` (declared earlier, runs later)
+            // deep-copies attributes — use-after-free, segfault, process death.
+            // The log line above carries the preview; the span gets the status.
+            return error.TursoError;
+        }
+
+        return try response_body.toOwnedSlice();
     }
+}
 
-    return try response_body.toOwnedSlice();
+/// `fetchEvictRetry` under a wall-clock bound. Zig's HTTP client exposes no
+/// read timeout anywhere on the fetch path (the only stdlib timeout is
+/// connect-time, and fetch doesn't use it), so a peer that accepts the
+/// request and never responds blocks the calling thread in the kernel
+/// forever — 2026-08-06: the snapshot builder sat silent 94min mid-export.
+/// Mechanism per zat's transport StallGuard (zat.dev/zat xrpc/transport.zig):
+/// a wall-clock check placed after a read can never fire, so the fetch runs
+/// as an async task and the caller watches it, canceling when the deadline
+/// passes. Cancel joins the task before returning, so the response writer is
+/// never touched after this returns error.RequestTimeout.
+fn fetchBounded(
+    http_client: *http.Client,
+    io: Io,
+    options: http.Client.FetchOptions,
+    timeout_s: u64,
+) (http.Client.FetchError || error{RequestTimeout})!http.Client.FetchResult {
+    if (timeout_s == 0) return fetchEvictRetry(http_client, io, options);
+
+    var done: std.atomic.Value(bool) = .init(false);
+    var future = io.async(fetchTask, .{ http_client, io, options, &done });
+
+    var elapsed_ms: u64 = 0;
+    while (!done.load(.acquire)) {
+        io.sleep(.fromMilliseconds(FETCH_TICK_MS), .awake) catch {};
+        elapsed_ms += FETCH_TICK_MS;
+        if (elapsed_ms >= timeout_s * 1000) {
+            // cancel() blocks until the task joins; a fetch that raced to
+            // success in this window is discarded — caller retries fresh
+            if (future.cancel(io)) |_| {} else |_| {}
+            return error.RequestTimeout;
+        }
+    }
+    return future.await(io);
+}
+
+fn fetchTask(
+    http_client: *http.Client,
+    io: Io,
+    options: http.Client.FetchOptions,
+    done: *std.atomic.Value(bool),
+) http.Client.FetchError!http.Client.FetchResult {
+    defer done.store(true, .release);
+    return fetchEvictRetry(http_client, io, options);
 }
 
 /// `fetch` with a one-shot retry when a pooled keep-alive connection turns
@@ -662,4 +728,88 @@ test "fetchEvictRetry recovers from a dead pooled connection" {
         });
         try std.testing.expectEqual(http.Status.ok, res.status);
     }
+}
+
+// regression for the 2026-08-06 silent export stall: a server that accepts
+// the request and never responds. Plain fetch blocks in the kernel forever;
+// fetchBounded must cancel the hung read and surface RequestTimeout in
+// bounded wall-clock time.
+const HangServer = struct {
+    server: Io.net.Server,
+    port: u16,
+    thread: std.Thread,
+    stopping: std.atomic.Value(bool),
+
+    fn start(io: Io) !*HangServer {
+        const s = try std.testing.allocator.create(HangServer);
+        errdefer std.testing.allocator.destroy(s);
+        var addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        s.server = try addr.listen(io, .{});
+        var bound: std.posix.sockaddr.in = undefined;
+        var len: std.posix.socklen_t = @sizeOf(@TypeOf(bound));
+        _ = std.c.getsockname(s.server.socket.handle, @ptrCast(&bound), &len);
+        s.port = std.mem.bigToNative(u16, bound.port);
+        s.stopping = .init(false);
+        s.thread = try std.Thread.spawn(.{}, run, .{ s, io });
+        return s;
+    }
+
+    fn run(s: *HangServer, io: Io) void {
+        var held: [4]?Io.net.Stream = .{ null, null, null, null };
+        var held_n: usize = 0;
+        defer for (held[0..held_n]) |maybe| {
+            if (maybe) |stream| stream.close(io);
+        };
+        while (true) {
+            const stream = s.server.accept(io) catch return;
+            if (s.stopping.load(.acquire)) {
+                stream.close(io);
+                return;
+            }
+            // read the request, answer nothing, keep the socket open
+            var buf: [4096]u8 = undefined;
+            _ = std.c.recv(stream.socket.handle, &buf, buf.len, 0);
+            if (held_n < held.len) {
+                held[held_n] = stream;
+                held_n += 1;
+            } else stream.close(io);
+        }
+    }
+
+    fn stop(s: *HangServer, io: Io) void {
+        s.stopping.store(true, .release);
+        var address = Io.net.IpAddress{ .ip4 = .loopback(s.port) };
+        const wake = address.connect(io, .{ .mode = .stream }) catch unreachable;
+        wake.close(io);
+        s.thread.join();
+        s.server.deinit(io);
+        std.testing.allocator.destroy(s);
+    }
+};
+
+test "fetchBounded cancels a hung request instead of blocking forever" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try HangServer.start(io);
+    defer server.stop(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.port});
+
+    var http_client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer http_client.deinit();
+
+    const started = Io.Timestamp.now(io, .awake).nanoseconds;
+    const bounded = fetchBounded(&http_client, io, .{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = "{}",
+    }, 1);
+    const elapsed_ns = Io.Timestamp.now(io, .awake).nanoseconds - started;
+
+    try std.testing.expectError(error.RequestTimeout, bounded);
+    // the whole point: bounded, not kernel-forever. generous margin for CI.
+    try std.testing.expect(elapsed_ns < 30 * std.time.ns_per_s);
 }

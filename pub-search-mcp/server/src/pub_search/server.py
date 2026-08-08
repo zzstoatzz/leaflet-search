@@ -288,51 +288,52 @@ async def get_document(uri: str) -> Document:
         raise ValueError(f"invalid AT-URI: {uri}")
     repo, collection, rkey = parts[0], parts[1], parts[2]
 
-    # Prefer the index's extracted text. Re-implementing extraction here drifts
-    # from the backend's extractor: this record's content is {"html": ...} with
-    # a textContent sibling, shapes the python copy did not know, so it returned
-    # "" while /document returned 5,326 characters for the same URI.
+    # Live record from the author's PDS — this is the point of the tool. The
+    # index lags by up to a snapshot cycle, so the PDS is the only way to read
+    # the CURRENT text, including documents published minutes ago.
+
     try:
-        async with get_http_client() as client:
-            response = await client.get("/document", params={"uri": uri})
-        if response.status_code == 200:
-            documents = (response.json() or {}).get("documents") or []
-            if documents and documents[0].get("content"):
-                doc = documents[0]
-                return Document(
-                    uri=doc.get("uri", uri),
-                    title=doc.get("title", ""),
-                    content=doc["content"],
-                    createdAt=doc.get("createdAt", ""),
-                    tags=doc.get("tags") or [],
-                    publicationUri=doc.get("publicationUri", ""),
-                )
+        pds = await _resolve_pds(repo)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{pds}/xrpc/com.atproto.repo.getRecord",
+                params={"repo": repo, "collection": collection, "rkey": rkey},
+            )
+            response.raise_for_status()
+            record = response.json()
+
+        value = record.get("value") or {}
+        content = _extract_content(value)
+        if content:
+            return Document(
+                uri=record.get("uri", uri),
+                title=value.get("title", ""),
+                content=content,
+                createdAt=value.get("publishedAt") or value.get("createdAt") or "",
+                # records can carry an explicit null for tags
+                tags=value.get("tags") or [],
+                # leaflet names its parent `publication`; site.standard `site`
+                publicationUri=value.get("publication") or value.get("site") or "",
+            )
     except Exception:
-        pass  # index unreachable — fall through to the PDS below
+        pass  # PDS down, DID unresolvable, or a record shape we cannot read
 
-    # Not indexed yet (published since the last snapshot), or excluded from the
-    # index: read the record from its PDS.
-
-    pds = await _resolve_pds(repo)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(
-            f"{pds}/xrpc/com.atproto.repo.getRecord",
-            params={"repo": repo, "collection": collection, "rkey": rkey},
-        )
-        response.raise_for_status()
-        record = response.json()
-
-    value = record.get("value") or {}
-
+    # Fallback to the index. Returning "" when the live fetch fails would look
+    # like an empty document rather than a failed read — the index's stored
+    # text is stale but true, which beats a convincing blank.
+    async with get_http_client() as client:
+        indexed = await client.get("/document", params={"uri": uri})
+    documents = (indexed.json() or {}).get("documents") or [] if indexed.status_code == 200 else []
+    if not documents:
+        raise ValueError(f"could not read {uri} from its PDS or the index")
+    doc = documents[0]
     return Document(
-        uri=record.get("uri", uri),
-        title=value.get("title", ""),
-        content=_extract_content(value),
-        createdAt=value.get("publishedAt") or value.get("createdAt") or "",
-        # records can carry an explicit null for tags — never pass None through
-        tags=value.get("tags") or [],
-        # leaflet names its parent `publication`; site.standard names it `site`
-        publicationUri=value.get("publication") or value.get("site") or "",
+        uri=doc.get("uri", uri),
+        title=doc.get("title", ""),
+        content=doc.get("content", ""),
+        createdAt=doc.get("createdAt", ""),
+        tags=doc.get("tags") or [],
+        publicationUri=doc.get("publicationUri", ""),
     )
 
 

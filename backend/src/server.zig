@@ -12,6 +12,7 @@ const ingest = @import("ingest.zig");
 const metrics = @import("metrics.zig");
 const search = @import("server/search.zig");
 const documents = @import("server/documents.zig");
+const visibility = @import("visibility.zig");
 const dashboard = @import("server/dashboard.zig");
 const recommended = @import("server/recommended.zig");
 const curators = @import("server/curators.zig");
@@ -239,8 +240,14 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
 
     const labeled_pref = parseQueryParam(alloc, target, "labeled") catch null;
     const show_labeled = labeled_pref != null and mem.eql(u8, labeled_pref.?, "show");
-    const hidden_pref = parseQueryParam(alloc, target, "hidden") catch null;
-    const show_hidden = hidden_pref != null and mem.eql(u8, hidden_pref.?, "show");
+    // `include_undiscoverable=true` opts in to publications that set
+    // preferences.showInDiscover=false. Default is exclusion. The old
+    // `hidden=show` spelling is still accepted so existing callers keep
+    // working, but it is undocumented and should not be used.
+    const undiscoverable_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
+    const legacy_hidden_pref = parseQueryParam(alloc, target, "hidden") catch null;
+    const include_undiscoverable = (undiscoverable_pref != null and mem.eql(u8, undiscoverable_pref.?, "true")) or
+        (legacy_hidden_pref != null and mem.eql(u8, legacy_hidden_pref.?, "show"));
 
     // Retrieve the full requested prefix plus one policy-visible row. Paging
     // is then a pure slice of a stable ranking, and that extra row is the
@@ -256,8 +263,22 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     const raw_results = search.search(alloc, query, tag_filter, platform_filter, since_filter, author_filter, mode, .{
         .max_results = result_window,
         .show_labeled = show_labeled,
-        .show_hidden = show_hidden,
+        .include_undiscoverable = include_undiscoverable,
     }) catch |err| {
+        // Startup window: the visibility set has not loaded, so we cannot tell
+        // which publications opted out. An empty result set would be
+        // indistinguishable from "nothing matched", so answer honestly and let
+        // the caller retry.
+        if (err == error.VisibilityNotReady) {
+            try request.respond(
+                "{\"error\":\"search is still starting up, retry shortly\"}",
+                .{
+                    .status = .service_unavailable,
+                    .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+                },
+            );
+            return;
+        }
         logfire.err("search failed: {}", .{err});
         metrics.stats.recordError();
         return err;
@@ -1225,7 +1246,22 @@ fn handleDocument(request: *http.Server.Request, target: []const u8) !void {
     const span = logfire.span("http.document", .{ .count = uris.len });
     defer span.end();
 
-    const body = documents.fetch(alloc, uris) catch {
+    const doc_undiscoverable_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
+    const doc_include_undiscoverable = doc_undiscoverable_pref != null and
+        mem.eql(u8, doc_undiscoverable_pref.?, "true");
+
+    // Same startup gate as search: without the visibility set we cannot tell
+    // which publications opted out, and reporting every uri as "missing" would
+    // read as "these do not exist".
+    if (!doc_include_undiscoverable and !visibility.isLoaded()) {
+        try request.respond(
+            "{\"error\":\"document fetch is still starting up, retry shortly\"}",
+            .{ .status = .service_unavailable, .extra_headers = json_hdr },
+        );
+        return;
+    }
+
+    const body = documents.fetch(alloc, uris, doc_include_undiscoverable) catch {
         try request.respond("{\"error\":\"replica not ready, retry shortly\"}", .{ .status = .service_unavailable, .extra_headers = json_hdr });
         return;
     };

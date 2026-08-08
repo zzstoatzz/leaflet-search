@@ -7,6 +7,7 @@ const db = @import("../db.zig");
 const tpuf = @import("../tpuf.zig");
 const classifier = @import("../ingest/classifier.zig");
 const policy = @import("../policy.zig");
+const visibility = @import("../visibility.zig");
 
 pub const Options = struct {
     /// Number of policy-visible, deduplicated results the caller needs from
@@ -15,8 +16,10 @@ pub const Options = struct {
     max_results: usize = 21,
     show_labeled: bool = false,
     /// Publications with preferences.showInDiscover=false are indexed but
-    /// excluded from results unless the caller passes hidden=show.
-    show_hidden: bool = false,
+    /// excluded from every retrieval path unless the caller opts in with
+    /// `include_undiscoverable=true`. The default is exclusion, and a path
+    /// that cannot resolve the preference excludes rather than shows.
+    include_undiscoverable: bool = false,
 };
 
 pub const SearchMode = enum {
@@ -467,6 +470,16 @@ const PubSearch = zql.Query(
 );
 
 pub fn search(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, mode: SearchMode, options: Options) ![]const u8 {
+    // The visibility set has not loaded yet (brief startup window before the
+    // replica seed lands). Every row would fail closed and we would return an
+    // empty result set that looks exactly like "nothing matched" — the one
+    // outcome a caller cannot distinguish from a real answer. Say so instead.
+    if (!options.include_undiscoverable and !visibility.isLoaded()) {
+        logfire.warn("search: visibility policy not loaded, refusing to serve", .{});
+        logfire.counter("search.visibility_not_ready", 1);
+        return error.VisibilityNotReady;
+    }
+
     if (mode == .hybrid) return searchHybrid(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options);
     if (mode == .semantic) return searchSemantic(alloc, query, platform_filter, since_filter, author_filter, options);
     return searchKeyword(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options);
@@ -477,29 +490,26 @@ fn includeDid(did: []const u8, show_labeled: bool) bool {
 }
 
 /// Doc belongs to a publication that opted out of discovery
-/// (site.standard.publication preferences.showInDiscover=false). Point lookup
-/// against the local replica, same pattern as isBridgyFed; if the replica is
-/// unavailable, err on showing.
-fn isHiddenDocUri(uri: []const u8) bool {
-    const local = db.getLocalDb() orelse return false;
-    var rows = local.query(
-        \\SELECT 1 FROM documents d
-        \\JOIN publications p ON d.publication_uri = p.uri
-        \\WHERE d.uri = ? AND COALESCE(p.show_in_discover, 1) = 0
-    , .{uri}) catch return false;
-    defer rows.deinit();
-    return rows.next() != null;
+/// (site.standard.publication preferences.showInDiscover=false).
+///
+/// This used to be a point lookup against the local replica keyed on the
+/// document uri, which fails open in exactly the cases that matter: a
+/// document indexed above the snapshot watermark, or a superseded rkey that
+/// only turso and turbopuffer still carry, has no replica row — and "no row"
+/// returned "not hidden". That shipped opted-out documents into anonymous
+/// semantic results until the next snapshot happened to close it.
+///
+/// It now tests membership in the complete set of opted-out publications
+/// (visibility.zig), keyed on identity every retrieval path already carries.
+/// The set is complete even when the document index is not, so every row —
+/// ghost, fresh, or replica-missing — gets a real answer, with no I/O.
+fn isUndiscoverableDoc(did: []const u8, base_path: []const u8) bool {
+    return visibility.isUndiscoverableDoc("", did, base_path);
 }
 
 /// Publication itself opted out of discovery.
-fn isHiddenPublicationUri(uri: []const u8) bool {
-    const local = db.getLocalDb() orelse return false;
-    var rows = local.query(
-        "SELECT 1 FROM publications WHERE uri = ? AND COALESCE(show_in_discover, 1) = 0",
-        .{uri},
-    ) catch return false;
-    defer rows.deinit();
-    return rows.next() != null;
+fn isUndiscoverablePublication(uri: []const u8) bool {
+    return visibility.isUndiscoverablePub(uri);
 }
 
 fn queryCandidateLimit(max_results: usize) usize {
@@ -723,7 +733,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 const doc = Doc.fromRow(row);
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
-                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+                if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -739,7 +749,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 const doc = Doc.fromRow(row);
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
-                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+                if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -814,7 +824,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
             if (!includeDid(doc.did, options.show_labeled)) continue;
-            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+            if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
             if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
             const uri_dupe = try alloc.dupe(u8, doc.uri);
             try seen_uris.put(uri_dupe, {});
@@ -833,7 +843,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
             if (!includeDid(doc.did, options.show_labeled)) continue;
-            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+            if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
             if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -851,7 +861,7 @@ fn searchKeyword(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, p
                 if (!std.mem.eql(u8, pub_result.did, af)) continue;
             }
             if (!includeDid(pub_result.did, options.show_labeled)) continue;
-            if (!options.show_hidden and isHiddenPublicationUri(pub_result.uri)) continue;
+            if (!options.include_undiscoverable and isUndiscoverablePublication(pub_result.uri)) continue;
             try jw.write(pub_result.toJson(alloc));
             result_count += 1;
         }
@@ -954,7 +964,7 @@ fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: 
         if (result_count >= options.max_results) break;
         const doc = Doc.fromLocalRow(row);
         if (!includeDid(doc.did, options.show_labeled)) continue;
-        if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+        if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
         if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
         try jw.write(doc.toJson(alloc));
         result_count += 1;
@@ -1022,7 +1032,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             }
             if (!passesSince(doc.createdAt, since_filter)) continue;
             if (!includeDid(doc.did, options.show_labeled)) continue;
-            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+            if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
             if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
             const uri_dupe = try alloc.dupe(u8, doc.uri);
             try seen_uris.put(uri_dupe, {});
@@ -1054,7 +1064,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             }
             if (!passesSince(doc.createdAt, since_filter)) continue;
             if (!includeDid(doc.did, options.show_labeled)) continue;
-            if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+            if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
             if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                 try jw.write(doc.toJson(alloc));
                 result_count += 1;
@@ -1090,7 +1100,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                 }
                 if (!passesSince(doc.createdAt, since_filter)) continue;
                 if (!includeDid(doc.did, options.show_labeled)) continue;
-                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+                if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
                 if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
                 const uri_dupe = try alloc.dupe(u8, doc.uri);
                 try seen_uris.put(uri_dupe, {});
@@ -1135,7 +1145,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                     continue;
                 }
                 if (!includeDid(doc.did, options.show_labeled)) continue;
-                if (!options.show_hidden and isHiddenDocUri(doc.uri)) continue;
+                if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
                 if (!seen_uris.contains(doc.uri) and !try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) {
                     try jw.write(doc.toJson(alloc));
                     result_count += 1;
@@ -1173,7 +1183,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                     }
                 }
                 if (!includeDid(pub_result.did, options.show_labeled)) continue;
-                if (!options.show_hidden and isHiddenPublicationUri(pub_result.uri)) continue;
+                if (!options.include_undiscoverable and isUndiscoverablePublication(pub_result.uri)) continue;
                 try jw.write(pub_result.toJson(alloc));
                 pub_count += 1;
                 result_count += 1;
@@ -1308,6 +1318,11 @@ pub fn findSimilar(alloc: Allocator, uri: []const u8, limit: usize) ![]const u8 
     for (results) |r| {
         if (std.mem.eql(u8, r.uri, uri)) continue;
         if (count >= limit) break;
+        // /similar had no visibility filter at all: an opted-out document
+        // could not be reached by search but was one "related documents" hop
+        // away from any discoverable neighbour.
+        if (isUndiscoverableDoc(r.did, r.base_path)) continue;
+        if (!includeDid(r.did, false)) continue;
         if (try isDuplicateAuthorTitle(&seen_authors, alloc, r.did, r.title)) continue;
         const doc_type: []const u8 = if (r.has_publication) "article" else "looseleaf";
         // prefer authoritative local-replica URL fields over stale tpuf attrs
@@ -1350,7 +1365,7 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
     const fusion_options: Options = .{
         .max_results = 200,
         .show_labeled = options.show_labeled,
-        .show_hidden = options.show_hidden,
+        .include_undiscoverable = options.include_undiscoverable,
     };
 
     // 1. keyword search (~10ms via local SQLite)
@@ -1518,7 +1533,7 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
 
         // cross-platform dedup: skip if same author+title already emitted
         if (!includeDid(jsonStr(obj, "did"), options.show_labeled)) continue;
-        if (!options.show_hidden and isHiddenDocUri(jsonStr(obj, "uri"))) continue;
+        if (!options.include_undiscoverable and isUndiscoverableDoc(jsonStr(obj, "did"), jsonStr(obj, "basePath"))) continue;
         if (try isDuplicateAuthorTitle(&seen_authors, alloc, jsonStr(obj, "did"), jsonStr(obj, "title"))) continue;
 
         const source_label: []const u8 = switch (bits) {
@@ -1637,7 +1652,7 @@ fn searchSemantic(alloc: Allocator, query: []const u8, platform_filter: ?[]const
         if (r.title.len == 0) continue;
         if (isBridgyFed(r.uri)) continue;
         if (!includeDid(r.did, options.show_labeled)) continue;
-        if (!options.show_hidden and isHiddenDocUri(r.uri)) continue;
+        if (!options.include_undiscoverable and isUndiscoverableDoc(r.did, r.base_path)) continue;
         if (platform_filter) |pf| {
             if (!std.mem.eql(u8, r.platform, pf)) continue;
         }
@@ -2168,13 +2183,13 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     defer arena.deinit();
 
     // warm once, then measure
-    _ = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .show_hidden = true });
+    _ = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .include_undiscoverable = true });
     var best_us: i64 = std.math.maxInt(i64);
     var out: []const u8 = "";
     var run: usize = 0;
     while (run < 5) : (run += 1) {
         const t0 = std.Io.Timestamp.now(tio, .awake).toMicroseconds();
-        out = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .show_hidden = true });
+        out = try searchLocal(arena.allocator(), &ldb, "", "photography", null, null, null, .{ .include_undiscoverable = true });
         const us = std.Io.Timestamp.now(tio, .awake).toMicroseconds() - t0;
         if (us < best_us) best_us = us;
     }
@@ -2197,7 +2212,7 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     var fts_run: usize = 0;
     while (fts_run < 5) : (fts_run += 1) {
         const t1 = std.Io.Timestamp.now(tio, .awake).toMicroseconds();
-        fts_out = try searchLocal(arena.allocator(), &ldb, "probe", "photography", null, null, null, .{ .show_hidden = true });
+        fts_out = try searchLocal(arena.allocator(), &ldb, "probe", "photography", null, null, null, .{ .include_undiscoverable = true });
         const us = std.Io.Timestamp.now(tio, .awake).toMicroseconds() - t1;
         if (us < fts_best_us) fts_best_us = us;
     }
@@ -2228,4 +2243,54 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
             }
         }
     }
+}
+
+test "search refuses to serve before the visibility set loads" {
+    // Regression: the showInDiscover filter used to be a per-uri lookup that
+    // returned "not hidden" whenever the replica lacked the row. Now the
+    // policy is a set, and an unloaded set means we genuinely cannot answer.
+    // Returning an empty result array here would be indistinguishable from
+    // "nothing matched" — the caller could not tell a policy gap from a real
+    // miss, which is precisely how the original leak stayed invisible.
+    visibility.resetForTest();
+    defer visibility.resetForTest();
+
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.VisibilityNotReady,
+        search(alloc, "anything", null, null, null, null, .keyword, .{}),
+    );
+}
+
+test "an explicit include_undiscoverable request does not need the set" {
+    // The opt-in path is asking for everything, so an unloaded set is not a
+    // policy gap for it — it must not be blocked by the readiness gate.
+    visibility.resetForTest();
+    defer visibility.resetForTest();
+
+    const alloc = std.testing.allocator;
+    const err = search(alloc, "anything", null, null, null, null, .semantic, .{ .include_undiscoverable = true });
+    // semantic is disabled in unit tests (no tpuf keys), so this returns the
+    // "not available" body rather than VisibilityNotReady. The point is only
+    // that the readiness gate did not fire.
+    if (err) |body| {
+        defer alloc.free(body);
+    } else |e| {
+        try std.testing.expect(e != error.VisibilityNotReady);
+    }
+}
+
+test "undiscoverable documents are matched by publication identity, not document uri" {
+    // The ghost case: turso and turbopuffer still carry a superseded rkey that
+    // the current snapshot does not. Keyed on document uri this row was
+    // invisible to the filter and leaked; keyed on the publication it does not.
+    visibility.resetForTest();
+    defer visibility.resetForTest();
+    try visibility.installForTest(&.{
+        .{ .uri = "at://did:plc:x/site.standard.publication/notes", .did = "did:plc:x", .base_path = "notes.example" },
+    });
+
+    try std.testing.expect(isUndiscoverableDoc("did:plc:x", "notes.example"));
+    try std.testing.expect(!isUndiscoverableDoc("did:plc:x", "public.example"));
+    try std.testing.expect(isUndiscoverablePublication("at://did:plc:x/site.standard.publication/notes"));
 }

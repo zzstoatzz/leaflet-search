@@ -124,6 +124,7 @@ async def search(
     mode: Mode = "keyword",
     limit: int = 5,
     offset: int = 0,
+    include_undiscoverable: bool = False,
 ) -> list[SearchResult]:
     """search long-form writing across ATProto publishing platforms.
 
@@ -141,6 +142,12 @@ async def search(
         mode: search mode — keyword, semantic, or hybrid (default: keyword)
         limit: max results (default 5, max 40)
         offset: skip this many ranked results (default 0, max 1000)
+        include_undiscoverable: include publications that set
+            preferences.showInDiscover=false. These are indexed but excluded
+            from discovery surfaces by default because their author asked to
+            stay out of them. Pass True only when the user is deliberately
+            looking through their own or a specific author's writing —
+            pair it with `author` rather than running it globally.
 
     returns:
         list of results with uri, title, snippet, platform, and web url
@@ -165,6 +172,8 @@ async def search(
         params["author"] = author
     if mode != "keyword":
         params["mode"] = mode
+    if include_undiscoverable:
+        params["include_undiscoverable"] = "true"
 
     async with get_http_client() as client:
         response = await client.get("/search", params=params)

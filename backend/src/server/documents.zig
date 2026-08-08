@@ -13,6 +13,7 @@ const db = @import("../db.zig");
 const policy = @import("../policy.zig");
 const classifier = @import("../ingest/classifier.zig");
 const search = @import("search.zig");
+const visibility = @import("../visibility.zig");
 
 pub const MAX_URIS = 25;
 
@@ -38,7 +39,7 @@ fn visible(did: []const u8) bool {
 /// Render the response body for a list of AT-URIs. Found documents land in
 /// `documents` (in request order); anything unknown, policy-excluded, or
 /// malformed lands in `missing`.
-pub fn fetch(alloc: Allocator, uris: []const []const u8) ![]const u8 {
+pub fn fetch(alloc: Allocator, uris: []const []const u8, include_undiscoverable: bool) ![]const u8 {
     const local = db.getLocalDb() orelse return error.LocalNotReady;
 
     var output: std.Io.Writer.Allocating = .init(alloc);
@@ -72,6 +73,16 @@ pub fn fetch(alloc: Allocator, uris: []const []const u8) ![]const u8 {
         const platform = row.text(5);
         const base_path = row.text(6);
         const path = row.text(7);
+
+        // Same visibility rule as search: a publication that opted out of
+        // discovery must not have its full text handed out by uri either.
+        // This endpoint is how an agent reads what search found, so leaving it
+        // open would make the search filter cosmetic — and it leaks the whole
+        // article, not just a title.
+        if (!include_undiscoverable and visibility.isUndiscoverableDoc("", did, base_path)) {
+            try missing.append(alloc, uri);
+            continue;
+        }
         const doc_type: []const u8 = if (row.int(8) != 0) "article" else "looseleaf";
 
         try jw.beginObject();

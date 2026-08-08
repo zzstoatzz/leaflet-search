@@ -10,6 +10,7 @@ const ingest = @import("ingest.zig");
 const builder = @import("builder.zig");
 const promote = @import("promote.zig");
 const labeler = @import("labeler.zig");
+const visibility = @import("visibility.zig");
 const labeler_classifier = @import("ingest/classifier.zig");
 
 const SOCKET_TIMEOUT_SECS = 5;
@@ -135,6 +136,13 @@ fn initServices(allocator: std.mem.Allocator, io: Io) void {
     db.initLocalDb(io);
     db.startSync(io);
 
+    // serving-time visibility policy. Seeds from the replica we just opened
+    // (no network) and then refreshes from turso in the background, so a
+    // showInDiscover preference is never resolved on the request path. Must
+    // come straight after the replica opens: until the set loads, the search
+    // paths fail closed, which is correct but hides opted-in results too.
+    visibility.start(io);
+
     // one-time: feed the existing corpus through the classifier so it evaluates
     // every already-indexed author, not just ones publishing after deploy.
     // Background thread — the replica is open, this just reads it.
@@ -210,6 +218,7 @@ test {
     _ = @import("server/documents.zig");
     _ = @import("server.zig");
     _ = @import("policy.zig");
+    _ = @import("visibility.zig");
     _ = @import("promote.zig");
     _ = @import("db/LocalDb.zig");
     _ = @import("server/pubkey.zig");

@@ -248,6 +248,13 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
 
     if (result.rows.len == 0) return .{ .verified = 0, .deleted = 0 };
 
+    // Logged at cycle START, not end: a cycle that never finishes emits no
+    // reconcile.cycle span, so without this there is no record it ever ran.
+    logfire.info("reconcile: cycle start, {d} documents (http bound {d}s)", .{
+        result.rows.len,
+        getHttpTimeoutSecs(),
+    });
+
     // collect URIs + URL-construction fields (copy since result owns the memory)
     const DocInfo = struct {
         uri: []const u8,
@@ -308,6 +315,22 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
             continue;
         };
 
+        // Per-phase spans. The cycle span alone cannot say where its time
+        // goes: a 2,740s cycle showed only 205s of db.query, and attributing
+        // the rest to hung HTTP was an inference, not a measurement — the
+        // 10s bound added alongside these spans fires zero times, so the cost
+        // is somewhere else. These three spans cover every phase of the loop,
+        // so the next number is measured.
+        const doc_span = logfire.span("reconcile.doc", .{});
+        defer doc_span.end();
+
+        // Attempt counters fire BEFORE each call; the spans above close only
+        // on completion. A phase that hangs emits an attempt and never a span,
+        // so attempts-minus-completions names the stuck phase. Spans alone
+        // cannot do this — a hung call is silent in both directions, which is
+        // why 34 minutes of cycle produced no signal at all.
+        logfire.counter("reconcile.resolve_attempt", 1);
+
         // resolve PDS for this DID
         const pds = resolvePds(allocator, parts.did, pds_cache) orelse {
             // PDS unknown or DID deactivated — skip, don't delete
@@ -326,6 +349,7 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
         }
 
         // check if record still exists at source
+        logfire.counter("reconcile.check_attempt", 1);
         const status = checkRecord(allocator, pds, parts.did, parts.collection, parts.rkey);
 
         switch (status) {
@@ -390,6 +414,12 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
 }
 
 fn updateVerifiedAt(client: *db.Client, uri: []const u8) void {
+    // exec already spans as db.query, so this is not a hidden cost — the span
+    // is here to attribute turso time to the reconciler specifically rather
+    // than leaving it pooled with every other db.query on the box.
+    const span = logfire.span("reconcile.update_verified", .{});
+    defer span.end();
+
     const ts: i64 = @intCast(@divFloor(Io.Timestamp.now(global_io.?, .real).nanoseconds, std.time.ns_per_s));
     const now = formatTimestamp(ts);
     client.exec(
@@ -537,6 +567,9 @@ fn formatTimestamp(ts: i64) TimestampBuf {
 const RecordStatus = enum { exists, deleted, error_skip };
 
 fn checkRecord(allocator: Allocator, pds: []const u8, did: []const u8, collection: []const u8, rkey: []const u8) RecordStatus {
+    const span = logfire.span("reconcile.check_record", .{});
+    defer span.end();
+
     // build URL: {pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={rkey}
     var url_buf: [512]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}/xrpc/com.atproto.repo.getRecord?repo={s}&collection={s}&rkey={s}", .{ pds, did, collection, rkey }) catch {
@@ -575,6 +608,12 @@ fn checkRecord(allocator: Allocator, pds: []const u8, did: []const u8, collectio
 /// Caches results in pds_cache (persists across cycles).
 fn resolvePds(allocator: Allocator, did: []const u8, cache: *std.StringHashMap([]const u8)) ?[]const u8 {
     if (cache.get(did)) |pds| return pds;
+
+    // Only a cache MISS is spanned — a hit is a hashmap lookup, and spanning
+    // it would bury the expensive case in noise. If the cache is cold every
+    // cycle, this span count will equal the batch size and say so.
+    const span = logfire.span("reconcile.resolve_pds", .{});
+    defer span.end();
 
     const pds = resolvePdsHttp(allocator, did) orelse return null;
 

@@ -90,7 +90,7 @@ pub fn insertDocument(
 
     var reads = try c.queryBatch(&.{
         .{ .sql = "SELECT uri FROM documents WHERE did = ? AND rkey = ?", .args = &.{ did, rkey } },
-        .{ .sql = "SELECT uri FROM documents WHERE did = ? AND content_hash = ?", .args = &.{ did, &content_hash } },
+        .{ .sql = "SELECT uri, COALESCE(source_collection, '') FROM documents WHERE did = ? AND content_hash = ?", .args = &.{ did, &content_hash } },
         .{ .sql = "SELECT base_path, platform FROM publications WHERE uri = ?", .args = &.{pub_uri} },
         .{ .sql = "SELECT base_path FROM publications WHERE did = ? AND base_path LIKE ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{ did, platform_pattern } },
         .{ .sql = "SELECT base_path FROM publications WHERE did = ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{did} },
@@ -114,17 +114,35 @@ pub fn insertDocument(
         }
     }
 
-    // cross-platform content dedup: if same author already has a document with
-    // identical title+content (different rkey from a different platform), skip it.
+    // cross-platform content dedup: the same essay cross-posted to leaflet AND
+    // site.standard should occupy one row, not two.
+    //
+    // Scoped to a DIFFERENT collection, which is what "cross-platform" means.
+    // Unscoped, it also swallowed renames: publishing tools that derive rkeys
+    // from paths implement a rename as create(new_rkey) + delete(old_rkey),
+    // and with an unchanged body the create matched the still-present old row
+    // by content hash and was dropped — then the delete removed the old one.
+    // Both gone, no error anywhere. Only pure renames were affected; an edit
+    // changes the hash and misses the dupe check entirely, which is why 7 of 7
+    // rename-only documents vanished while 13 of 13 edited ones survived.
     var content_unchanged = false;
     if (reads.getFirst(1)) |row| {
         const existing_uri = row.text(0);
-        if (!std.mem.eql(u8, existing_uri, uri)) {
-            logfire.debug("indexer: skipping dupe for {s} (existing: {s})", .{ uri, existing_uri });
-            logfire.span("ingest.dropped", .{ .reason = "content_hash_dupe", .uri = uri, .existing_uri = existing_uri }).end();
-            return;
+        switch (contentHashVerdict(existing_uri, row.text(1), uri, source_collection)) {
+            .same_document => content_unchanged = true,
+            .cross_platform_dupe => {
+                logfire.debug("indexer: skipping cross-platform dupe for {s} (existing: {s})", .{ uri, existing_uri });
+                logfire.span("ingest.dropped", .{ .reason = "content_hash_dupe", .uri = uri, .existing_uri = existing_uri }).end();
+                return;
+            },
+            .rename => {
+                // The old row is removed by the delete that follows on the
+                // firehose; a transient duplicate is harmless because search
+                // dedupes by (did, title) anyway.
+                logfire.info("indexer: same-collection rename {s} -> {s}", .{ existing_uri, uri });
+                logfire.counter("ingest.rename_indexed", 1);
+            },
         }
-        content_unchanged = true;
     }
 
     // look up base_path from publication (or fallback to DID lookup)
@@ -304,6 +322,35 @@ pub const DocWriteParams = struct {
     content_unchanged: bool,
     tags: []const []const u8,
 };
+
+/// What a content-hash match against an existing row means.
+///
+/// Unscoped, this check dropped renames: tools that derive rkeys from paths
+/// implement a rename as create(new_rkey) + delete(old_rkey), so with an
+/// unchanged body the create matched the still-present old row and was
+/// discarded — then the delete removed the old one. Both gone, silently. Only
+/// pure renames were hit; an edit changes the hash and never reaches here,
+/// which is why 7 of 7 rename-only documents vanished and 13 of 13 edited ones
+/// survived the same commit.
+pub const HashVerdict = enum {
+    /// same uri — an unchanged re-put
+    same_document,
+    /// same body under a different collection: the essay is cross-posted
+    cross_platform_dupe,
+    /// same body, same collection, different rkey: a rename, and it must index
+    rename,
+};
+
+pub fn contentHashVerdict(
+    existing_uri: []const u8,
+    existing_collection: []const u8,
+    uri: []const u8,
+    collection: []const u8,
+) HashVerdict {
+    if (std.mem.eql(u8, existing_uri, uri)) return .same_document;
+    if (std.mem.eql(u8, existing_collection, collection)) return .rename;
+    return .cross_platform_dupe;
+}
 
 /// Builds the single-pipeline write batch for one document. Owns the arg
 /// storage the returned statements point into — must stay pinned (not moved)
@@ -789,4 +836,43 @@ test "DOC_UPSERT_SQL: unchanged content keeps indexed_at, changed content bumps 
         defer row.deinit();
         try t.expect(!std.mem.eql(u8, "2020-06-06T00:00:00", row.text(0)));
     }
+}
+
+test "content-hash match: a same-collection rename must index, not drop" {
+    const t = std.testing;
+    const doc = "site.standard.document";
+
+    // The regression: create(new rkey, identical body) arriving while the old
+    // row is still present. Dropping it here, then applying the delete that
+    // follows on the firehose, removed the document from the corpus entirely.
+    try t.expectEqual(HashVerdict.rename, contentHashVerdict(
+        "at://did:plc:x/site.standard.document/architecture-bounded-scans",
+        doc,
+        "at://did:plc:x/site.standard.document/operations-bounded-scans",
+        doc,
+    ));
+
+    // an unchanged re-put of the same uri
+    try t.expectEqual(HashVerdict.same_document, contentHashVerdict(
+        "at://did:plc:x/site.standard.document/a",
+        doc,
+        "at://did:plc:x/site.standard.document/a",
+        doc,
+    ));
+
+    // the case the check exists for: one essay cross-posted to two platforms
+    try t.expectEqual(HashVerdict.cross_platform_dupe, contentHashVerdict(
+        "at://did:plc:x/pub.leaflet.document/a",
+        "pub.leaflet.document",
+        "at://did:plc:x/site.standard.document/b",
+        doc,
+    ));
+
+    // a legacy row with no recorded collection is not evidence of cross-posting
+    try t.expectEqual(HashVerdict.cross_platform_dupe, contentHashVerdict(
+        "at://did:plc:x/pub.leaflet.document/a",
+        "",
+        "at://did:plc:x/site.standard.document/b",
+        doc,
+    ));
 }

@@ -333,3 +333,54 @@ test "a document of an opted-out publication is hidden even when its uri is unkn
         "notes.example",
     ));
 }
+
+/// The opt-in is scoped to ONE identity per request.
+///
+/// `include_undiscoverable=true` exists so an author can read their own
+/// unlisted writing. Honored on a global query it is a corpus-wide switch
+/// instead: anyone can flip one boolean and read every opted-out publication,
+/// including other people's. Verified 2026-08-08 against a third party's
+/// publication, so this is not hypothetical.
+///
+/// Requiring an author does not make it authenticated — a caller can still
+/// name someone else — but it removes the enumeration: you must already know
+/// whose writing you are asking for, and you get only theirs.
+pub fn optInIsScoped(author_filter: ?[]const u8) bool {
+    const author = author_filter orelse return false;
+    return author.len > 0;
+}
+
+test "the opt-in requires an author" {
+    try std.testing.expect(!optInIsScoped(null));
+    try std.testing.expect(!optInIsScoped(""));
+    try std.testing.expect(optInIsScoped("did:plc:x"));
+    try std.testing.expect(optInIsScoped("nate.bsky.social"));
+}
+
+/// Every uri in a batch fetch must belong to the same repo when the opt-in is
+/// set, for the same reason: one identity per request.
+pub fn urisShareOneDid(uris: []const []const u8) bool {
+    var first: ?[]const u8 = null;
+    for (uris) |uri| {
+        const rest = if (mem.startsWith(u8, uri, "at://")) uri["at://".len..] else uri;
+        const slash = mem.indexOfScalar(u8, rest, '/') orelse return false;
+        const did = rest[0..slash];
+        if (first) |f| {
+            if (!mem.eql(u8, f, did)) return false;
+        } else first = did;
+    }
+    return first != null;
+}
+
+test "batch opt-in is limited to a single repo" {
+    try std.testing.expect(urisShareOneDid(&.{
+        "at://did:plc:x/site.standard.document/a",
+        "at://did:plc:x/site.standard.document/b",
+    }));
+    try std.testing.expect(!urisShareOneDid(&.{
+        "at://did:plc:x/site.standard.document/a",
+        "at://did:plc:y/site.standard.document/b",
+    }));
+    try std.testing.expect(!urisShareOneDid(&.{}));
+    try std.testing.expect(!urisShareOneDid(&.{"garbage"}));
+}

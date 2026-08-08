@@ -249,6 +249,22 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     const include_undiscoverable = (undiscoverable_pref != null and mem.eql(u8, undiscoverable_pref.?, "true")) or
         (legacy_hidden_pref != null and mem.eql(u8, legacy_hidden_pref.?, "show"));
 
+    // Scoped to one identity per request. Without this the flag is a
+    // corpus-wide switch: any anonymous caller reads every opted-out
+    // publication, including other people's. Rejected rather than ignored —
+    // a silently-dropped flag is how the original inconsistency stayed
+    // invisible for months.
+    if (include_undiscoverable and !visibility.optInIsScoped(author_filter)) {
+        try request.respond(
+            "{\"error\":\"include_undiscoverable requires an author filter — it opts you into one author's unlisted writing, not the whole corpus\"}",
+            .{
+                .status = .bad_request,
+                .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            },
+        );
+        return;
+    }
+
     // Retrieve the full requested prefix plus one policy-visible row. Paging
     // is then a pure slice of a stable ranking, and that extra row is the
     // evidence for hasMore.
@@ -1296,6 +1312,20 @@ fn handleDocument(request: *http.Server.Request, target: []const u8) !void {
     const doc_include_undiscoverable = doc_undiscoverable_pref != null and
         mem.eql(u8, doc_undiscoverable_pref.?, "true");
 
+    // One identity per request, same rule as /search. A batch of 25 arbitrary
+    // uris with the flag set would be a small enumeration of other people's
+    // opted-out documents.
+    if (doc_include_undiscoverable and !visibility.urisShareOneDid(uris)) {
+        try request.respond(
+            "{\"error\":\"include_undiscoverable requires every uri to belong to the same repo\"}",
+            .{
+                .status = .bad_request,
+                .extra_headers = json_hdr,
+            },
+        );
+        return;
+    }
+
     // Same startup gate as search: without the visibility set we cannot tell
     // which publications opted out, and reporting every uri as "missing" would
     // read as "these do not exist".
@@ -1329,8 +1359,23 @@ fn handleSimilar(request: *http.Server.Request, target: []const u8, io: Io) !voi
 
     const format = parseQueryParam(alloc, target, "format") catch "v1";
 
-    const similar_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
-    const similar_include_undiscoverable = similar_pref != null and mem.eql(u8, similar_pref.?, "true");
+    // No opt-in here. /similar returns neighbours from any author, so the flag
+    // could not be scoped to one identity — it would be exactly the
+    // corpus-wide switch we are removing from /search. Rejected loudly rather
+    // than ignored.
+    if (parseQueryParam(alloc, target, "include_undiscoverable")) |pref| {
+        if (mem.eql(u8, pref, "true")) {
+            try request.respond(
+                "{\"error\":\"include_undiscoverable is not supported on /similar — neighbours come from every author, so the opt-in cannot be scoped to one identity. Use /search?author=\"}",
+                .{
+                    .status = .bad_request,
+                    .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+                },
+            );
+            return;
+        }
+    } else |_| {}
+    const similar_include_undiscoverable = false;
 
     if (!similar_include_undiscoverable and !visibility.isLoaded()) {
         try request.respond(

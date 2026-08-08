@@ -333,3 +333,15 @@ class TestBrowseFallsBackToKeyword:
         monkeypatch.setattr(server, "get_http_client", lambda: _Client())
         await server.search(query="atproto")
         assert captured["params"].get("mode") == "hybrid"
+
+
+class TestOptInIsScoped:
+    async def test_include_undiscoverable_requires_author(self):
+        """The opt-in is one identity per request. Without this it was a
+        corpus-wide switch any anonymous caller could flip."""
+        import pytest
+
+        from pub_search import server
+
+        with pytest.raises(ValueError, match="requires an author"):
+            await server.search(query="anything", include_undiscoverable=True)

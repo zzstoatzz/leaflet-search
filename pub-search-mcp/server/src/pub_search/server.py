@@ -163,15 +163,22 @@ async def search(
         include_undiscoverable: include publications that set
             preferences.showInDiscover=false. These are indexed but excluded
             from discovery surfaces by default because their author asked to
-            stay out of them. Pass True only when the user is deliberately
-            looking through their own or a specific author's writing —
-            pair it with `author` rather than running it globally.
+            stay out of them. REQUIRES `author` — the opt-in is scoped to one
+            identity per request, never the whole corpus.
 
     returns:
         list of results with uri, title, snippet, platform, and web url
     """
     if not query and not tag and not author:
         return []
+
+    # Scoped to one identity. The backend rejects this too; failing here gives
+    # the agent a usable message instead of a 400 it has to interpret.
+    if include_undiscoverable and not author:
+        raise ValueError(
+            "include_undiscoverable requires an author — it opts you into one "
+            "author's unlisted writing, not the whole corpus"
+        )
 
     # Browsing (no query) is only meaningful as an exact-match listing: the
     # semantic and hybrid paths rank against a query embedding and return

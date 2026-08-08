@@ -21,7 +21,8 @@ const DOC_SQL =
     \\SELECT d.uri, d.did, d.rkey, d.title, COALESCE(d.created_at, ''),
     \\  d.platform, COALESCE(NULLIF(d.base_path, ''), p.base_path, ''),
     \\  COALESCE(d.path, ''), d.has_publication, COALESCE(p.name, ''),
-    \\  COALESCE(d.cover_image, ''), d.content
+    \\  COALESCE(d.cover_image, ''), d.content,
+    \\  COALESCE(d.publication_uri, '')
     \\FROM documents d LEFT JOIN publications p ON d.publication_uri = p.uri
     \\WHERE d.uri = ?
     \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0)
@@ -106,6 +107,8 @@ pub fn fetch(alloc: Allocator, uris: []const []const u8, include_undiscoverable:
         try jw.write(path);
         try jw.objectField("publicationName");
         try jw.write(row.text(9));
+        try jw.objectField("publicationUri");
+        try jw.write(row.text(12));
         try jw.objectField("coverImage");
         try jw.write(row.text(10));
         try jw.objectField("url");

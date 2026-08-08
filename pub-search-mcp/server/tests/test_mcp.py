@@ -205,3 +205,49 @@ class TestMcpServerRegistration:
         content = result.messages[0].content
         assert isinstance(content, TextContent)
         assert "search" in content.text.lower()
+
+
+class TestExtractContent:
+    """The PDS fallback re-implements what the backend's extractor does, so it
+    drifts. These pin the shapes that returned empty text in production."""
+
+    def test_site_standard_html_content(self):
+        """content={"html": ...} with a textContent sibling.
+
+        Regression: get_document returned "" for
+        at://did:plc:bvraa6gajy4tfr3eh2sisdkr/site.standard.document/3mseqcv3c22wf
+        while /document returned 5,326 characters for the same URI.
+        """
+        from pub_search.server import _extract_content
+
+        value = {
+            "title": "Latch",
+            "textContent": "plain text body",
+            "content": {"$type": "site.standard.defs#html", "html": "<p>markup</p>"},
+        }
+        assert _extract_content(value) == "plain text body"
+
+    def test_html_only_is_stripped_to_text(self):
+        from pub_search.server import _extract_content
+
+        value = {"content": {"html": "<p>hello <a href='#'>world</a></p><script>x()</script>"}}
+        out = _extract_content(value)
+        assert "hello" in out and "world" in out
+        assert "<" not in out and "x()" not in out
+
+    def test_leaflet_pages_blocks_still_work(self):
+        from pub_search.server import _extract_content
+
+        value = {"pages": [{"blocks": [{"block": {"plaintext": "para one"}},
+                                       {"block": {"plaintext": "para two"}}]}]}
+        assert _extract_content(value) == "para one\n\npara two"
+
+    def test_whitewind_string_content(self):
+        from pub_search.server import _extract_content
+
+        assert _extract_content({"content": "# markdown body"}) == "# markdown body"
+
+    def test_empty_record_yields_empty_string(self):
+        from pub_search.server import _extract_content
+
+        assert _extract_content({}) == ""

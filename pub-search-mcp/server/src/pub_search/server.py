@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
+from html import unescape
 from typing import Any, Literal
 
 import httpx
@@ -216,6 +218,18 @@ async def _resolve_pds(did: str) -> str:
     raise ValueError(f"no PDS endpoint in DID document for {did}")
 
 
+def _strip_html(html: str) -> str:
+    """crude tag strip for the PDS fallback path only.
+
+    The index's extractor is the real one; this exists so a document that is
+    not indexed yet still returns readable text instead of markup.
+    """
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"[ \t]*\n\s*\n\s*", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
+
+
 def _extract_content(value: dict[str, Any]) -> str:
     """pull plaintext out of a document record, whatever its shape.
 
@@ -226,6 +240,14 @@ def _extract_content(value: dict[str, Any]) -> str:
     content_obj = value.get("content")
     if isinstance(content_obj, str):
         return content_obj
+
+    # site.standard.document carries a plaintext sibling, and its content can
+    # be {"html": ...} rather than pages/blocks. Missing both is what made
+    # get_document return empty text for records the index extracts fine.
+    if text := value.get("textContent"):
+        return text
+    if isinstance(content_obj, dict) and isinstance(content_obj.get("html"), str):
+        return _strip_html(content_obj["html"])
 
     pages = value.get("pages") or []
     if not pages and isinstance(content_obj, dict):
@@ -265,6 +287,31 @@ async def get_document(uri: str) -> Document:
     if len(parts) < 3:
         raise ValueError(f"invalid AT-URI: {uri}")
     repo, collection, rkey = parts[0], parts[1], parts[2]
+
+    # Prefer the index's extracted text. Re-implementing extraction here drifts
+    # from the backend's extractor: this record's content is {"html": ...} with
+    # a textContent sibling, shapes the python copy did not know, so it returned
+    # "" while /document returned 5,326 characters for the same URI.
+    try:
+        async with get_http_client() as client:
+            response = await client.get("/document", params={"uri": uri})
+        if response.status_code == 200:
+            documents = (response.json() or {}).get("documents") or []
+            if documents and documents[0].get("content"):
+                doc = documents[0]
+                return Document(
+                    uri=doc.get("uri", uri),
+                    title=doc.get("title", ""),
+                    content=doc["content"],
+                    createdAt=doc.get("createdAt", ""),
+                    tags=doc.get("tags") or [],
+                    publicationUri=doc.get("publicationUri", ""),
+                )
+    except Exception:
+        pass  # index unreachable — fall through to the PDS below
+
+    # Not indexed yet (published since the last snapshot), or excluded from the
+    # index: read the record from its PDS.
 
     pds = await _resolve_pds(repo)
     async with httpx.AsyncClient(timeout=15.0) as client:

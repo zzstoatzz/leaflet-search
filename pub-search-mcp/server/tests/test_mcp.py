@@ -269,3 +269,67 @@ class TestExtractContent:
         from pub_search.server import _extract_content
 
         assert _extract_content({}) == ""
+
+
+class TestBrowseFallsBackToKeyword:
+    """search defaults to hybrid, but hybrid/semantic rank against a query
+    embedding and return nothing without one — so a browse must stay keyword."""
+
+    async def test_author_browse_without_query_uses_keyword(self, monkeypatch):
+        from pub_search import server
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"results": []}
+
+        class _Client:
+            async def get(self, path, params=None):
+                captured["params"] = params or {}
+                return _Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(server, "get_http_client", lambda: _Client())
+        await server.search(query="", author="did:plc:xyz")
+        # keyword is the default upstream, so mode must be absent entirely
+        assert "mode" not in captured["params"]
+
+    async def test_query_search_keeps_hybrid(self, monkeypatch):
+        from pub_search import server
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"results": []}
+
+        class _Client:
+            async def get(self, path, params=None):
+                captured["params"] = params or {}
+                return _Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(server, "get_http_client", lambda: _Client())
+        await server.search(query="atproto")
+        assert captured["params"].get("mode") == "hybrid"

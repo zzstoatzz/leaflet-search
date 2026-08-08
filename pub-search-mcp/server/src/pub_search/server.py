@@ -173,6 +173,12 @@ async def search(
     if not query and not tag and not author:
         return []
 
+    # Browsing (no query) is only meaningful as an exact-match listing: the
+    # semantic and hybrid paths rank against a query embedding and return
+    # nothing without one. Defaulting to hybrid without this made
+    # search("", author=X) — the browse-an-author call — return zero results.
+    effective_mode = mode if query else "keyword"
+
     params: dict[str, Any] = {"format": "v2", "limit": str(limit)}
     if query:
         params["q"] = query
@@ -184,8 +190,8 @@ async def search(
         params["since"] = since
     if author:
         params["author"] = author
-    if mode != "keyword":
-        params["mode"] = mode
+    if effective_mode != "keyword":
+        params["mode"] = effective_mode
     if include_undiscoverable:
         params["include_undiscoverable"] = "true"
 

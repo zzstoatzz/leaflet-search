@@ -33,16 +33,9 @@ fn getIntervalSecs() u64 {
     return std.fmt.parseInt(u64, val, 10) catch 1800;
 }
 
-/// Documents verified per cycle.
-///
-/// Sized against the target, not by feel. 64,380 documents on a 7-day reverify
-/// need ~9,200/day; at one cycle per RECONCILE_INTERVAL_SECS (1800s = 48
-/// cycles/day) that is ~192 documents per cycle. 200 clears it with headroom.
-///
-/// This only became a safe default once the network phase ran concurrently.
-/// While the loop was serial, cycle time scaled with batch size and throughput
-/// stayed flat at ~65 docs/hour no matter what this said — raising it then
-/// would have made cycles longer and changed nothing else.
+/// Documents per cycle. 64k docs / 7-day reverify = ~9,200/day; at 48
+/// cycles/day that needs ~192. Only meaningful because the network phase runs
+/// concurrently — serially, cycle time scaled with this and throughput did not.
 fn getBatchSize() usize {
     const val = getenv("RECONCILE_BATCH_SIZE") orelse "200";
     return std.fmt.parseInt(usize, val, 10) catch 200;
@@ -53,16 +46,8 @@ fn getReverifyDays() u64 {
     return std.fmt.parseInt(u64, val, 10) catch 7;
 }
 
-/// Wall-clock bound on every outbound PDS / PLC request.
-///
-/// zig 0.16's http client has no read timeout on the fetch path, so a peer
-/// that accepts the request and never answers blocks this thread in the kernel
-/// forever. The reconciler is a serial loop, so ONE such peer stalls the whole
-/// sweep. Measured 2026-08-08 before this bound: ~2,740s per 50-document cycle
-/// with only 205s of it in db.query — roughly 54s of dead wait per document,
-/// which is how a 7-day reverify target degraded into a ~64-day sweep.
-///
-/// 10s is generous for a getRecord; only a hung peer should reach it.
+/// Wall-clock bound per outbound PDS/PLC request. zig's http client has no
+/// read timeout, so an unanswering peer blocks forever without one.
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
 
 fn getHttpTimeoutSecs() u64 {
@@ -165,11 +150,8 @@ fn worker(allocator: Allocator, io: Io) void {
             if (counts.verified > 0 or counts.deleted > 0) {
                 logfire.info("reconcile: verified {d} documents, deleted {d}", .{ counts.verified, counts.deleted });
             }
-            // Sweep-lag signal. Without it, throughput falling an order of
-            // magnitude below the reverify target is invisible: every cycle
-            // still logs a healthy "verified 50", and only the age of the
-            // oldest unverified document reveals that the sweep can never
-            // catch up. That is how a 7-day target ran at ~64 days unnoticed.
+            // per-cycle counts look healthy even when the sweep can never
+            // catch up; only the lag numbers show that.
             reportSweepLag();
         } else |err| {
             consecutive_errors += 1;
@@ -202,10 +184,8 @@ const DocInfo = struct {
     has_publication: bool,
 };
 
-/// What the network phase decided about a document. No database or vector
-/// mutation happens in that phase — every outcome is applied serially
-/// afterwards, so turso sees exactly the same one-writer pattern it did when
-/// the whole loop was serial.
+/// Decided in the network phase, applied serially afterwards so turso keeps
+/// its single-writer pattern.
 const Outcome = union(enum) {
     skip, // unparseable uri, or never reached
     no_pds, // DID deactivated / PLC unknown — verify, don't delete
@@ -213,17 +193,9 @@ const Outcome = union(enum) {
     checked: RecordStatus,
 };
 
-/// How many documents are verified concurrently.
-///
-/// Throughput here is per-document LATENCY bound, not batch bound: a cycle
-/// costs batch_size × per_doc, so raising the batch raises cycle time by the
-/// same factor and leaves throughput flat. Measured before this change: 50
-/// docs / 2,740s = ~65 docs/hour, against the ~383/hour that a 7-day reverify
-/// over 64k documents needs. Only concurrency moves that number.
-///
-/// 8 in-flight against a 10s bound is ≤80 outstanding requests worst case,
-/// spread across many PDS hosts, with a 200ms pause per worker between
-/// documents — so a single publisher still sees at most ~5 req/s from us.
+/// Throughput is per-doc latency bound (cycle = batch x per_doc), so only
+/// concurrency moves it. Each worker pauses 200ms between documents, capping
+/// us at ~5 req/s per worker against any one publisher.
 const DEFAULT_CONCURRENCY: usize = 8;
 const MAX_CONCURRENCY: usize = 32;
 
@@ -245,9 +217,8 @@ const CheckCtx = struct {
     cache_lock: Io.Mutex,
 };
 
-/// Cache-guarded PDS resolution. The HTTP miss happens OUTSIDE the lock —
-/// holding it across a 10s-bounded network call would serialize every worker
-/// behind the slowest DID and undo the concurrency.
+/// HTTP miss happens outside the lock; holding it across a network call would
+/// serialize every worker behind the slowest DID.
 fn resolvePdsShared(ctx: *CheckCtx, did: []const u8) ?[]const u8 {
     ctx.cache_lock.lockUncancelable(ctx.io);
     const cached = ctx.cache.get(did);
@@ -274,10 +245,9 @@ fn resolvePdsShared(ctx: *CheckCtx, did: []const u8) ?[]const u8 {
     return pds;
 }
 
-/// Claim the next unprocessed index, or null when the batch is exhausted.
-/// Factored out so the claiming rule is testable: the correctness risk of the
-/// parallel phase is a document processed twice (a double delete) or skipped
-/// (silently never verified), and both are properties of this function.
+/// Claim the next index, or null when exhausted. Factored out to test the
+/// risk directly: a doc claimed twice is deleted twice, one never claimed is
+/// silently never verified.
 fn claimNext(next: *std.atomic.Value(usize), len: usize) ?usize {
     const i = next.fetchAdd(1, .monotonic);
     if (i >= len) return null;
@@ -295,9 +265,8 @@ fn checkWorker(ctx: *CheckCtx) void {
             continue;
         };
 
-        // Attempt counters fire BEFORE the call; spans close only on
-        // completion, so a hung phase is silent in both directions.
-        // attempts-minus-completions is what names a stuck phase.
+        // counters fire before the call, spans only on completion, so
+        // attempts-minus-completions names a stuck phase.
         logfire.counter("reconcile.resolve_attempt", 1);
         const pds = resolvePdsShared(ctx, parts.did) orelse {
             ctx.outcomes[i] = .no_pds;
@@ -327,10 +296,8 @@ fn checkWorker(ctx: *CheckCtx) void {
 /// min), off the request path.
 fn reportSweepLag() void {
     const client = db.getClient() orelse return;
-    // Two separate facts. Coalescing NULL to an epoch date conflated them and
-    // reported "20673d behind" — the age of 1970, not of any real
-    // verification. Never-verified is a backlog count; oldest-verified is the
-    // sweep's actual lag.
+    // Two separate facts: coalescing NULL to an epoch date reported the age of
+    // 1970 (20673d) rather than any real verification.
     var result = client.query(
         \\SELECT
         \\  CAST(COALESCE((julianday('now') - julianday(MIN(verified_at))), 0) AS INTEGER),
@@ -445,9 +412,7 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
     var stale_ids: std.ArrayList([32]u8) = .empty;
     defer stale_ids.deinit(allocator);
 
-    // ---- phase 1: network, concurrent ----
-    // Every PDS/PLC request for the batch, run by a small pool of workers.
-    // Nothing here touches turso or turbopuffer.
+    // ---- phase 1: network, concurrent (no turso/tpuf) ----
     const outcomes = allocator.alloc(Outcome, docs.items.len) catch {
         return error.OutOfMemory;
     };
@@ -476,8 +441,8 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
                 break :blk null;
             };
         }
-        // If every spawn failed we would silently verify nothing, so fall back
-        // to doing the work on this thread rather than reporting a clean cycle.
+        // all spawns failing would report a clean cycle having verified
+        // nothing, so fall back to this thread.
         var spawned: usize = 0;
         for (threads[0..worker_count]) |t| {
             if (t != null) spawned += 1;
@@ -489,8 +454,6 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
     }
 
     // ---- phase 2: database, serial ----
-    // Applied on this thread only, so turso keeps the single-writer pattern it
-    // had when the whole loop was serial.
     for (docs.items, outcomes) |doc, outcome| {
         switch (outcome) {
             .skip => {},
@@ -537,9 +500,8 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
                 },
             },
         }
-        // No sleep here: this phase is local turso writes, and the politeness
-        // pause that used to live here now runs per worker in the network
-        // phase, where the remote requests actually are.
+        // politeness pause lives in the network phase now, where the remote
+        // requests are.
     }
 
     if (stale_ids.items.len > 0 and tpuf.isEnabled()) {

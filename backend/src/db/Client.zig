@@ -311,16 +311,21 @@ pub fn fetchBounded(
     if (timeout_s == 0) return fetchEvictRetry(http_client, io, options);
 
     var done: std.atomic.Value(bool) = .init(false);
-    var future = io.async(fetchTask, .{ http_client, io, options, &done });
 
-    // Deadline measured against the clock, NOT by accumulating nominal tick
-    // durations. `elapsed_ms += FETCH_TICK_MS` assumed a 250ms sleep takes
-    // 250ms; under scheduler pressure it takes much longer, so the counter
-    // undercounts and the bound silently inflates. Measured 2026-08-08 with 8
-    // concurrent reconciler workers: check_record ran 135s against a nominal
-    // 10s bound and logged zero timeouts, because elapsed_ms had only reached
-    // ~2.5s of ticks by then. A timeout that stretches under load is worst
-    // exactly when it is needed.
+    // Must be io.concurrent: io.async degrades to an inline call past
+    // async_limit (= cpus - 1, so 0 on our 1-vCPU machine), which finishes the
+    // work before it returns and leaves the deadline loop below unreachable.
+    var future = io.concurrent(fetchTask, .{ http_client, io, options, &done }) catch |err| {
+        logfire.counter("db.fetch_unbounded", 1);
+        logfire.warn(
+            "fetchBounded: concurrency unavailable ({s}) — running this request UNBOUNDED",
+            .{@errorName(err)},
+        );
+        return fetchEvictRetry(http_client, io, options);
+    };
+
+    // Clock, not tick count: a 250ms sleep is not 250ms under load, so summing
+    // nominal ticks inflates the bound exactly when it matters.
     const started = Io.Timestamp.now(io, .awake);
     const timeout_ns = timeout_s * std.time.ns_per_s;
     while (!done.load(.acquire)) {

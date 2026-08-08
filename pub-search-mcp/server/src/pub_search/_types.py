@@ -93,3 +93,20 @@ class Document(BaseModel):
     createdAt: str = ""
     tags: list[str] = []
     publicationUri: str = ""
+
+
+class AuthorProfile(BaseModel):
+    """What one author writes, where, and when.
+
+    Answers "who is this person, in this corpus?" — a question that otherwise
+    costs an agent a browse plus several passes of counting over the results.
+    """
+
+    author: str
+    document_count: int
+    platforms: list[str]
+    publications: list[str]
+    first_published: str = ""
+    last_published: str = ""
+    recurring_terms: list[str] = []
+    recent: list["SearchResult"] = []

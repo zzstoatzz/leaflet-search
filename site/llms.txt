@@ -22,12 +22,13 @@
 
 - hosted: `claude mcp add-json pub-search '{"type": "http", "url": "https://pub-search-by-zzstoatzz.fastmcp.app/mcp"}'`
 - local stdio: `claude mcp add pub-search -- uvx --from 'git+https://github.com/zzstoatzz/pub-search#subdirectory=pub-search-mcp/server' pub-search`
-- a curated layer, not a 1:1 of the HTTP API. tools: `search`,
-  `get_document` (fetches + flattens the live record from the author's PDS),
-  `find_similar`, `discover_focal_post`,
-  `describe_cluster`, `recommended_by_top_authors`, `get_tags`, `get_stats`,
-  `get_popular`. prompts: `usage_guide`, `search_tips`. resource:
-  `pub-search://stats`.
+- a curated layer, not a 1:1 of the HTTP API. tools: `search` (hybrid by
+  default, no offset), `get_document` (fetches + flattens the live record from
+  the author's PDS), `author_profile`, `find_similar`, `describe_cluster`,
+  `discover_focal_post`, `recommended_by_top_authors`. prompts:
+  `usage_guide`, `search_tips`. resources: `pub-search://stats`,
+  `pub-search://tags`, `pub-search://popular` — reference data is read on
+  demand rather than charged against every reasoning cycle.
 
 ### HTTP API — for code-mode agents, scripts, pipelines
 
@@ -81,7 +82,7 @@
 - `author` accepts a handle or a DID (handles resolve server-side).
   `search("", author="someone.com")` browses an author's everything.
 - freshness is bounded, not real-time — the keyword replica refreshes by
-  snapshot swap (minutes-to-hours of lag). `get_stats` / `/api/dashboard` show
+  snapshot swap (minutes-to-hours of lag). `pub-search://stats` / `/api/dashboard` show
   current counts if staleness matters.
 
 ## Source docs

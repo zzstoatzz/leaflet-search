@@ -11,6 +11,7 @@ import httpx
 from fastmcp import FastMCP
 
 from pub_search._types import (
+    AuthorProfile,
     ClusterContext,
     Document,
     PopularSearch,
@@ -38,22 +39,25 @@ search long-form writing on ATProto: leaflet, pckt, offprint, greengale, whitewi
 
 ## tools
 
-- `search(query, mode, tag, platform, since, author)` - search with mode: keyword, semantic, or hybrid
-- `get_document(uri)` - fetch full content by AT-URI
-- `find_similar(uri)` - find related documents (raw)
-- `discover_focal_post(window, sort)` - what's notable right now (top/trending in a window)
-- `describe_cluster(uri)` - a focal post's neighborhood + cross-platform / author / shared-terms observations
-- `recommended_by_top_authors(top_authors, window)` - transitive taste: what the most-recommended writers are themselves recommending. tunable resolution via the pool size.
-- `get_tags()` - available tags
-- `get_stats()` - index statistics
-- `get_popular()` - popular queries
+- `search(query, tag, platform, since, author)` - hybrid by default; narrow with filters rather than paging
+- `get_document(uri)` - the LIVE record from the author's PDS, flattened to text
+- `author_profile(author)` - what one author writes, where, and over what period
+- `find_similar(uri)` - documents near this one
+- `describe_cluster(uri)` - that neighborhood plus cross-platform / author / shared-term observations
+- `discover_focal_post(window, sort)` - what's notable right now
+- `recommended_by_top_authors(top_authors, window)` - transitive taste: what the most-recommended writers themselves recommend
+
+## resources
+
+reference data, read when you need it, not carried in every turn:
+`pub-search://stats`, `pub-search://tags`, `pub-search://popular`
 
 ## workflows
 
 **research a topic.**
-1. `search("topic")` for keyword search, `search("topic", mode="hybrid")` for best results
-2. `get_document(uri)` for full text
-3. `find_similar(uri)` for related content
+1. `search("topic")` — hybrid already, no mode to pick
+2. `get_document(uri)` for the full current text
+3. `describe_cluster(uri)` for who else is in this conversation
 
 **curate / write about the network.** pub-search is the only place that sees
 every long-form ATProto platform as one corpus, so the network-position of a
@@ -65,9 +69,13 @@ can't get from any single platform's UI.
 
 ## search modes
 
-- **keyword** (default): fast exact match (~100ms), supports all filters
-- **semantic**: meaning-based (~500ms), good for natural language queries
-- **hybrid**: both combined via rank fusion, `source` field shows how each result was found
+`hybrid` is the default and is usually right. `keyword` for exact or heavily
+filtered lookups (tag/since apply there); `semantic` for purely conceptual
+questions. Results carry a `source` field showing how each was found.
+
+There is no `offset`: semantic ranking is approximate-nearest-neighbour and
+does not repeat exactly, so page 2 is not a stable continuation of page 1.
+Narrow the query instead.
 
 ## visibility
 
@@ -100,7 +108,7 @@ def search_tips() -> str:
 - `search("natural language query", mode="semantic")` for meaning-based search
 - `search("query", mode="hybrid")` for best of both — results show `source` field
 - `find_similar(uri)` to discover related documents
-- `get_tags()` to discover available tags
+- read `pub-search://tags` to see what topics the corpus actually covers
 """
 
 
@@ -131,27 +139,27 @@ async def search(
     platform: Platform | None = None,
     since: str | None = None,
     author: str | None = None,
-    mode: Mode = "keyword",
+    mode: Mode = "hybrid",
     limit: int = 5,
-    offset: int = 0,
     include_undiscoverable: bool = False,
 ) -> list[SearchResult]:
     """search long-form writing across ATProto publishing platforms.
 
-    modes:
-        keyword: fast exact match (~100ms), supports all filters
-        semantic: meaning-based (~500ms), good for natural language queries
-        hybrid: both combined via rank fusion — results include a `source` field
+    Defaults to hybrid (keyword + meaning, rank-fused), which is the right
+    answer for almost every research question. Narrow with `tag`, `platform`,
+    `since` or `author` rather than paging — there is deliberately no offset:
+    semantic ranking is an approximate-nearest-neighbour search that does not
+    repeat exactly, so page 2 is not a stable continuation of page 1.
 
     args:
-        query: search query (titles and content). for semantic/hybrid, natural language works well.
-        tag: filter by tag (keyword mode only)
-        platform: filter by platform (leaflet, pckt, offprint, greengale, whitewind, other)
-        since: ISO date - only documents created after this date (keyword mode only)
-        author: filter by author (DID like "did:plc:xyz" or handle like "nate.bsky.social")
-        mode: search mode — keyword, semantic, or hybrid (default: keyword)
+        query: what you are looking for. natural language works well.
+        tag: filter by tag (exact-match modes only)
+        platform: leaflet, pckt, offprint, greengale, whitewind, other
+        since: ISO date — documents created after it (exact-match modes only)
+        author: handle ("nate.bsky.social") or DID ("did:plc:xyz")
+        mode: hybrid (default), keyword for exact/filtered lookups, semantic
+            for purely conceptual ones
         limit: max results (default 5, max 40)
-        offset: skip this many ranked results (default 0, max 1000)
         include_undiscoverable: include publications that set
             preferences.showInDiscover=false. These are indexed but excluded
             from discovery surfaces by default because their author asked to
@@ -165,11 +173,7 @@ async def search(
     if not query and not tag and not author:
         return []
 
-    params: dict[str, Any] = {
-        "format": "v2",
-        "limit": str(limit),
-        "offset": str(offset),
-    }
+    params: dict[str, Any] = {"format": "v2", "limit": str(limit)}
     if query:
         params["q"] = query
     if tag:
@@ -511,34 +515,69 @@ async def describe_cluster(uri: str, k: int = 5) -> ClusterContext:
 
 
 @mcp.tool
-async def get_tags(limit: int = 10) -> list[Tag]:
-    """list all available tags with document counts.
+async def author_profile(author: str, limit: int = 40) -> AuthorProfile:
+    """what one author writes about, where they publish, and over what period.
 
-    returns tags sorted by document count (most popular first).
-    useful for discovering topics and filtering searches.
+    Answers "who is this person in this corpus?" in one call. Doing it through
+    `search` means browsing the author and then counting platforms, publications
+    and date ranges by hand over the results — several reasoning cycles to
+    re-derive the same summary every time.
 
     args:
-        limit: max tags to return (default 10)
+        author: handle ("nate.bsky.social") or DID ("did:plc:xyz")
+        limit: how many of their documents to read for the summary (default 40)
 
     returns:
-        list of tags with their document counts
+        counts, the platforms and publications they use, their publishing date
+        range, terms recurring across their titles, and their most recent work
     """
+    params: dict[str, Any] = {"format": "v2", "author": author, "limit": str(limit)}
+    async with get_http_client() as client:
+        response = await client.get("/search", params=params)
+        response.raise_for_status()
+        data = response.json()
+
+    if isinstance(data, dict) and "error" in data:
+        return AuthorProfile(author=author, document_count=0, platforms=[], publications=[])
+
+    rows = [SearchResult(**r) for r in _extract_results(data)]
+    docs = [r for r in rows if r.type != "publication"]
+
+    dates = sorted(d.createdAt for d in docs if d.createdAt)
+    terms = Counter(w for d in docs for w in _title_terms(d.title))
+
+    return AuthorProfile(
+        author=author,
+        document_count=len(docs),
+        platforms=sorted({d.platform for d in docs}),
+        publications=sorted({d.publicationName for d in docs if d.publicationName}),
+        first_published=dates[0] if dates else "",
+        last_published=dates[-1] if dates else "",
+        recurring_terms=[w for w, n in terms.most_common(8) if n > 1],
+        recent=docs[:5],
+    )
+
+
+# -----------------------------------------------------------------------------
+# resources — reference data, not actions
+#
+# tags / popular / stats were tools. They are lookups an agent reads, not steps
+# it takes, and every tool's schema is re-read on each reasoning cycle — so
+# three of them charged a per-turn token tax to answer questions nobody asks
+# mid-task. As resources they stay available without competing with the tools
+# that do work.
+# -----------------------------------------------------------------------------
+
+
+async def _fetch_tags(limit: int = 40) -> list[Tag]:
     async with get_http_client() as client:
         response = await client.get("/tags", params={"format": "v2"})
         response.raise_for_status()
         data = response.json()
-
-    results = _extract_results(data)
-    return [Tag(**t) for t in results[:limit]]
+    return [Tag(**t) for t in _extract_results(data)[:limit]]
 
 
-@mcp.tool
-async def get_stats() -> Stats:
-    """get index statistics.
-
-    returns:
-        document and publication counts
-    """
+async def _fetch_stats() -> Stats:
     async with get_http_client() as client:
         response = await client.get("/stats")
         response.raise_for_status()
@@ -547,38 +586,30 @@ async def get_stats() -> Stats:
         return Stats(**data)
 
 
-@mcp.tool
-async def get_popular(limit: int = 5) -> list[PopularSearch]:
-    """get popular search queries.
+@mcp.resource("pub-search://stats")
+async def stats_resource() -> str:
+    """size and shape of the corpus."""
+    stats = await _fetch_stats()
+    return f"pub-search index: {stats.documents} documents, {stats.publications} publications"
 
-    see what others are searching for.
-    can inspire new research directions.
 
-    args:
-        limit: max queries to return (default 5)
+@mcp.resource("pub-search://tags")
+async def tags_resource() -> str:
+    """the tag vocabulary, most-used first — the topics this corpus actually covers."""
+    tags = await _fetch_tags()
+    lines = [f"{t.tag} ({t.count})" for t in tags]
+    return "tags by document count:\n" + "\n".join(lines)
 
-    returns:
-        list of popular queries with search counts
-    """
+
+@mcp.resource("pub-search://popular")
+async def popular_resource() -> str:
+    """what other people are searching for right now."""
     async with get_http_client() as client:
         response = await client.get("/popular", params={"format": "v2"})
         response.raise_for_status()
         data = response.json()
-
-    results = _extract_results(data)
-    return [PopularSearch(**p) for p in results[:limit]]
-
-
-# -----------------------------------------------------------------------------
-# resources
-# -----------------------------------------------------------------------------
-
-
-@mcp.resource("pub-search://stats")
-async def stats_resource() -> str:
-    """current index statistics."""
-    stats = await get_stats()
-    return f"pub search index: {stats.documents} documents, {stats.publications} publications"
+    rows = [PopularSearch(**p) for p in _extract_results(data)[:10]]
+    return "popular queries:\n" + "\n".join(f"{p.query} ({p.count})" for p in rows)
 
 
 # -----------------------------------------------------------------------------

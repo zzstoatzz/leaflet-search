@@ -160,13 +160,31 @@ class TestMcpServerRegistration:
             "discover_focal_post",
             "describe_cluster",
             "recommended_by_top_authors",
-            "get_tags",
-            "get_stats",
-            "get_popular",
+            "author_profile",
         }
         assert expected == tool_names
+
+    async def test_reference_data_is_resources_not_tools(self, client):
+        """tags/popular/stats are lookups, not actions.
+
+        Every tool's schema is re-read on each reasoning cycle, so keeping
+        reference data as tools charged a per-turn token tax to answer
+        questions nobody asks mid-task.
+        """
+        async with client:
+            tool_names = {t.name for t in await client.list_tools()}
+            resource_uris = {str(r.uri) for r in await client.list_resources()}
+
+        assert not ({"get_tags", "get_stats", "get_popular"} & tool_names)
+        assert {"pub-search://stats", "pub-search://tags", "pub-search://popular"} <= resource_uris
+
+    async def test_search_does_not_expose_offset(self, client):
+        """semantic ranking is ANN and does not repeat exactly, so page 2 is not
+        a stable continuation of page 1. Narrowing beats paging."""
+        async with client:
+            tools = await client.list_tools()
         search_tool = next(t for t in tools if t.name == "search")
-        assert "offset" in search_tool.input_schema["properties"]
+        assert "offset" not in search_tool.input_schema["properties"]
 
     async def test_list_prompts(self, client):
         """verify prompts are registered."""

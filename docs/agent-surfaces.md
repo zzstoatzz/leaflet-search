@@ -46,11 +46,20 @@ with three things the raw API doesn't have:
    [`/document`](api.md#document) returns the stored extracted text, batched.)
 2. **composed curator tools.** `discover_focal_post` (what's notable now,
    top vs trending), `describe_cluster` (a post's semantic neighborhood with
-   cross-platform/author/shared-term observations pre-computed), and
+   cross-platform/author/shared-term observations pre-computed),
    `recommended_by_top_authors` (transitive taste: what the
-   most-recommended writers themselves endorse). each replaces a multi-call
-   assembly an agent would otherwise fumble through — the network-position
-   framing is done server-side.
+   most-recommended writers themselves endorse), and `author_profile` (what
+   one author writes, where, and over what period). each replaces a
+   multi-call assembly an agent would otherwise fumble through — the
+   network-position framing is done server-side.
+
+   the surface is deliberately small. tags, popular queries and index stats
+   are **resources** (`pub-search://tags`, `pub-search://popular`,
+   `pub-search://stats`), not tools: they are lookups an agent reads, not
+   steps it takes, and every tool's schema is re-read on each reasoning
+   cycle. `search` has no `offset` for the same reason it defaults to
+   hybrid — semantic ranking is ANN and does not repeat exactly, so paging is
+   not a stable continuation; narrowing is.
 3. **prompts.** `usage_guide` and `search_tips` ship with the server.
    caveat: many MCP clients still don't surface prompts or resources, so
    don't design your integration assuming they're visible. the tool
@@ -136,8 +145,8 @@ project is yet.
   author's everything.
 - **freshness is bounded, not real-time.** ingestion from the firehose is
   continuous, but the keyword-serving replica is refreshed by snapshot swap.
-  expect minutes-to-hours of lag, not seconds. `get_stats` /
-  `/api/dashboard` show current counts if staleness matters to you.
+  expect minutes-to-hours of lag, not seconds. the `pub-search://stats`
+  resource / `/api/dashboard` show current counts if staleness matters to you.
 - **`get_document` (MCP) reaches out to the author's PDS per call.** latency
   and availability depend on that PDS, not on pub-search. fine for reading a
   handful of focal posts; for batches, the API's `/document` serves stored

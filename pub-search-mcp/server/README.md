@@ -33,9 +33,12 @@ claude mcp add pub-search -- uvx --from 'git+https://github.com/zzstoatzz/pub-se
 | `search_hybrid` | combined keyword + semantic search with author/platform filtering |
 | `get_document` | retrieve full content by AT-URI |
 | `find_similar` | find semantically similar documents |
-| `get_tags` | list all tags with document counts |
-| `get_popular` | see popular search queries |
-| `get_stats` | index statistics and performance metrics |
+| `author_profile` | what one author writes, where, and over what period |
+
+reference data is exposed as **resources**, not tools — `pub-search://tags`,
+`pub-search://popular`, `pub-search://stats`. tool schemas are re-read on every
+reasoning cycle, so lookups an agent reads (rather than steps it takes) do not
+belong in that budget.
 
 ## workflow
 

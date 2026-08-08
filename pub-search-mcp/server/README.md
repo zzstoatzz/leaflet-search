@@ -50,6 +50,8 @@ find_similar("at://...") → [{uri: "at://...", title: "...", snippet: "..."}]
 
 the `author` param accepts either a handle (`nate.bsky.social`) or a DID (`did:plc:xyz`). handles are resolved server-side.
 
+**visibility**: publications that set `preferences.showInDiscover=false` are indexed but excluded from `search` and `find_similar`. `search(..., include_undiscoverable=True)` opts back in — intended for reading through a specific author's own writing, so pair it with `author=`. `get_document` reads the record straight from the author's PDS, so it is not filtered; see [docs/visibility.md](../../docs/visibility.md).
+
 ## development
 
 ```bash

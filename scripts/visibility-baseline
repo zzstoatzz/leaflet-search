@@ -1,0 +1,239 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx"]
+# ///
+"""
+capture / compare a serving baseline across every discovery surface.
+
+The visibility change (docs/visibility.md) moves showInDiscover enforcement to
+a response-level policy pass that FAILS CLOSED. The failure mode to watch for
+is therefore over-hiding: dropping rows that should have been served. A leak is
+loud once you look for it; over-hiding is silent and looks like "search got
+worse".
+
+So: snapshot result counts + latency per surface BEFORE deploying, snapshot
+again AFTER, and diff. Anything that lost rows is the regression.
+
+Usage:
+    ./scripts/visibility-baseline capture before.json
+    # ...deploy...
+    ./scripts/visibility-baseline capture after.json
+    ./scripts/visibility-baseline compare before.json after.json
+
+    # optional: prove the fix on a known opted-out publication
+    ./scripts/visibility-baseline capture before.json --undiscoverable-did did:plc:xyz
+"""
+
+from __future__ import annotations
+
+import json
+import statistics
+import sys
+import time
+from typing import Any, NamedTuple
+
+import httpx
+
+BASE = "https://leaflet-search-backend.fly.dev"
+TIMEOUT = 30.0
+
+# Spread across modes and filter shapes: every retrieval path that the policy
+# pass now sits in front of. Over-hiding in any one of them shows up as a
+# count drop for that probe alone, which is what makes the diff diagnostic
+# rather than just alarming.
+QUERIES = [
+    "atproto", "photography", "rust", "music", "climate",
+    "zig programming", "self hosting", "typescript react",
+    "japan travel", "coffee", "machine learning", "bluesky",
+    "database performance", "art", "politics", "leaflet",
+]
+
+
+class Probe(NamedTuple):
+    name: str
+    path: str
+    params: dict[str, str]
+
+
+def probes(undiscoverable_did: str | None) -> list[Probe]:
+    out: list[Probe] = []
+    for mode in ("keyword", "semantic", "hybrid"):
+        for q in QUERIES:
+            out.append(Probe(
+                name=f"search/{mode}/{q}",
+                path="/search",
+                params={"q": q, "mode": mode, "format": "v2", "limit": "20"},
+            ))
+
+    # non-query shapes: tag browse and author listing exercise paths that the
+    # plain q= probes never reach (tag browse is local-replica only; the
+    # author listing with no q falls through to turso).
+    out += [
+        Probe("tag/tech", "/search", {"tag": "tech", "format": "v2", "limit": "20"}),
+        Probe("tag/atproto", "/search", {"tag": "atproto", "format": "v2", "limit": "20"}),
+        Probe("tag+q/tech+relay", "/search", {"tag": "tech", "q": "relay", "format": "v2", "limit": "20"}),
+        Probe("platform/leaflet", "/search", {"q": "the", "platform": "leaflet", "format": "v2", "limit": "20"}),
+        Probe("tags", "/tags", {}),
+        Probe("popular", "/popular", {}),
+    ]
+
+    if undiscoverable_did:
+        # The actual fix, asserted directly: this author's opted-out documents
+        # must be absent by default and present under the opt-in.
+        out += [
+            Probe("undiscoverable/default", "/search",
+                  {"author": undiscoverable_did, "format": "v2", "limit": "40"}),
+            Probe("undiscoverable/opted-in", "/search",
+                  {"author": undiscoverable_did, "format": "v2", "limit": "40",
+                   "include_undiscoverable": "true"}),
+        ]
+    return out
+
+
+def count_results(payload: Any) -> int:
+    if isinstance(payload, dict):
+        if "results" in payload:
+            return len(payload["results"] or [])
+        if "error" in payload:
+            return -1
+        if "tags" in payload:
+            return len(payload["tags"] or [])
+    if isinstance(payload, list):
+        return len(payload)
+    return -1
+
+
+def capture(out_path: str, undiscoverable_did: str | None) -> None:
+    rows: dict[str, dict[str, Any]] = {}
+    with httpx.Client(base_url=BASE, timeout=TIMEOUT) as client:
+        all_probes = probes(undiscoverable_did)
+        for i, probe in enumerate(all_probes, 1):
+            latencies: list[float] = []
+            count, status = -1, 0
+            for _ in range(2):  # two samples; one is not evidence
+                t0 = time.perf_counter()
+                try:
+                    r = client.get(probe.path, params=probe.params)
+                    status = r.status_code
+                    payload = r.json()
+                except Exception as exc:  # noqa: BLE001
+                    rows[probe.name] = {"error": str(exc), "count": -1, "status": 0}
+                    break
+                latencies.append((time.perf_counter() - t0) * 1000)
+                count = count_results(payload)
+            else:
+                rows[probe.name] = {
+                    "count": count,
+                    "status": status,
+                    "ms": round(statistics.median(latencies), 1),
+                }
+            print(f"  [{i}/{len(all_probes)}] {probe.name}: "
+                  f"{rows[probe.name].get('count')} @ {rows[probe.name].get('ms')}ms",
+                  file=sys.stderr)
+
+    snapshot = client_meta()
+    with open(out_path, "w") as fh:
+        json.dump({"snapshot": snapshot, "probes": rows}, fh, indent=2)
+    print(f"\nwrote {out_path} ({len(rows)} probes)")
+
+
+def client_meta() -> dict[str, Any]:
+    """Snapshot identity, so a diff can tell a code regression from a rebuild."""
+    try:
+        with httpx.Client(base_url=BASE, timeout=10.0) as c:
+            return c.get("/snapshot").json()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def compare(before_path: str, after_path: str) -> int:
+    before = json.load(open(before_path))
+    after = json.load(open(after_path))
+
+    b_snap = before.get("snapshot", {}).get("build_id")
+    a_snap = after.get("snapshot", {}).get("build_id")
+    if b_snap != a_snap:
+        print(f"NOTE: snapshot changed between runs ({b_snap} -> {a_snap}).")
+        print("      Corpus differences are expected; judge shape, not exact counts.\n")
+
+    bp, ap = before["probes"], after["probes"]
+    regressions, errors, notes = [], [], []
+
+    for name, b in bp.items():
+        a = ap.get(name)
+        if a is None:
+            notes.append(f"{name}: missing after")
+            continue
+        if a.get("status", 0) >= 500 or a.get("count") == -1:
+            errors.append(f"{name}: status={a.get('status')} error={a.get('error', '')}")
+            continue
+        b_count, a_count = b.get("count", -1), a.get("count", -1)
+        if b_count <= 0:
+            continue
+        lost = b_count - a_count
+        if lost > 0:
+            pct = 100.0 * lost / b_count
+            entry = f"{name}: {b_count} -> {a_count} (-{lost}, -{pct:.0f}%)"
+            # The opted-out author's default probe SHOULD lose rows: that is
+            # the fix landing, not a regression.
+            (notes if name == "undiscoverable/default" else regressions).append(entry)
+
+    print("=" * 70)
+    if errors:
+        print(f"\nERRORS ({len(errors)}) — these block the deploy:")
+        for e in errors:
+            print(f"  {e}")
+    if regressions:
+        print(f"\nOVER-HIDING ({len(regressions)}) — rows lost where none should be:")
+        for r in regressions:
+            print(f"  {r}")
+    if notes:
+        print(f"\nEXPECTED CHANGES ({len(notes)}):")
+        for n in notes:
+            print(f"  {n}")
+    if not errors and not regressions:
+        print("\nno regressions: every surface returned at least as many rows as before.")
+
+    lat_b = [v["ms"] for v in bp.values() if "ms" in v]
+    lat_a = [v["ms"] for v in ap.values() if "ms" in v]
+    if lat_b and lat_a:
+        print(f"\nlatency median: {statistics.median(lat_b):.0f}ms -> {statistics.median(lat_a):.0f}ms")
+        print(f"latency p95:    {percentile(lat_b, 95):.0f}ms -> {percentile(lat_a, 95):.0f}ms")
+
+    print("=" * 70)
+    return 1 if (errors or regressions) else 0
+
+
+def percentile(xs: list[float], p: float) -> float:
+    s = sorted(xs)
+    k = int(round((p / 100.0) * (len(s) - 1)))
+    return s[k]
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 2
+    cmd = args[0]
+    if cmd == "capture":
+        if len(args) < 2:
+            print("usage: visibility-baseline capture <out.json> [--undiscoverable-did DID]")
+            return 2
+        did = None
+        if "--undiscoverable-did" in args:
+            did = args[args.index("--undiscoverable-did") + 1]
+        capture(args[1], did)
+        return 0
+    if cmd == "compare":
+        if len(args) < 3:
+            print("usage: visibility-baseline compare <before.json> <after.json>")
+            return 2
+        return compare(args[1], args[2])
+    print(f"unknown command: {cmd}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

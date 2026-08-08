@@ -24,8 +24,19 @@ full-text search across documents and publications.
 | `format` | string | no | `v2` wraps the page with pagination metadata |
 | `limit` | int | no | page size (default 20, max 40) |
 | `offset` | int | no | ranked-result offset (default 0, max 1000) |
+| `include_undiscoverable` | bool | no | `true` includes publications that set `preferences.showInDiscover=false`. default excludes them. |
 
 *at least one of `q`, `tag`, or `author` required
+
+**visibility:** publications that set `preferences.showInDiscover=false` are
+indexed but excluded from every discovery surface — `/search` (all modes),
+`/similar`, and `/document`. Their author asked to stay out of discovery, not
+to be forgotten. `include_undiscoverable=true` opts back in; it is intended for
+reading through a specific author's own writing, so pair it with `author=`
+rather than issuing a global query. During the brief startup window before the
+visibility set loads, these endpoints answer `503` rather than returning a
+result set that would look like "nothing matched". See
+[visibility.md](visibility.md).
 
 **filter behavior by mode:**
 - **keyword**: respects all filters (`tag`, `platform`, `since`, `author`)

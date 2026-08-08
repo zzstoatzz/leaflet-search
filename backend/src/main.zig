@@ -10,6 +10,7 @@ const ingest = @import("ingest.zig");
 const builder = @import("builder.zig");
 const promote = @import("promote.zig");
 const labeler = @import("labeler.zig");
+const visibility = @import("visibility.zig");
 const labeler_classifier = @import("ingest/classifier.zig");
 
 const SOCKET_TIMEOUT_SECS = 5;
@@ -124,6 +125,12 @@ pub fn main() !void {
 }
 
 fn initServices(allocator: std.mem.Allocator, io: Io) void {
+    // FIRST: the search paths fail closed until the visibility set loads, so
+    // anything ordered ahead of this lands directly in the window where
+    // /search answers 503. Non-blocking — it seeds from turso (already
+    // initialized, before the listener) on its own thread.
+    visibility.start(io);
+
     // run schema migrations first (idempotent, but may be slow if turso is laggy)
     db.initSchema();
 
@@ -134,6 +141,12 @@ fn initServices(allocator: std.mem.Allocator, io: Io) void {
     // init local db (slow - turso already initialized)
     db.initLocalDb(io);
     db.startSync(io);
+
+    // Backstop for the visibility set: if turso was unreachable at boot the
+    // refresher is still unloaded, and the replica can answer instead — its
+    // publications table is complete at or below the snapshot watermark, which
+    // is enough to serve while turso recovers.
+    if (!visibility.isLoaded()) visibility.seedFromLocal();
 
     // one-time: feed the existing corpus through the classifier so it evaluates
     // every already-indexed author, not just ones publishing after deploy.
@@ -210,6 +223,7 @@ test {
     _ = @import("server/documents.zig");
     _ = @import("server.zig");
     _ = @import("policy.zig");
+    _ = @import("visibility.zig");
     _ = @import("promote.zig");
     _ = @import("db/LocalDb.zig");
     _ = @import("server/pubkey.zig");

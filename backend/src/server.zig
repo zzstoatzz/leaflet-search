@@ -12,6 +12,7 @@ const ingest = @import("ingest.zig");
 const metrics = @import("metrics.zig");
 const search = @import("server/search.zig");
 const documents = @import("server/documents.zig");
+const visibility = @import("visibility.zig");
 const dashboard = @import("server/dashboard.zig");
 const recommended = @import("server/recommended.zig");
 const curators = @import("server/curators.zig");
@@ -239,8 +240,14 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
 
     const labeled_pref = parseQueryParam(alloc, target, "labeled") catch null;
     const show_labeled = labeled_pref != null and mem.eql(u8, labeled_pref.?, "show");
-    const hidden_pref = parseQueryParam(alloc, target, "hidden") catch null;
-    const show_hidden = hidden_pref != null and mem.eql(u8, hidden_pref.?, "show");
+    // `include_undiscoverable=true` opts in to publications that set
+    // preferences.showInDiscover=false. Default is exclusion. The old
+    // `hidden=show` spelling is still accepted so existing callers keep
+    // working, but it is undocumented and should not be used.
+    const undiscoverable_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
+    const legacy_hidden_pref = parseQueryParam(alloc, target, "hidden") catch null;
+    const include_undiscoverable = (undiscoverable_pref != null and mem.eql(u8, undiscoverable_pref.?, "true")) or
+        (legacy_hidden_pref != null and mem.eql(u8, legacy_hidden_pref.?, "show"));
 
     // Retrieve the full requested prefix plus one policy-visible row. Paging
     // is then a pure slice of a stable ranking, and that extra row is the
@@ -256,8 +263,22 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     const raw_results = search.search(alloc, query, tag_filter, platform_filter, since_filter, author_filter, mode, .{
         .max_results = result_window,
         .show_labeled = show_labeled,
-        .show_hidden = show_hidden,
+        .include_undiscoverable = include_undiscoverable,
     }) catch |err| {
+        // Startup window: the visibility set has not loaded, so we cannot tell
+        // which publications opted out. An empty result set would be
+        // indistinguishable from "nothing matched", so answer honestly and let
+        // the caller retry.
+        if (err == error.VisibilityNotReady) {
+            try request.respond(
+                "{\"error\":\"search is still starting up, retry shortly\"}",
+                .{
+                    .status = .service_unavailable,
+                    .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+                },
+            );
+            return;
+        }
         logfire.err("search failed: {}", .{err});
         metrics.stats.recordError();
         return err;
@@ -265,14 +286,84 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     metrics.stats.recordSearch(query);
     logfire.counter("search.requests", 1);
 
-    // label policy: results from bulk-generated-labeled accounts are hidden by
-    // default; `labeled=show` opts in (they come back annotated so the UI can
-    // badge them). Kept accounts are always shown, annotated. Mirrors the
-    // opt-in model of bsky labeler subscriptions, for our own surface.
-    const results = applyLabelPolicy(alloc, raw_results, show_labeled) catch raw_results;
+    try sendResults(request, alloc, raw_results, format, query, @tagName(mode), limit, offset, .{
+        .show_labeled = show_labeled,
+        .include_undiscoverable = include_undiscoverable,
+    });
+}
 
+pub const ResultPolicy = struct {
+    show_labeled: bool = false,
+    include_undiscoverable: bool = false,
+};
+
+/// THE serving policy choke point. Every endpoint that returns a result array
+/// runs through here, via sendResults — a retrieval path cannot publish a row
+/// without passing this.
+///
+/// Two policies, one pass over the serialized array:
+///   - label policy: rows from bulk-generated accounts are dropped unless kept
+///     or `show_labeled`; survivors are annotated so the UI can badge them.
+///   - visibility policy: rows belonging to a publication that set
+///     preferences.showInDiscover=false are dropped unless the caller opted in.
+///
+/// The retrieval paths ALSO filter per row. That is deliberate and is not
+/// redundancy for its own sake: the per-row checks keep the bounded candidate
+/// window from being spent on rows that will be dropped here, which is what
+/// keeps pagination honest. This pass is the guarantee — if a path forgets its
+/// row check, or a new path is added, nothing leaks. That split already
+/// existed for the label policy (includeDid + this pass); visibility now uses
+/// the same one instead of trusting ~14 call sites to remember.
+///
+/// Result sets are ≤tens of rows, so the reparse is noise.
+fn applyResultPolicy(alloc: Allocator, body: []const u8, opts: ResultPolicy) ![]const u8 {
+    const root = try json.parseFromSliceLeaky(json.Value, alloc, body, .{});
+    if (root != .array) return body; // error payloads etc. pass through
+
+    var out = json.Array.init(alloc);
+    for (root.array.items) |item| {
+        var result = item;
+        const did = zat.json.getString(result, "did") orelse "";
+
+        if (!opts.include_undiscoverable) {
+            const base_path = zat.json.getString(result, "basePath") orelse "";
+            const uri = zat.json.getString(result, "uri") orelse "";
+            const is_pub = std.mem.eql(u8, zat.json.getString(result, "type") orelse "", "publication");
+            const undiscoverable = if (is_pub)
+                visibility.isUndiscoverablePub(uri)
+            else
+                visibility.isUndiscoverableDoc("", did, base_path);
+            if (undiscoverable) continue;
+        }
+
+        if (did.len > 0 and classifier.isLabeledDid(did)) {
+            const kept = policy.isKept(did);
+            if (!kept and !opts.show_labeled) continue;
+            try result.object.put(alloc, "labeled", .{ .bool = true });
+            try result.object.put(alloc, "kept", .{ .bool = kept });
+        }
+        try out.append(result);
+    }
+    return json.Stringify.valueAlloc(alloc, json.Value{ .array = out }, .{});
+}
+
+/// Send a result array through the policy choke point, then the v1/v2 envelope.
+/// Endpoints returning results must use this rather than sendJson directly —
+/// that is what makes the policy impossible to forget.
+fn sendResults(
+    request: *http.Server.Request,
+    alloc: Allocator,
+    raw: []const u8,
+    format: []const u8,
+    query: []const u8,
+    mode: []const u8,
+    limit: usize,
+    offset: usize,
+    opts: ResultPolicy,
+) !void {
+    const results = applyResultPolicy(alloc, raw, opts) catch raw;
     if (mem.eql(u8, format, "v2")) {
-        const wrapped = try wrapResponse(alloc, results, query, @tagName(mode), limit, offset, false);
+        const wrapped = try wrapResponse(alloc, results, query, mode, limit, offset, false);
         try sendJson(request, wrapped);
     } else {
         // Always slice the bounded candidate array. The old `limit < 40`
@@ -281,30 +372,6 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
         const paginated = try paginateJsonArray(alloc, results, limit, offset);
         try sendJson(request, paginated);
     }
-}
-
-/// Label policy over a serialized search-result array: rows from labeled
-/// accounts are dropped unless kept or `show`; survivors are annotated
-/// (labeled/kept) so the UI can badge them. One choke point covers every
-/// mode and format; result sets are ≤tens of rows so the reparse is noise.
-fn applyLabelPolicy(alloc: Allocator, body: []const u8, show: bool) ![]const u8 {
-    const root = try json.parseFromSliceLeaky(json.Value, alloc, body, .{});
-    if (root != .array) return body; // error payloads etc. pass through
-
-    var out = json.Array.init(alloc);
-    for (root.array.items) |item| {
-        var result = item;
-        if (zat.json.getString(result, "did")) |did| {
-            if (classifier.isLabeledDid(did)) {
-                const kept = policy.isKept(did);
-                if (!kept and !show) continue;
-                try result.object.put(alloc, "labeled", .{ .bool = true });
-                try result.object.put(alloc, "kept", .{ .bool = kept });
-            }
-        }
-        try out.append(result);
-    }
-    return json.Stringify.valueAlloc(alloc, json.Value{ .array = out }, .{});
 }
 
 fn handleTags(request: *http.Server.Request, target: []const u8, io: Io) !void {
@@ -1225,7 +1292,22 @@ fn handleDocument(request: *http.Server.Request, target: []const u8) !void {
     const span = logfire.span("http.document", .{ .count = uris.len });
     defer span.end();
 
-    const body = documents.fetch(alloc, uris) catch {
+    const doc_undiscoverable_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
+    const doc_include_undiscoverable = doc_undiscoverable_pref != null and
+        mem.eql(u8, doc_undiscoverable_pref.?, "true");
+
+    // Same startup gate as search: without the visibility set we cannot tell
+    // which publications opted out, and reporting every uri as "missing" would
+    // read as "these do not exist".
+    if (!doc_include_undiscoverable and !visibility.isLoaded()) {
+        try request.respond(
+            "{\"error\":\"document fetch is still starting up, retry shortly\"}",
+            .{ .status = .service_unavailable, .extra_headers = json_hdr },
+        );
+        return;
+    }
+
+    const body = documents.fetch(alloc, uris, doc_include_undiscoverable) catch {
         try request.respond("{\"error\":\"replica not ready, retry shortly\"}", .{ .status = .service_unavailable, .extra_headers = json_hdr });
         return;
     };
@@ -1247,6 +1329,20 @@ fn handleSimilar(request: *http.Server.Request, target: []const u8, io: Io) !voi
 
     const format = parseQueryParam(alloc, target, "format") catch "v1";
 
+    const similar_pref = parseQueryParam(alloc, target, "include_undiscoverable") catch null;
+    const similar_include_undiscoverable = similar_pref != null and mem.eql(u8, similar_pref.?, "true");
+
+    if (!similar_include_undiscoverable and !visibility.isLoaded()) {
+        try request.respond(
+            "{\"error\":\"similar is still starting up, retry shortly\"}",
+            .{
+                .status = .service_unavailable,
+                .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            },
+        );
+        return;
+    }
+
     // span attributes are copied internally, safe to use arena strings
     const span = logfire.span("http.similar", .{ .uri = uri });
     defer span.end();
@@ -1260,12 +1356,12 @@ fn handleSimilar(request: *http.Server.Request, target: []const u8, io: Io) !voi
         return;
     };
 
-    if (mem.eql(u8, format, "v2")) {
-        const wrapped = try wrapResponse(alloc, results, "", "similar", 20, 0, false);
-        try sendJson(request, wrapped);
-    } else {
-        try sendJson(request, results);
-    }
+    // /similar used to send results straight out, bypassing policy entirely:
+    // an opted-out (or labeled) document was one "related documents" hop away
+    // from any discoverable neighbour. It goes through the choke point now.
+    try sendResults(request, alloc, results, format, "", "similar", 20, 0, .{
+        .include_undiscoverable = similar_include_undiscoverable,
+    });
 }
 
 /// Wrap a result prefix in the v2 page envelope. Search prefixes pass
@@ -1567,4 +1663,53 @@ fn handleActivity(request: *http.Server.Request, io: Io) !void {
     pos += 1;
 
     try sendJson(request, buf[0..pos]);
+}
+
+test "result policy is the choke point: undiscoverable rows drop whatever produced them" {
+    // The guarantee that makes the per-row checks an optimization rather than
+    // the enforcement. A retrieval path that forgets its row filter — or a new
+    // path added later — still cannot publish an opted-out publication's row.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    visibility.resetForTest();
+    defer visibility.resetForTest();
+    try visibility.installForTest(&.{
+        .{ .uri = "at://did:plc:x/site.standard.publication/notes", .did = "did:plc:x", .base_path = "notes.example" },
+    });
+
+    const body =
+        \\[{"type":"article","uri":"at://did:plc:x/site.standard.document/a","did":"did:plc:x","basePath":"notes.example","title":"hidden"},
+        \\ {"type":"article","uri":"at://did:plc:y/site.standard.document/b","did":"did:plc:y","basePath":"public.example","title":"shown"},
+        \\ {"type":"publication","uri":"at://did:plc:x/site.standard.publication/notes","did":"did:plc:x","basePath":"notes.example","title":"notes"}]
+    ;
+
+    const filtered = try applyResultPolicy(alloc, body, .{});
+    const root = try json.parseFromSliceLeaky(json.Value, alloc, filtered, .{});
+    try std.testing.expectEqual(@as(usize, 1), root.array.items.len);
+    try std.testing.expectEqualStrings("shown", zat.json.getString(root.array.items[0], "title").?);
+
+    // ...and the opt-in returns all three, including the publication row.
+    const opted_in = try applyResultPolicy(alloc, body, .{ .include_undiscoverable = true });
+    const all = try json.parseFromSliceLeaky(json.Value, alloc, opted_in, .{});
+    try std.testing.expectEqual(@as(usize, 3), all.array.items.len);
+}
+
+test "result policy fails closed when the visibility set never loaded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    visibility.resetForTest();
+    defer visibility.resetForTest();
+
+    const body =
+        \\[{"type":"article","uri":"at://did:plc:y/site.standard.document/b","did":"did:plc:y","basePath":"public.example","title":"shown"}]
+    ;
+    // Unloaded set = we cannot tell who opted out. Callers reach this only via
+    // the 503 gate; if they somehow do, dropping beats publishing.
+    const filtered = try applyResultPolicy(alloc, body, .{});
+    const root = try json.parseFromSliceLeaky(json.Value, alloc, filtered, .{});
+    try std.testing.expectEqual(@as(usize, 0), root.array.items.len);
 }

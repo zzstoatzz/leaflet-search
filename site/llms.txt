@@ -40,6 +40,11 @@
   `/stats`, `/activity`, `/api/dashboard`, `/subscribed`, `/subscribers`,
   `/wrapped`, `/api/labeler`, `/health`. full parameters + response shapes
   in api.md.
+- publications that set `preferences.showInDiscover=false` are indexed but
+  excluded from every discovery surface (search, /similar, /document). their
+  author asked to stay out of them. `include_undiscoverable=true` opts back
+  in — intended for looking through a specific author's own writing, so pair
+  it with `author=`, not with a global query.
 
 ### AT Protocol labeler — a subscribable trust signal
 

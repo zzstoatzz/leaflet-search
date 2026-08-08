@@ -67,6 +67,14 @@ can't get from any single platform's UI.
 - **semantic**: meaning-based (~500ms), good for natural language queries
 - **hybrid**: both combined via rank fusion, `source` field shows how each result was found
 
+## visibility
+
+publications that set `preferences.showInDiscover=false` are indexed but kept
+out of `search` and `find_similar`. their author asked to stay out of discovery.
+`search(..., include_undiscoverable=True)` opts back in — use it when someone is
+deliberately reading through a specific author's own writing, and pair it with
+`author=`. do not set it on a general/global query.
+
 ## result types
 
 - **article**: document in a publication
@@ -124,6 +132,7 @@ async def search(
     mode: Mode = "keyword",
     limit: int = 5,
     offset: int = 0,
+    include_undiscoverable: bool = False,
 ) -> list[SearchResult]:
     """search long-form writing across ATProto publishing platforms.
 
@@ -141,6 +150,12 @@ async def search(
         mode: search mode — keyword, semantic, or hybrid (default: keyword)
         limit: max results (default 5, max 40)
         offset: skip this many ranked results (default 0, max 1000)
+        include_undiscoverable: include publications that set
+            preferences.showInDiscover=false. These are indexed but excluded
+            from discovery surfaces by default because their author asked to
+            stay out of them. Pass True only when the user is deliberately
+            looking through their own or a specific author's writing —
+            pair it with `author` rather than running it globally.
 
     returns:
         list of results with uri, title, snippet, platform, and web url
@@ -165,6 +180,8 @@ async def search(
         params["author"] = author
     if mode != "keyword":
         params["mode"] = mode
+    if include_undiscoverable:
+        params["include_undiscoverable"] = "true"
 
     async with get_http_client() as client:
         response = await client.get("/search", params=params)
@@ -231,6 +248,12 @@ async def get_document(uri: str) -> Document:
     fetches the complete document from ATProto, including full text content.
     use this after finding documents via search to get the complete text.
 
+    note: this reads the record directly from the author's PDS, not from the
+    pub-search index, so it is not filtered by preferences.showInDiscover.
+    That is deliberate — the preference is about staying out of discovery
+    surfaces, not about revoking access to a public record you already have
+    the URI for. Search will not hand you those URIs by default.
+
     args:
         uri: the AT-URI of the document (e.g., at://did:plc:.../pub.leaflet.document/...)
 
@@ -273,6 +296,9 @@ async def find_similar(uri: str, limit: int = 5) -> list[SearchResult]:
     uses vector similarity to find semantically related documents.
     great for discovering related content after finding
     an interesting document.
+
+    publications that set preferences.showInDiscover=false are excluded, same
+    as search — otherwise they would be one hop away from any neighbour.
 
     args:
         uri: the AT-URI of the document to find similar content for

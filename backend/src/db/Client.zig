@@ -298,7 +298,11 @@ fn doRequest(self: *Client, span: logfire.Span, span_name: []const u8, sql_for_l
 /// as an async task and the caller watches it, canceling when the deadline
 /// passes. Cancel joins the task before returning, so the response writer is
 /// never touched after this returns error.RequestTimeout.
-fn fetchBounded(
+/// Run a fetch with a wall-clock bound, canceling the task when the deadline
+/// passes. zig 0.16 has no read timeout anywhere on the fetch path, so any
+/// caller doing HTTP to a peer it does not control needs this — see the
+/// reconciler, whose per-doc PDS checks hung the sweep for ~54s per document.
+pub fn fetchBounded(
     http_client: *http.Client,
     io: Io,
     options: http.Client.FetchOptions,

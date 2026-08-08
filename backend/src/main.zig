@@ -125,6 +125,12 @@ pub fn main() !void {
 }
 
 fn initServices(allocator: std.mem.Allocator, io: Io) void {
+    // FIRST: the search paths fail closed until the visibility set loads, so
+    // anything ordered ahead of this lands directly in the window where
+    // /search answers 503. Non-blocking — it seeds from turso (already
+    // initialized, before the listener) on its own thread.
+    visibility.start(io);
+
     // run schema migrations first (idempotent, but may be slow if turso is laggy)
     db.initSchema();
 
@@ -136,12 +142,11 @@ fn initServices(allocator: std.mem.Allocator, io: Io) void {
     db.initLocalDb(io);
     db.startSync(io);
 
-    // serving-time visibility policy. Seeds from the replica we just opened
-    // (no network) and then refreshes from turso in the background, so a
-    // showInDiscover preference is never resolved on the request path. Must
-    // come straight after the replica opens: until the set loads, the search
-    // paths fail closed, which is correct but hides opted-in results too.
-    visibility.start(io);
+    // Backstop for the visibility set: if turso was unreachable at boot the
+    // refresher is still unloaded, and the replica can answer instead — its
+    // publications table is complete at or below the snapshot watermark, which
+    // is enough to serve while turso recovers.
+    if (!visibility.isLoaded()) visibility.seedFromLocal();
 
     // one-time: feed the existing corpus through the classifier so it evaluates
     // every already-indexed author, not just ones publishing after deploy.

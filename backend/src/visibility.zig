@@ -218,8 +218,10 @@ fn refreshFromTurso() void {
 
 fn worker() void {
     const io = global_io orelse return;
-    // The replica seed already ran; refresh immediately so opt-outs newer
-    // than the snapshot close within one request-free beat of boot.
+    // Turso first, and immediately: it is initialized before the listener
+    // starts accepting, whereas the replica takes ~1.4s to open. Until the set
+    // loads, search answers 503, so this query is the length of that window —
+    // a turso point read (p50 10ms) rather than a replica open.
     refreshFromTurso();
     while (true) {
         io.sleep(Io.Duration.fromSeconds(REFRESH_INTERVAL_SECS), .awake) catch {};
@@ -227,11 +229,15 @@ fn worker() void {
     }
 }
 
-/// Seed from the replica, then keep the set fresh from turso in the
-/// background. Must run before the search paths serve their first request.
+/// Start the refresher. Non-blocking: the seed happens on the spawned thread
+/// so a slow turso cannot stall the rest of initServices behind it.
+///
+/// Call this FIRST in initServices. Everything after it (migrations, opening
+/// the replica) is slower, and the search paths fail closed until the set
+/// exists — so anything ordered before this is added directly to the window
+/// where search answers 503.
 pub fn start(io: Io) void {
     global_io = io;
-    seedFromLocal();
     const thread = std.Thread.spawn(.{}, worker, .{}) catch |err| {
         logfire.err("visibility: refresher failed to start: {s}", .{@errorName(err)});
         return;

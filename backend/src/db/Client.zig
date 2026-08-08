@@ -313,11 +313,20 @@ pub fn fetchBounded(
     var done: std.atomic.Value(bool) = .init(false);
     var future = io.async(fetchTask, .{ http_client, io, options, &done });
 
-    var elapsed_ms: u64 = 0;
+    // Deadline measured against the clock, NOT by accumulating nominal tick
+    // durations. `elapsed_ms += FETCH_TICK_MS` assumed a 250ms sleep takes
+    // 250ms; under scheduler pressure it takes much longer, so the counter
+    // undercounts and the bound silently inflates. Measured 2026-08-08 with 8
+    // concurrent reconciler workers: check_record ran 135s against a nominal
+    // 10s bound and logged zero timeouts, because elapsed_ms had only reached
+    // ~2.5s of ticks by then. A timeout that stretches under load is worst
+    // exactly when it is needed.
+    const started = Io.Timestamp.now(io, .awake);
+    const timeout_ns = timeout_s * std.time.ns_per_s;
     while (!done.load(.acquire)) {
         io.sleep(.fromMilliseconds(FETCH_TICK_MS), .awake) catch {};
-        elapsed_ms += FETCH_TICK_MS;
-        if (elapsed_ms >= timeout_s * 1000) {
+        const elapsed_ns = Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
+        if (elapsed_ns >= timeout_ns) {
             // cancel() blocks until the task joins; a fetch that raced to
             // success in this window is discarded — caller retries fresh
             if (future.cancel(io)) |_| {} else |_| {}

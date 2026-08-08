@@ -327,8 +327,14 @@ fn checkWorker(ctx: *CheckCtx) void {
 /// min), off the request path.
 fn reportSweepLag() void {
     const client = db.getClient() orelse return;
+    // Two separate facts. Coalescing NULL to an epoch date conflated them and
+    // reported "20673d behind" — the age of 1970, not of any real
+    // verification. Never-verified is a backlog count; oldest-verified is the
+    // sweep's actual lag.
     var result = client.query(
-        \\SELECT CAST((julianday('now') - julianday(MIN(COALESCE(verified_at, '1970-01-01')))) AS INTEGER)
+        \\SELECT
+        \\  CAST(COALESCE((julianday('now') - julianday(MIN(verified_at))), 0) AS INTEGER),
+        \\  SUM(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END)
         \\FROM documents
     , &.{}) catch |err| {
         logfire.warn("reconcile: sweep-lag probe failed: {s}", .{@errorName(err)});
@@ -338,13 +344,15 @@ fn reportSweepLag() void {
     if (result.rows.len == 0) return;
 
     const lag_days = result.rows[0].int(0);
-    logfire.gaugeInt("reconcile.oldest_unverified_days", lag_days);
+    const never_verified = result.rows[0].int(1);
+    logfire.gaugeInt("reconcile.oldest_verified_days", lag_days);
+    logfire.gaugeInt("reconcile.never_verified_docs", never_verified);
 
     const target = getReverifyDays();
     if (lag_days > 0 and @as(u64, @intCast(lag_days)) > target * 2) {
         logfire.warn(
-            "reconcile: sweep is {d}d behind a {d}d reverify target — deletions of records gone at source are lagging by that much",
-            .{ lag_days, target },
+            "reconcile: oldest verification is {d}d old against a {d}d target ({d} documents never verified)",
+            .{ lag_days, target, never_verified },
         );
     }
 }

@@ -43,6 +43,23 @@ fn getReverifyDays() u64 {
     return std.fmt.parseInt(u64, val, 10) catch 7;
 }
 
+/// Wall-clock bound on every outbound PDS / PLC request.
+///
+/// zig 0.16's http client has no read timeout on the fetch path, so a peer
+/// that accepts the request and never answers blocks this thread in the kernel
+/// forever. The reconciler is a serial loop, so ONE such peer stalls the whole
+/// sweep. Measured 2026-08-08 before this bound: ~2,740s per 50-document cycle
+/// with only 205s of it in db.query — roughly 54s of dead wait per document,
+/// which is how a 7-day reverify target degraded into a ~64-day sweep.
+///
+/// 10s is generous for a getRecord; only a hung peer should reach it.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+
+fn getHttpTimeoutSecs() u64 {
+    const val = getenv("RECONCILE_HTTP_TIMEOUT_SECS") orelse "10";
+    return std.fmt.parseInt(u64, val, 10) catch DEFAULT_HTTP_TIMEOUT_SECS;
+}
+
 fn isEnabled() bool {
     const val = getenv("RECONCILE_ENABLED") orelse "true";
     return !mem.eql(u8, val, "false") and !mem.eql(u8, val, "0");
@@ -138,6 +155,12 @@ fn worker(allocator: Allocator, io: Io) void {
             if (counts.verified > 0 or counts.deleted > 0) {
                 logfire.info("reconcile: verified {d} documents, deleted {d}", .{ counts.verified, counts.deleted });
             }
+            // Sweep-lag signal. Without it, throughput falling an order of
+            // magnitude below the reverify target is invisible: every cycle
+            // still logs a healthy "verified 50", and only the age of the
+            // oldest unverified document reveals that the sweep can never
+            // catch up. That is how a 7-day target ran at ~64 days unnoticed.
+            reportSweepLag();
         } else |err| {
             consecutive_errors += 1;
             logfire.warn("reconcile: cycle error: {}, consecutive: {d}", .{ err, consecutive_errors });
@@ -156,6 +179,38 @@ const CycleCounts = struct {
     verified: usize,
     deleted: usize,
 };
+
+/// Emit how far behind the verification sweep is: the age in days of the
+/// oldest document still awaiting (re)verification. This is the number that
+/// says whether the reconciler can meet RECONCILE_REVERIFY_DAYS at all —
+/// per-cycle counts cannot, because a starved sweep and a healthy one both
+/// log the same "verified 50".
+///
+/// One aggregate over an indexed column, once per cycle (default every 30
+/// min), off the request path.
+fn reportSweepLag() void {
+    const client = db.getClient() orelse return;
+    var result = client.query(
+        \\SELECT CAST((julianday('now') - julianday(MIN(COALESCE(verified_at, '1970-01-01')))) AS INTEGER)
+        \\FROM documents
+    , &.{}) catch |err| {
+        logfire.warn("reconcile: sweep-lag probe failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer result.deinit();
+    if (result.rows.len == 0) return;
+
+    const lag_days = result.rows[0].int(0);
+    logfire.gaugeInt("reconcile.oldest_unverified_days", lag_days);
+
+    const target = getReverifyDays();
+    if (lag_days > 0 and @as(u64, @intCast(lag_days)) > target * 2) {
+        logfire.warn(
+            "reconcile: sweep is {d}d behind a {d}d reverify target — deletions of records gone at source are lagging by that much",
+            .{ lag_days, target },
+        );
+    }
+}
 
 fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), last_head_ns: *std.StringHashMap(i128)) !CycleCounts {
     const span = logfire.span("reconcile.cycle", .{});
@@ -494,11 +549,17 @@ fn checkRecord(allocator: Allocator, pds: []const u8, did: []const u8, collectio
     var response_body: std.Io.Writer.Allocating = .init(allocator);
     defer response_body.deinit();
 
-    const res = http_client.fetch(.{
+    const res = db.Client.fetchBounded(&http_client, global_io.?, .{
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &response_body.writer,
-    }) catch {
+    }, getHttpTimeoutSecs()) catch |err| {
+        if (err == error.RequestTimeout) {
+            logfire.warn("reconcile: PDS check timed out for {s}", .{did});
+            logfire.counter("reconcile.pds_timeout", 1);
+        }
+        // A timeout is NOT evidence the record is gone — leave verified_at
+        // alone so the document is retried, and never delete on a hang.
         return .error_skip;
     };
 
@@ -536,12 +597,13 @@ fn resolvePdsHttp(allocator: Allocator, did: []const u8) ?[]const u8 {
     var response_body: std.Io.Writer.Allocating = .init(allocator);
     defer response_body.deinit();
 
-    const res = http_client.fetch(.{
+    const res = db.Client.fetchBounded(&http_client, global_io.?, .{
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &response_body.writer,
-    }) catch |err| {
-        logfire.warn("reconcile: PLC lookup failed for {s}: {}", .{ did, err });
+    }, getHttpTimeoutSecs()) catch |err| {
+        logfire.warn("reconcile: PLC lookup failed for {s}: {s}", .{ did, @errorName(err) });
+        if (err == error.RequestTimeout) logfire.counter("reconcile.plc_timeout", 1);
         return null;
     };
 

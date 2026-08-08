@@ -70,6 +70,36 @@ publication uri (SQL paths know it) and by `did` + `base_path` (turbopuffer
 results carry that, and keying on it avoids making a 64k-vector attribute
 backfill load-bearing for a policy check).
 
+## where it is enforced: one choke point, not per-endpoint
+
+The set answers the question; `applyResultPolicy` in `server.zig` is where the
+answer is *applied*, for every endpoint that returns a result array. Endpoints
+reach it through `sendResults`, so a retrieval path cannot publish a row
+without passing policy.
+
+This mirrors what the label policy already did — and finishes it. The response
+pass existed but was wired to `/search` only, which is exactly why `/similar`
+shipped with no label filter *and* no visibility filter: it sent results
+straight out.
+
+The retrieval paths still filter per row. That is deliberate, and the division
+of labor matters:
+
+| layer | role |
+|---|---|
+| per-row checks in `search.zig` | **optimization** — keeps the bounded candidate window from being spent on rows that will be dropped, which is what keeps pagination honest |
+| `applyResultPolicy` | **guarantee** — a path that forgets its row check, or a new path added later, still cannot leak |
+
+Enforcing only per-row is how the original bug survived: 14 call sites, each
+correct, all trusting one lookup that could not answer. Enforcing only at the
+response layer would silently shrink pages. Both, with the guarantee at the
+bottom, is the durable arrangement.
+
+`/document` is the exception: its response is an object (`documents` +
+`missing`), not an array, so it applies the same predicate in
+`documents.zig`. Any future endpoint with a bespoke response shape must do
+the same — that is the one place this design still asks someone to remember.
+
 ## why not the alternatives
 
 - **turso lookup on the request path** — violates the invariant this codebase

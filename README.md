@@ -42,6 +42,8 @@ search returns three entity types: `article` (document in a publication), `loose
 
 **modes**: `keyword` (default) uses FTS5 with BM25 + recency scoring. `semantic` uses voyage embeddings + [turbopuffer](https://turbopuffer.com) ANN. `hybrid` merges both via reciprocal rank fusion.
 
+**visibility**: publications that set `preferences.showInDiscover=false` are indexed but excluded from every discovery surface (`/search`, `/similar`, `/document`). `include_undiscoverable=true` opts back in — meant for reading a specific author's own writing, so pair it with `author=`. Enforcement is a single response-level policy pass, not a per-endpoint filter; see [docs/visibility.md](docs/visibility.md).
+
 **ranking**: keyword results use hybrid BM25 + recency scoring. text relevance is primary, but recent documents get a boost (~1 point per 30 days). the `since` parameter filters to documents created after the given ISO date (e.g., `since=2025-01-01`).
 
 `/similar` uses [Voyage AI](https://voyageai.com) embeddings with [turbopuffer](https://turbopuffer.com) ANN search.

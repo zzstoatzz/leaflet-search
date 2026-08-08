@@ -67,6 +67,14 @@ can't get from any single platform's UI.
 - **semantic**: meaning-based (~500ms), good for natural language queries
 - **hybrid**: both combined via rank fusion, `source` field shows how each result was found
 
+## visibility
+
+publications that set `preferences.showInDiscover=false` are indexed but kept
+out of `search` and `find_similar`. their author asked to stay out of discovery.
+`search(..., include_undiscoverable=True)` opts back in — use it when someone is
+deliberately reading through a specific author's own writing, and pair it with
+`author=`. do not set it on a general/global query.
+
 ## result types
 
 - **article**: document in a publication
@@ -240,6 +248,12 @@ async def get_document(uri: str) -> Document:
     fetches the complete document from ATProto, including full text content.
     use this after finding documents via search to get the complete text.
 
+    note: this reads the record directly from the author's PDS, not from the
+    pub-search index, so it is not filtered by preferences.showInDiscover.
+    That is deliberate — the preference is about staying out of discovery
+    surfaces, not about revoking access to a public record you already have
+    the URI for. Search will not hand you those URIs by default.
+
     args:
         uri: the AT-URI of the document (e.g., at://did:plc:.../pub.leaflet.document/...)
 
@@ -282,6 +296,9 @@ async def find_similar(uri: str, limit: int = 5) -> list[SearchResult]:
     uses vector similarity to find semantically related documents.
     great for discovering related content after finding
     an interesting document.
+
+    publications that set preferences.showInDiscover=false are excluded, same
+    as search — otherwise they would be one hop away from any neighbour.
 
     args:
         uri: the AT-URI of the document to find similar content for

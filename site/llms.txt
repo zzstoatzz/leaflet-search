@@ -29,6 +29,13 @@
   `usage_guide`, `search_tips`. resources: `pub-search://stats`,
   `pub-search://tags`, `pub-search://popular` — reference data is read on
   demand rather than charged against every reasoning cycle.
+- publications that set `preferences.showInDiscover=false` are indexed but kept
+  out of every discovery surface. `include_undiscoverable=true` opts back in
+  and is scoped to ONE identity: it requires `author=` on `/search`, requires a
+  single repo on `/document`, and is rejected on `/similar`. Requests without
+  that scope get a 400 rather than being silently downgraded. This is scoping,
+  not authentication — it closes enumeration, but a caller who already knows a
+  DID can still read that author's unlisted writing.
 
 ### HTTP API — for code-mode agents, scripts, pipelines
 
@@ -43,9 +50,9 @@
   in api.md.
 - publications that set `preferences.showInDiscover=false` are indexed but
   excluded from every discovery surface (search, /similar, /document). their
-  author asked to stay out of them. `include_undiscoverable=true` opts back
-  in — intended for looking through a specific author's own writing, so pair
-  it with `author=`, not with a global query.
+  author asked to stay out of them. `include_undiscoverable=true` opts back in
+  and REQUIRES `author=` (400 without it); on `/document` every uri must share
+  one repo; `/similar` rejects it outright. scoping, not authentication.
 
 ### AT Protocol labeler — a subscribable trust signal
 

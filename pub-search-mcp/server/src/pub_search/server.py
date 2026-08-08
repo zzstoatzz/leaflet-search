@@ -528,7 +528,9 @@ async def describe_cluster(uri: str, k: int = 5) -> ClusterContext:
 
 
 @mcp.tool
-async def author_profile(author: str, limit: int = 40) -> AuthorProfile:
+async def author_profile(
+    author: str, limit: int = 40, include_undiscoverable: bool = False
+) -> AuthorProfile:
     """what one author writes about, where they publish, and over what period.
 
     Answers "who is this person in this corpus?" in one call. Doing it through
@@ -539,12 +541,19 @@ async def author_profile(author: str, limit: int = 40) -> AuthorProfile:
     args:
         author: handle ("nate.bsky.social") or DID ("did:plc:xyz")
         limit: how many of their documents to read for the summary (default 40)
+        include_undiscoverable: include this author's publications that set
+            preferences.showInDiscover=false. Already scoped — this tool takes
+            one author by definition. Without it a prolific author whose main
+            publication is unlisted summarizes as a handful of documents, with
+            nothing saying anything was withheld.
 
     returns:
         counts, the platforms and publications they use, their publishing date
         range, terms recurring across their titles, and their most recent work
     """
     params: dict[str, Any] = {"format": "v2", "author": author, "limit": str(limit)}
+    if include_undiscoverable:
+        params["include_undiscoverable"] = "true"
     async with get_http_client() as client:
         response = await client.get("/search", params=params)
         response.raise_for_status()

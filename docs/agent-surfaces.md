@@ -68,6 +68,35 @@ with three things the raw API doesn't have:
 choose MCP when the consumer is a tool-calling agent and you want it
 productive immediately, with no code of yours in the loop.
 
+### visibility: two deliberate asymmetries
+
+Both of these are settled decisions, recorded here so they are not re-read as
+the showInDiscover bug and "re-fixed".
+
+**`get_document` returns opted-out documents; REST `/document` does not.**
+The MCP tool reads the live record from the author's PDS, where it is public by
+construction — `showInDiscover` is a request to *discovery surfaces*, not an
+access control, and nothing private is exposed by fetching a public record you
+already have the URI for. REST `/document` reads the index, which is a
+discovery surface, so it withholds. The asymmetry is the point: search will not
+hand you the URI of an opted-out document, and if you have one already, the
+protocol never pretended it was secret.
+
+**The opt-in is scoped to one identity, not authenticated.**
+`include_undiscoverable=true` requires `author` on `/search`, requires a single
+repo on `/document`, and is rejected outright on `/similar` (neighbours come
+from every author, so it cannot be scoped there at all). Requests without the
+scope are **rejected, not silently ignored** — a dropped flag is how the
+original inconsistency stayed invisible.
+
+This closes enumeration: there is no way to *discover* which publications have
+opted out. It does not stop a caller who already knows a DID from reading that
+author's unlisted writing. That gap needs authentication, which does not exist
+yet — so treat the guarantee as "not listed", not "not readable".
+
+`author_profile` takes the same flag, and needs no extra scoping because it is
+already one author per call.
+
 ### HTTP API — for code-mode agents, scripts, and pipelines
 
 base URL: `https://leaflet-search-backend.fly.dev` — full reference in

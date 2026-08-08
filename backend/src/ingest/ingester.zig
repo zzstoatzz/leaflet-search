@@ -12,6 +12,7 @@ const extractor = @import("extractor.zig");
 const classifier = @import("classifier.zig");
 const Io = std.Io;
 const tpuf = @import("../tpuf.zig");
+const db = @import("../db.zig");
 
 // leaflet-specific collections
 const LEAFLET_DOCUMENT = "pub.leaflet.document";
@@ -98,9 +99,9 @@ const IngesterCtx = struct {
     drop_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     no_id_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    fn process(self: *IngesterCtx, _: Io, frame: []u8) void {
+    fn process(self: *IngesterCtx, io: Io, frame: []u8) void {
         defer self.allocator.free(frame);
-        processMessage(self.allocator, frame) catch |err| {
+        processMessage(self.allocator, io, frame) catch |err| {
             // NO ack on failure: the ingester's outbox retransmits the frame
             // (~60s), so a transient turso error is retried instead of lost.
             logfire.err("message processing error: {}", .{err});
@@ -350,7 +351,7 @@ const LeafletPublication = struct {
     base_path: ?[]const u8 = null,
 };
 
-fn processMessage(allocator: Allocator, payload: []const u8) !void {
+fn processMessage(allocator: Allocator, io: Io, payload: []const u8) !void {
     const parsed = json.parseFromSlice(json.Value, allocator, payload, .{}) catch {
         logfire.err("ingester: JSON parse failed, first 100 bytes: {s}", .{payload[0..@min(payload.len, 100)]});
         return;
@@ -409,7 +410,7 @@ fn processMessage(allocator: Allocator, payload: []const u8) !void {
                 }
             }
 
-            processDocument(allocator, uri, did.raw, rec.rkey, inner_record, rec.collection, rec.cid) catch |err| {
+            processDocument(allocator, io, uri, did.raw, rec.rkey, inner_record, rec.collection, rec.cid) catch |err| {
                 logfire.err("document processing error: {}", .{err});
             };
         } else if (isPublicationCollection(rec.collection)) {
@@ -445,7 +446,7 @@ fn processMessage(allocator: Allocator, payload: []const u8) !void {
     }
 }
 
-fn processDocument(allocator: Allocator, uri: []const u8, did: []const u8, rkey: []const u8, record: json.ObjectMap, collection: []const u8, source_cid: ?[]const u8) !void {
+fn processDocument(allocator: Allocator, io: Io, uri: []const u8, did: []const u8, rkey: []const u8, record: json.ObjectMap, collection: []const u8, source_cid: ?[]const u8) !void {
     var doc = extractor.extractDocument(allocator, record, collection) catch |err| {
         if (err == error.MissingTitle) {
             logfire.span("ingest.dropped", .{ .reason = "missing_title", .collection = collection, .uri = uri }).end();
@@ -457,6 +458,12 @@ fn processDocument(allocator: Allocator, uri: []const u8, did: []const u8, rkey:
         return;
     };
     defer doc.deinit();
+
+    // a fetch failure indexes the inline text (title/description) rather than
+    // dropping the doc — the reconciler's next pass gets another shot
+    hydrateBlobPages(allocator, io, did, &doc) catch |err| {
+        logfire.warn("ingest: blobPages hydration failed for {s}: {}", .{ uri, err });
+    };
 
     try indexer.insertDocument(
         uri,
@@ -480,6 +487,62 @@ fn processDocument(allocator: Allocator, uri: []const u8, did: []const u8, rkey:
     // emits bulk-mirror on its own when an author crosses the threshold. Local
     // sqlite only — never blocks the firehose.
     classifier.observe(did, doc.title, doc.content);
+}
+
+/// leaflet moves the page tree out of the record and into a content.blobPages
+/// blob once a document outgrows the record size limit — the inline pages array
+/// is empty and only title/description survive extraction. Fetch the blob from
+/// the author's PDS, flatten it, and append it to the extracted content.
+const MAX_BLOB_PAGES_BYTES = 4 * 1024 * 1024;
+
+// this runs on the live ingest worker (workers=1), so every network call must
+// be bounded — an unanswering PDS would otherwise stall ingestion entirely
+const BLOB_FETCH_TIMEOUT_SECS = 20;
+
+fn hydrateBlobPages(allocator: Allocator, io: Io, did: []const u8, doc: *extractor.ExtractedDocument) !void {
+    const cid = doc.blob_pages_cid orelse return;
+
+    const pds = try resolvePds(allocator, io, did);
+    defer allocator.free(pds);
+    if (!mem.startsWith(u8, pds, "https://")) return error.InsecurePds;
+
+    var url_buf: [768]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &url_buf,
+        "{s}/xrpc/com.atproto.sync.getBlob?did={s}&cid={s}",
+        .{ pds, did, cid },
+    ) catch return error.UrlTooLong;
+
+    var http_client: http.Client = .{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+
+    const res = try db.Client.fetchBounded(&http_client, io, .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &sink.writer,
+    }, BLOB_FETCH_TIMEOUT_SECS);
+    const status: u10 = @intFromEnum(res.status);
+    if (status < 200 or status >= 300) return error.BlobUnavailable;
+
+    const body = try sink.toOwnedSlice();
+    defer allocator.free(body);
+    if (body.len > MAX_BLOB_PAGES_BYTES) return error.BlobTooLarge;
+
+    const pages_text = try extractor.flattenBlobPages(allocator, body);
+    if (pages_text.len == 0) {
+        allocator.free(pages_text);
+        return;
+    }
+    defer allocator.free(pages_text);
+
+    const old = doc.content;
+    doc.content = if (old.len > 0)
+        try std.fmt.allocPrint(allocator, "{s} {s}", .{ old, pages_text })
+    else
+        try allocator.dupe(u8, pages_text);
+    allocator.free(old);
 }
 
 fn processPublication(_: Allocator, uri: []const u8, did: []const u8, rkey: []const u8, record: json.ObjectMap) !void {
@@ -701,10 +764,13 @@ pub fn applyDocumentReconciliation(
             const value = parsed.value.object.get("value") orelse return error.BadRecordResponse;
             if (value != .object) return error.BadRecordResponse;
             if (observe_classifier) {
-                try processDocument(allocator, uri, did.raw, rkey, value.object, collection, actual_cid);
+                try processDocument(allocator, io, uri, did.raw, rkey, value.object, collection, actual_cid);
             } else {
                 var doc = try extractor.extractDocument(allocator, value.object, collection);
                 defer doc.deinit();
+                hydrateBlobPages(allocator, io, did.raw, &doc) catch |err| {
+                    logfire.warn("reconcile: blobPages hydration failed for {s}: {}", .{ uri, err });
+                };
                 try indexer.insertDocument(
                     uri, did.raw, rkey, doc.title, doc.content, doc.created_at,
                     doc.publication_uri, doc.tags, doc.platformName(), doc.source_collection,
@@ -825,7 +891,7 @@ fn backfillCollection(
                     }
                 }
                 const source_cid = zat.json.getString(entry, "cid");
-                processDocument(allocator, uri, did, rkey, inner, collection, source_cid) catch {
+                processDocument(allocator, io, uri, did, rkey, inner, collection, source_cid) catch {
                     counts.skipped += 1;
                     continue;
                 };
@@ -904,11 +970,11 @@ fn resolvePds(allocator: Allocator, io: Io, did: []const u8) ![]u8 {
     var sink: std.Io.Writer.Allocating = .init(allocator);
     defer sink.deinit();
 
-    const res = try http_client.fetch(.{
+    const res = try db.Client.fetchBounded(&http_client, io, .{
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &sink.writer,
-    });
+    }, BLOB_FETCH_TIMEOUT_SECS);
     if (res.status != .ok) return error.PlcLookupFailed;
 
     const body = try sink.toOwnedSlice();

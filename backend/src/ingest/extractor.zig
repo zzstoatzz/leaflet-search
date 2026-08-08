@@ -42,6 +42,7 @@ pub const ExtractedDocument = struct {
     path: ?[]const u8, // URL path from record (e.g., "/001" for zat.dev)
     content_type: ?[]const u8, // content.$type (e.g., "pub.leaflet.content") for platform detection
     cover_image: ?[]const u8, // blob CID for cover image (e.g., "bafkrei...")
+    blob_pages_cid: ?[]const u8, // content.blobPages blob CID — leaflet stores long documents out-of-line
 
     pub fn deinit(self: *ExtractedDocument) void {
         self.allocator.free(self.content);
@@ -106,8 +107,15 @@ pub fn extractDocument(
     const tags = try extractTags(allocator, record_val);
     errdefer allocator.free(tags);
 
+    // leaflet moves the page tree out of the record and into a blob once the
+    // document grows past the record size limit; the caller fetches it
+    const blob_pages_cid = zat.json.getString(record_val, "content.blobPages.ref.$link");
+
     // extract content - try textContent first (standard.site), then parse blocks
-    const content = try extractContent(allocator, record_val);
+    const content = extractContent(allocator, record_val) catch |err| switch (err) {
+        error.NoContent => if (blob_pages_cid != null) try allocator.dupe(u8, "") else return err,
+        else => return err,
+    };
 
     // for leaflet documents without a coverImage, try first image block
     const final_cover_image = cover_image orelse extractFirstImageCid(record_val);
@@ -124,7 +132,23 @@ pub fn extractDocument(
         .path = path,
         .content_type = content_type,
         .cover_image = final_cover_image,
+        .blob_pages_cid = blob_pages_cid,
     };
+}
+
+/// Flatten a fetched content.blobPages blob (a JSON array of pages) to plain
+/// text using the same block parsing as inline pages. Caller owns the result.
+pub fn flattenBlobPages(allocator: Allocator, blob_json: []const u8) ![]u8 {
+    const parsed = json.parseFromSlice(json.Value, allocator, blob_json, .{}) catch return error.BadBlobJson;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.BadBlobJson;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (parsed.value.array.items) |page| {
+        if (page == .object) try extractPageContent(allocator, &buf, page.object);
+    }
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn extractTags(allocator: Allocator, record: json.Value) ![][]const u8 {
@@ -383,6 +407,61 @@ test "extractDocument: no cover image" {
     defer doc.deinit();
 
     try std.testing.expect(doc.cover_image == null);
+}
+
+test "extractDocument: blobPages document with empty inline pages" {
+    const allocator = std.testing.allocator;
+
+    // regression: leaflet docs past the record size limit ship empty
+    // content.pages plus a blobPages blob ref — these used to index with
+    // description-only content (or drop entirely without a description)
+    const test_json =
+        \\{"title":"Long Post","description":"the hook","content":{"$type":"pub.leaflet.content","pages":[],"blobPages":{"$type":"blob","ref":{"$link":"bafkreiblobpages123"},"mimeType":"application/json","size":9999}}}
+    ;
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, test_json, .{});
+    defer parsed.deinit();
+
+    var doc = try extractDocument(allocator, parsed.value.object, "site.standard.document");
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("the hook", doc.content);
+    try std.testing.expectEqualStrings("bafkreiblobpages123", doc.blob_pages_cid.?);
+}
+
+test "extractDocument: blobPages document with no description still extracts" {
+    const allocator = std.testing.allocator;
+
+    const test_json =
+        \\{"title":"Long Post","content":{"$type":"pub.leaflet.content","pages":[],"blobPages":{"$type":"blob","ref":{"$link":"bafkreiblobpages123"},"mimeType":"application/json","size":9999}}}
+    ;
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, test_json, .{});
+    defer parsed.deinit();
+
+    var doc = try extractDocument(allocator, parsed.value.object, "site.standard.document");
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("", doc.content);
+    try std.testing.expectEqualStrings("bafkreiblobpages123", doc.blob_pages_cid.?);
+}
+
+test "flattenBlobPages: flattens a pages array" {
+    const allocator = std.testing.allocator;
+
+    const blob_json =
+        \\[{"$type":"pub.leaflet.pages.linearDocument","id":"p1","blocks":[{"$type":"pub.leaflet.pages.linearDocument#block","block":{"$type":"pub.leaflet.blocks.header","plaintext":"The big problem"}},{"$type":"pub.leaflet.pages.linearDocument#block","block":{"$type":"pub.leaflet.blocks.text","plaintext":"Everyone is separated."}}]}]
+    ;
+
+    const text = try flattenBlobPages(allocator, blob_json);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("The big problem Everyone is separated.", text);
+}
+
+test "flattenBlobPages: rejects non-array blobs" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.BadBlobJson, flattenBlobPages(allocator, "{\"not\":\"pages\"}"));
+    try std.testing.expectError(error.BadBlobJson, flattenBlobPages(allocator, "\x89PNG not json"));
 }
 
 test "extractDocument: com.whtwnd.blog.entry (whitewind)" {

@@ -218,6 +218,7 @@ test {
     _ = @import("db/zug_conn.zig");
     _ = @import("db/migrations.zig");
     _ = @import("ingest/extractor.zig");
+    _ = @import("ingest/reconciler.zig");
     _ = @import("ingest/ingester.zig");
     _ = @import("server/search.zig");
     _ = @import("server/documents.zig");

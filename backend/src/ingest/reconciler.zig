@@ -33,9 +33,19 @@ fn getIntervalSecs() u64 {
     return std.fmt.parseInt(u64, val, 10) catch 1800;
 }
 
+/// Documents verified per cycle.
+///
+/// Sized against the target, not by feel. 64,380 documents on a 7-day reverify
+/// need ~9,200/day; at one cycle per RECONCILE_INTERVAL_SECS (1800s = 48
+/// cycles/day) that is ~192 documents per cycle. 200 clears it with headroom.
+///
+/// This only became a safe default once the network phase ran concurrently.
+/// While the loop was serial, cycle time scaled with batch size and throughput
+/// stayed flat at ~65 docs/hour no matter what this said — raising it then
+/// would have made cycles longer and changed nothing else.
 fn getBatchSize() usize {
-    const val = getenv("RECONCILE_BATCH_SIZE") orelse "50";
-    return std.fmt.parseInt(usize, val, 10) catch 50;
+    const val = getenv("RECONCILE_BATCH_SIZE") orelse "200";
+    return std.fmt.parseInt(usize, val, 10) catch 200;
 }
 
 fn getReverifyDays() u64 {
@@ -180,6 +190,133 @@ const CycleCounts = struct {
     deleted: usize,
 };
 
+/// One row of the verification queue. Hoisted to file scope so the parallel
+/// network phase can take a slice of them.
+const DocInfo = struct {
+    uri: []const u8,
+    did: []const u8,
+    base_path: []const u8,
+    path: []const u8,
+    platform: []const u8,
+    rkey: []const u8,
+    has_publication: bool,
+};
+
+/// What the network phase decided about a document. No database or vector
+/// mutation happens in that phase — every outcome is applied serially
+/// afterwards, so turso sees exactly the same one-writer pattern it did when
+/// the whole loop was serial.
+const Outcome = union(enum) {
+    skip, // unparseable uri, or never reached
+    no_pds, // DID deactivated / PLC unknown — verify, don't delete
+    bridgy, // brid.gy-hosted; mark excluded
+    checked: RecordStatus,
+};
+
+/// How many documents are verified concurrently.
+///
+/// Throughput here is per-document LATENCY bound, not batch bound: a cycle
+/// costs batch_size × per_doc, so raising the batch raises cycle time by the
+/// same factor and leaves throughput flat. Measured before this change: 50
+/// docs / 2,740s = ~65 docs/hour, against the ~383/hour that a 7-day reverify
+/// over 64k documents needs. Only concurrency moves that number.
+///
+/// 8 in-flight against a 10s bound is ≤80 outstanding requests worst case,
+/// spread across many PDS hosts, with a 200ms pause per worker between
+/// documents — so a single publisher still sees at most ~5 req/s from us.
+const DEFAULT_CONCURRENCY: usize = 8;
+const MAX_CONCURRENCY: usize = 32;
+
+fn getConcurrency() usize {
+    const val = getenv("RECONCILE_CONCURRENCY") orelse "8";
+    const n = std.fmt.parseInt(usize, val, 10) catch DEFAULT_CONCURRENCY;
+    return std.math.clamp(n, 1, MAX_CONCURRENCY);
+}
+
+/// Shared state for the network phase. Workers pull documents off `next`, so
+/// a slow host stalls one worker instead of the whole sweep.
+const CheckCtx = struct {
+    allocator: Allocator,
+    io: Io,
+    docs: []const DocInfo,
+    outcomes: []Outcome,
+    next: std.atomic.Value(usize),
+    cache: *std.StringHashMap([]const u8),
+    cache_lock: Io.Mutex,
+};
+
+/// Cache-guarded PDS resolution. The HTTP miss happens OUTSIDE the lock —
+/// holding it across a 10s-bounded network call would serialize every worker
+/// behind the slowest DID and undo the concurrency.
+fn resolvePdsShared(ctx: *CheckCtx, did: []const u8) ?[]const u8 {
+    ctx.cache_lock.lockUncancelable(ctx.io);
+    const cached = ctx.cache.get(did);
+    ctx.cache_lock.unlock(ctx.io);
+    if (cached) |pds| return pds;
+
+    const span = logfire.span("reconcile.resolve_pds", .{});
+    defer span.end();
+    const pds = resolvePdsHttp(ctx.allocator, did) orelse return null;
+
+    ctx.cache_lock.lockUncancelable(ctx.io);
+    defer ctx.cache_lock.unlock(ctx.io);
+    // Two workers can miss the same DID concurrently. Keep the first winner
+    // rather than overwriting it — overwriting would leak the value that
+    // other threads may already be holding a pointer to.
+    if (ctx.cache.get(did)) |existing| {
+        ctx.allocator.free(pds);
+        return existing;
+    }
+    const key = ctx.allocator.dupe(u8, did) catch return pds;
+    ctx.cache.put(key, pds) catch {
+        ctx.allocator.free(key);
+    };
+    return pds;
+}
+
+/// Claim the next unprocessed index, or null when the batch is exhausted.
+/// Factored out so the claiming rule is testable: the correctness risk of the
+/// parallel phase is a document processed twice (a double delete) or skipped
+/// (silently never verified), and both are properties of this function.
+fn claimNext(next: *std.atomic.Value(usize), len: usize) ?usize {
+    const i = next.fetchAdd(1, .monotonic);
+    if (i >= len) return null;
+    return i;
+}
+
+fn checkWorker(ctx: *CheckCtx) void {
+    while (true) {
+        const i = claimNext(&ctx.next, ctx.docs.len) orelse return;
+        const doc = ctx.docs[i];
+
+        const parts = parseAtUri(doc.uri) orelse {
+            logfire.warn("reconcile: invalid AT-URI: {s}", .{doc.uri});
+            ctx.outcomes[i] = .skip;
+            continue;
+        };
+
+        // Attempt counters fire BEFORE the call; spans close only on
+        // completion, so a hung phase is silent in both directions.
+        // attempts-minus-completions is what names a stuck phase.
+        logfire.counter("reconcile.resolve_attempt", 1);
+        const pds = resolvePdsShared(ctx, parts.did) orelse {
+            ctx.outcomes[i] = .no_pds;
+            continue;
+        };
+
+        if (std.mem.indexOf(u8, pds, "brid.gy") != null) {
+            ctx.outcomes[i] = .bridgy;
+            continue;
+        }
+
+        logfire.counter("reconcile.check_attempt", 1);
+        ctx.outcomes[i] = .{ .checked = checkRecord(ctx.allocator, pds, parts.did, parts.collection, parts.rkey) };
+
+        // Politeness, per worker: at most ~5 requests/second each.
+        ctx.io.sleep(Io.Duration.fromMilliseconds(200), .awake) catch {};
+    }
+}
+
 /// Emit how far behind the verification sweep is: the age in days of the
 /// oldest document still awaiting (re)verification. This is the number that
 /// says whether the reconciler can meet RECONCILE_REVERIFY_DAYS at all —
@@ -224,7 +361,7 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
     // re-verify docs older than RECONCILE_REVERIFY_DAYS
     // compute cutoff timestamp in Zig (avoids strftime with parameterized modifiers)
     var batch_str: [10]u8 = undefined;
-    const batch_str_val = std.fmt.bufPrint(&batch_str, "{d}", .{batch_size}) catch "50";
+    const batch_str_val = std.fmt.bufPrint(&batch_str, "{d}", .{batch_size}) catch "200";
 
     const io = global_io.?;
     const now_s: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
@@ -256,15 +393,6 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
     });
 
     // collect URIs + URL-construction fields (copy since result owns the memory)
-    const DocInfo = struct {
-        uri: []const u8,
-        did: []const u8,
-        base_path: []const u8,
-        path: []const u8,
-        platform: []const u8,
-        rkey: []const u8,
-        has_publication: bool,
-    };
     var docs: std.ArrayList(DocInfo) = .empty;
     defer {
         for (docs.items) |doc| {
@@ -309,51 +437,62 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
     var stale_ids: std.ArrayList([32]u8) = .empty;
     defer stale_ids.deinit(allocator);
 
-    for (docs.items) |doc| {
-        const parts = parseAtUri(doc.uri) orelse {
-            logfire.warn("reconcile: invalid AT-URI: {s}", .{doc.uri});
-            continue;
-        };
+    // ---- phase 1: network, concurrent ----
+    // Every PDS/PLC request for the batch, run by a small pool of workers.
+    // Nothing here touches turso or turbopuffer.
+    const outcomes = allocator.alloc(Outcome, docs.items.len) catch {
+        return error.OutOfMemory;
+    };
+    defer allocator.free(outcomes);
+    @memset(outcomes, .skip);
 
-        // Per-phase spans. The cycle span alone cannot say where its time
-        // goes: a 2,740s cycle showed only 205s of db.query, and attributing
-        // the rest to hung HTTP was an inference, not a measurement — the
-        // 10s bound added alongside these spans fires zero times, so the cost
-        // is somewhere else. These three spans cover every phase of the loop,
-        // so the next number is measured.
-        const doc_span = logfire.span("reconcile.doc", .{});
-        defer doc_span.end();
+    var ctx = CheckCtx{
+        .allocator = allocator,
+        .io = io,
+        .docs = docs.items,
+        .outcomes = outcomes,
+        .next = .init(0),
+        .cache = pds_cache,
+        .cache_lock = Io.Mutex.init,
+    };
 
-        // Attempt counters fire BEFORE each call; the spans above close only
-        // on completion. A phase that hangs emits an attempt and never a span,
-        // so attempts-minus-completions names the stuck phase. Spans alone
-        // cannot do this — a hung call is silent in both directions, which is
-        // why 34 minutes of cycle produced no signal at all.
-        logfire.counter("reconcile.resolve_attempt", 1);
+    {
+        const net_span = logfire.span("reconcile.network_phase", .{});
+        defer net_span.end();
 
-        // resolve PDS for this DID
-        const pds = resolvePds(allocator, parts.did, pds_cache) orelse {
-            // PDS unknown or DID deactivated — skip, don't delete
-            // still update verified_at so these don't permanently clog the queue
-            updateVerifiedAt(client, doc.uri);
-            continue;
-        };
-
-        // authoritative bridgy-fed classification: brid.gy-hosted DIDs are bridged
-        // content we exclude from search. this replaces the old ingest-time
-        // "HTTP site field" heuristic, which mislabeled legit standard.site
-        // custom-domain blogs. mark + skip (no point URL-checking bridged junk).
-        if (std.mem.indexOf(u8, pds, "brid.gy") != null) {
-            markBridgyfed(client, doc.uri);
-            continue;
+        const worker_count = @min(getConcurrency(), docs.items.len);
+        var threads: [MAX_CONCURRENCY]?std.Thread = @splat(null);
+        for (0..worker_count) |w| {
+            threads[w] = std.Thread.spawn(.{}, checkWorker, .{&ctx}) catch |err| blk: {
+                logfire.warn("reconcile: worker {d} spawn failed: {s}", .{ w, @errorName(err) });
+                break :blk null;
+            };
         }
+        // If every spawn failed we would silently verify nothing, so fall back
+        // to doing the work on this thread rather than reporting a clean cycle.
+        var spawned: usize = 0;
+        for (threads[0..worker_count]) |t| {
+            if (t != null) spawned += 1;
+        }
+        if (spawned == 0) checkWorker(&ctx);
+        for (threads[0..worker_count]) |t| {
+            if (t) |thread| thread.join();
+        }
+    }
 
-        // check if record still exists at source
-        logfire.counter("reconcile.check_attempt", 1);
-        const status = checkRecord(allocator, pds, parts.did, parts.collection, parts.rkey);
-
-        switch (status) {
-            .exists => {
+    // ---- phase 2: database, serial ----
+    // Applied on this thread only, so turso keeps the single-writer pattern it
+    // had when the whole loop was serial.
+    for (docs.items, outcomes) |doc, outcome| {
+        switch (outcome) {
+            .skip => {},
+            // PDS unknown or DID deactivated — verify anyway so these don't
+            // permanently clog the head of the queue.
+            .no_pds => updateVerifiedAt(client, doc.uri),
+            // brid.gy-hosted: bridged content we exclude from search.
+            .bridgy => markBridgyfed(client, doc.uri),
+            .checked => |status| switch (status) {
+                .exists => {
                 // PDS record is good — also check the destination URL we'd
                 // link to. Per-host throttled inside checkDocUrl. 404 →
                 // soft-hide; 2xx → reset url_dead (in case it came back).
@@ -374,24 +513,25 @@ fn runCycle(allocator: Allocator, pds_cache: *std.StringHashMap([]const u8), las
                         }
                     }
                 }
-                updateVerifiedAt(client, doc.uri);
-                verified += 1;
-            },
-            .deleted => {
-                // record gone — delete from turso + queue for tpuf batch delete
-                indexer.deleteDocument(doc.uri);
-                const hashed = tpuf.hashId(doc.uri);
-                stale_ids.append(allocator, hashed) catch {};
-                deleted += 1;
-                logfire.info("reconcile: deleted stale document: {s}", .{doc.uri});
-            },
-            .error_skip => {
-                // 5xx / timeout / network error — don't update verified_at, retry next cycle
+                    updateVerifiedAt(client, doc.uri);
+                    verified += 1;
+                },
+                .deleted => {
+                    // record gone — delete from turso + queue for tpuf batch delete
+                    indexer.deleteDocument(doc.uri);
+                    const hashed = tpuf.hashId(doc.uri);
+                    stale_ids.append(allocator, hashed) catch {};
+                    deleted += 1;
+                    logfire.info("reconcile: deleted stale document: {s}", .{doc.uri});
+                },
+                .error_skip => {
+                    // 5xx / timeout / network error — don't update verified_at, retry next cycle
+                },
             },
         }
-
-        // rate limit: 200ms between PDS requests
-        io.sleep(Io.Duration.fromMilliseconds(200), .awake) catch {};
+        // No sleep here: this phase is local turso writes, and the politeness
+        // pause that used to live here now runs per worker in the network
+        // phase, where the remote requests actually are.
     }
 
     if (stale_ids.items.len > 0 and tpuf.isEnabled()) {
@@ -603,29 +743,6 @@ fn checkRecord(allocator: Allocator, pds: []const u8, did: []const u8, collectio
     return .error_skip;
 }
 
-/// Resolve a DID to its PDS endpoint URL via plc.directory.
-/// Returns null if DID is deactivated or PDS cannot be determined.
-/// Caches results in pds_cache (persists across cycles).
-fn resolvePds(allocator: Allocator, did: []const u8, cache: *std.StringHashMap([]const u8)) ?[]const u8 {
-    if (cache.get(did)) |pds| return pds;
-
-    // Only a cache MISS is spanned — a hit is a hashmap lookup, and spanning
-    // it would bury the expensive case in noise. If the cache is cold every
-    // cycle, this span count will equal the batch size and say so.
-    const span = logfire.span("reconcile.resolve_pds", .{});
-    defer span.end();
-
-    const pds = resolvePdsHttp(allocator, did) orelse return null;
-
-    // cache with duped key + value
-    const key = allocator.dupe(u8, did) catch return pds;
-    cache.put(key, pds) catch {
-        allocator.free(key);
-    };
-
-    return pds;
-}
-
 fn resolvePdsHttp(allocator: Allocator, did: []const u8) ?[]const u8 {
     var url_buf: [256]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "https://plc.directory/{s}", .{did}) catch return null;
@@ -674,4 +791,49 @@ fn resolvePdsHttp(allocator: Allocator, did: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+test "concurrency is clamped to a sane range" {
+    // A typo in the env must not spawn 10,000 threads at a PDS, and must not
+    // spawn zero workers (which would report clean cycles that verified
+    // nothing).
+    try std.testing.expect(getConcurrency() >= 1);
+    try std.testing.expect(getConcurrency() <= MAX_CONCURRENCY);
+}
+
+test "every document is claimed exactly once under concurrent workers" {
+    // The parallel phase's correctness risk: a document claimed twice gets
+    // deleted twice, and one never claimed is silently never verified while
+    // the cycle still reports success.
+    const N = 1000;
+    var counts = [_]std.atomic.Value(u32){.init(0)} ** N;
+    var next: std.atomic.Value(usize) = .init(0);
+
+    const Runner = struct {
+        fn run(nxt: *std.atomic.Value(usize), seen: []std.atomic.Value(u32)) void {
+            while (claimNext(nxt, seen.len)) |i| {
+                _ = seen[i].fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Runner.run, .{ &next, counts[0..] });
+    for (threads) |t| t.join();
+
+    for (&counts) |*c| try std.testing.expectEqual(@as(u32, 1), c.load(.monotonic));
+}
+
+test "claimNext stops at the batch end" {
+    var next: std.atomic.Value(usize) = .init(0);
+    try std.testing.expectEqual(@as(?usize, 0), claimNext(&next, 2));
+    try std.testing.expectEqual(@as(?usize, 1), claimNext(&next, 2));
+    try std.testing.expectEqual(@as(?usize, null), claimNext(&next, 2));
+    // and stays exhausted rather than wrapping
+    try std.testing.expectEqual(@as(?usize, null), claimNext(&next, 2));
+}
+
+test "an empty batch claims nothing" {
+    var next: std.atomic.Value(usize) = .init(0);
+    try std.testing.expectEqual(@as(?usize, null), claimNext(&next, 0));
 }

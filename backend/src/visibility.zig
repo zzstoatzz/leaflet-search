@@ -206,6 +206,21 @@ fn refreshFromTurso() void {
     }
 
     const before = count();
+
+    // A set that was non-empty and is now empty means nothing is filtered
+    // anymore — the exact silent fail-open this module exists to prevent.
+    // Every author opting back in simultaneously is possible but far less
+    // likely than a schema or query fault, so make it loud and alertable.
+    // We still install it: the data is the data, and refusing would strand an
+    // author who genuinely opted back in.
+    if (before > 0 and entries.items.len == 0) {
+        logfire.err(
+            "visibility: undiscoverable set collapsed {d} -> 0; nothing is being filtered — verify publications.show_in_discover",
+            .{before},
+        );
+        logfire.counter("visibility.set_collapsed", 1);
+    }
+
     install(entries.items) catch |err| {
         logfire.err("visibility: refresh install failed: {s}", .{@errorName(err)});
         return;

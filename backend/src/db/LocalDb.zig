@@ -22,6 +22,12 @@ const LocalDb = @This();
 /// after bumping this.)
 pub const SCHEMA_VERSION: u32 = 4; // v4: documents.source_cid for source-attested reconciliation
 
+/// Covering index for the keyword-search candidate pass; serving SQL binds to
+/// it with INDEXED BY, and createSchema (which runs on every open, including
+/// adopted snapshots) guarantees it exists before queries are served.
+pub const SEARCH_COVER_INDEX = "idx_documents_search_cover";
+pub const SEARCH_COVER_INDEX_COLUMNS = "(uri, created_at, is_bridgyfed, url_dead, platform, did)";
+
 const READ_POOL_SIZE = 12;
 
 // Per-thread checkout state. A thread holds at most one pool connection; nested
@@ -476,6 +482,17 @@ fn createSchema(self: *LocalDb) !void {
     addColumnIfMissing(c, "publications", "indexed_at", "TEXT");
     addColumnIfMissing(c, "publications", "show_in_discover", "INTEGER NOT NULL DEFAULT 1");
 
+    // Covering index for the keyword-search candidate pass. `documents` rows
+    // carry the full body with created_at and the policy flags stored AFTER
+    // content, so a plain uri-PK probe for the ranking columns reads past
+    // every document's body (overflow pages included) for every FTS match —
+    // measured 1.4s vs 34ms for 'atproto' (2.9k matches) on the prod replica
+    // (2026-08-11). Must be created after addColumnIfMissing gives older
+    // snapshots is_bridgyfed/url_dead. Serving SQL names this index via
+    // INDEXED BY (through SEARCH_COVER_INDEX), so it must exist wherever
+    // those queries run (guarded by plan test in server/search.zig).
+    c.exec("CREATE INDEX IF NOT EXISTS " ++ SEARCH_COVER_INDEX ++ " ON documents" ++ SEARCH_COVER_INDEX_COLUMNS, .{}) catch {};
+
     // Materialized (did, rkey) for subscriptions so the publication join is a
     // sargable indexed equijoin instead of parsing publication_uri per row (see
     // pubkey.joinOnStored). createSchema runs at every boot before serving, so
@@ -665,7 +682,6 @@ fn truncateSql(sql: []const u8) []const u8 {
     const max_len = 100;
     return if (sql.len > max_len) sql[0..max_len] else sql;
 }
-
 
 // remove a sqlite db file and its WAL/SHM sidecars (test helper)
 fn unlinkDbFiles(path: [:0]const u8) void {

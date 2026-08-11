@@ -879,6 +879,46 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
     return sql ++ "\n" ++ LOCAL_DOC_RECENCY_ORDER;
 }
 
+// Two-phase keyword search over document content. The inner pass ranks every
+// FTS match using only the covering index (rank + recency + policy flags) and
+// keeps the top candidate_limit uris; the outer pass re-runs the MATCH but
+// computes snippet() and reads full document rows only for rows in that set.
+// One-phase sorted the full SELECT (snippet included) for every match, which
+// tokenizes each matching document's whole body — 14s for 'atproto' on the
+// prod replica (2026-08-11). INDEXED BY is load-bearing: the planner prefers
+// the uri primary-key probe, which reads past the body for created_at.
+fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
+    return
+    \\SELECT f.uri, d.did, d.title,
+    \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(p.name, '') as publication_name
+    \\FROM documents_fts f
+    \\JOIN documents d ON f.uri = d.uri
+    \\LEFT JOIN publications p ON d.publication_uri = p.uri
+    \\WHERE documents_fts MATCH ? AND f.uri IN (
+    \\  SELECT uri FROM (
+    \\    SELECT f2.uri AS uri,
+    \\      f2.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
+    \\    FROM documents_fts f2
+    ++ "\n    JOIN documents d2 INDEXED BY " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON f2.uri = d2.uri\n" ++
+        \\    WHERE f2.documents_fts MATCH ?
+    ++ inner_extra_cond ++ "\n" ++
+        \\    AND (? = '' OR d2.did = ?)
+        \\    AND (? = '' OR d2.created_at >= ?)
+        \\    AND (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
+        \\    ORDER BY score, f2.uri LIMIT ?
+        \\  )
+        \\)
+        \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
+    ;
+}
+
+const LOCAL_DOCS_FTS_SQL = localDocsFtsSql("");
+const LOCAL_DOCS_FTS_PLATFORM_SQL = localDocsFtsSql("\n    AND d2.platform = ?");
+
 // Tag browse (no FTS text): fully local — document_tags and recommends both
 // live in the replica. Ranked by recency with a recommendation lift: score is
 // months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
@@ -947,15 +987,15 @@ fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: 
     const candidate_limit = queryCandidateLimit(options.max_results);
     var rows = if (query.len == 0)
         try local.query(LOCAL_TAG_BROWSE_SQL, .{
-            tag,        platform_val, platform_val,
-            author_val, author_val,   since_val,
+            tag,        platform_val,    platform_val,
+            author_val, author_val,      since_val,
             since_val,  candidate_limit,
         })
     else blk: {
         const fts_query = try buildFtsQuery(alloc, query);
         break :blk try local.query(LOCAL_TAG_FTS_SQL, .{
-            fts_query,  tag,        platform_val, platform_val,
-            author_val, author_val, since_val,    since_val,
+            fts_query,       tag,        platform_val, platform_val,
+            author_val,      author_val, since_val,    since_val,
             candidate_limit,
         });
     };
@@ -1008,20 +1048,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
 
     // document content search
     if (platform_filter) |platform| {
-        var rows = try local.query(withLocalDocRecencyOrder(
-            \\SELECT f.uri, d.did, d.title,
-            \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
-            \\  d.created_at, d.rkey, d.base_path, d.has_publication,
-            \\  d.platform, COALESCE(d.path, '') as path,
-            \\  COALESCE(d.cover_image, '') as cover_image,
-            \\  COALESCE(p.name, '') as publication_name
-            \\FROM documents_fts f
-            \\JOIN documents d ON f.uri = d.uri
-            \\LEFT JOIN publications p ON d.publication_uri = p.uri
-            \\WHERE documents_fts MATCH ? AND d.platform = ? AND (? = '' OR d.did = ?)
-            \\AND (? = '' OR d.created_at >= ?)
-            \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
-        ), .{ fts_query, platform, author_val, author_val, since_val, since_val, candidate_limit });
+        var rows = try local.query(LOCAL_DOCS_FTS_PLATFORM_SQL, .{ fts_query, fts_query, platform, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
         defer rows.deinit();
 
         while (rows.next()) |row| {
@@ -1072,20 +1099,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
         }
     } else {
         // no platform filter
-        var rows = try local.query(withLocalDocRecencyOrder(
-            \\SELECT f.uri, d.did, d.title,
-            \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
-            \\  d.created_at, d.rkey, d.base_path, d.has_publication,
-            \\  d.platform, COALESCE(d.path, '') as path,
-            \\  COALESCE(d.cover_image, '') as cover_image,
-            \\  COALESCE(p.name, '') as publication_name
-            \\FROM documents_fts f
-            \\JOIN documents d ON f.uri = d.uri
-            \\LEFT JOIN publications p ON d.publication_uri = p.uri
-            \\WHERE documents_fts MATCH ? AND (? = '' OR d.did = ?)
-            \\AND (? = '' OR d.created_at >= ?)
-            \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
-        ), .{ fts_query, author_val, author_val, since_val, since_val, candidate_limit });
+        var rows = try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
         defer rows.deinit();
 
         {
@@ -2146,18 +2160,14 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
             .{ "A", 100, 6 }, .{ "B", 10, 0 }, .{ "C", 200, 12 }, .{ "D", 40, 1 },
         }) |probe| {
             var sql_buf: [512]u8 = undefined;
-            const ins = try std.fmt.bufPrintZ(&sql_buf,
-                "INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) " ++
-                    "VALUES ('at://probe/{s}', 'did:plc:probe{s}', 'rk{s}', 'probe {s}', '', datetime('now', '-{d} days'), 'other', '', 0, '', '')",
-                .{ probe[0], probe[0], probe[0], probe[0], probe[1] });
+            const ins = try std.fmt.bufPrintZ(&sql_buf, "INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) " ++
+                "VALUES ('at://probe/{s}', 'did:plc:probe{s}', 'rk{s}', 'probe {s}', '', datetime('now', '-{d} days'), 'other', '', 0, '', '')", .{ probe[0], probe[0], probe[0], probe[0], probe[1] });
             try w.exec(ins, .{});
             try w.exec("INSERT INTO document_tags VALUES ('at://probe/" ++ probe[0] ++ "', 'photography')", .{});
             var r: usize = 0;
             while (r < probe[2]) : (r += 1) {
                 var rec_buf: [256]u8 = undefined;
-                const rec = try std.fmt.bufPrintZ(&rec_buf,
-                    "INSERT INTO recommends VALUES ('at://rec/{s}/{d}', 'did:plc:fan{d}', 'rr{d}', 'at://probe/{s}', '', '')",
-                    .{ probe[0], r, r, r, probe[0] });
+                const rec = try std.fmt.bufPrintZ(&rec_buf, "INSERT INTO recommends VALUES ('at://rec/{s}/{d}', 'did:plc:fan{d}', 'rr{d}', 'at://probe/{s}', '', '')", .{ probe[0], r, r, r, probe[0] });
                 try w.exec(rec, .{});
             }
         }
@@ -2243,6 +2253,89 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
             }
         }
     }
+}
+
+test "keyword doc search: candidate pass stays on the covering index" {
+    // Regression (2026-08-11): documents rows store the full body with
+    // created_at and policy flags AFTER content, so ranking every FTS match
+    // through the uri primary key read past every matching document's body —
+    // 14s for 'atproto' in prod. The candidate pass must resolve entirely
+    // from SEARCH_COVER_INDEX, and snippet() must only run for the top
+    // candidates. This test both prepares the INDEXED BY statement (fails if
+    // createSchema drops/renames the index) and asserts the plan.
+    const zqlite = @import("zqlite");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+
+    var path_buf: [64]u8 = undefined;
+    const zpath = std.fmt.bufPrintZ(&path_buf, "/tmp/docs-fts-plan-{d}.db", .{std.c.getpid()}) catch unreachable;
+    const cleanup = struct {
+        fn rm(p: []const u8) void {
+            var b: [80]u8 = undefined;
+            inline for (.{ "", "-wal", "-shm" }) |sfx| {
+                const z = std.fmt.bufPrintZ(&b, "{s}{s}", .{ p, sfx }) catch return;
+                _ = std.c.unlink(z.ptr);
+            }
+        }
+    };
+    cleanup.rm(zpath);
+    defer cleanup.rm(zpath);
+
+    {
+        const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+        defer w.close();
+        try w.exec(
+            \\CREATE TABLE documents (
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  created_at TEXT, publication_uri TEXT, platform TEXT,
+            \\  path TEXT, base_path TEXT, has_publication INTEGER,
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\)
+        , .{});
+        try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
+        try w.exec("CREATE INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON documents" ++ db.LocalDb.SEARCH_COVER_INDEX_COLUMNS, .{});
+        try w.exec(
+            \\INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image)
+            \\VALUES ('at://doc/1', 'did:plc:a', 'r1', 'atproto notes', 'a body about atproto', datetime('now', '-3 days'), 'other', '', 0, '', ''),
+            \\       ('at://doc/2', 'did:plc:b', 'r2', 'unrelated', 'nothing here', datetime('now', '-1 days'), 'other', '', 0, '', '')
+        , .{});
+        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+    }
+
+    var ldb = db.LocalDb.init(std.testing.allocator, tio);
+    for (&ldb.read_pool) |*slot| slot.* = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadOnly);
+    defer for (&ldb.read_pool) |*slot| {
+        if (slot.*) |c| c.close();
+        slot.* = null;
+    };
+    ldb.read_conn = ldb.read_pool[0];
+    ldb.setReady(true);
+
+    inline for (.{ LOCAL_DOCS_FTS_SQL, LOCAL_DOCS_FTS_PLATFORM_SQL }, .{ false, true }) |sql, has_platform| {
+        var plan = if (has_platform)
+            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "\"atproto\"*", "other", "", "", "", "", @as(usize, 83), @as(usize, 83) })
+        else
+            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "\"atproto\"*", "", "", "", "", @as(usize, 83), @as(usize, 83) });
+        defer plan.deinit();
+        var saw_cover = false;
+        while (plan.next()) |prow| {
+            const detail = prow.text(3);
+            if (std.mem.indexOf(u8, detail, "COVERING INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX) != null) saw_cover = true;
+            // the fat documents probe must never drive the candidate pass
+            try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
+        }
+        try std.testing.expect(saw_cover);
+    }
+
+    // end-to-end: the matching doc comes back with its snippet
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true });
+    try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/2") == null);
 }
 
 test "search refuses to serve before the visibility set loads" {

@@ -480,9 +480,21 @@ pub fn search(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, plat
         return error.VisibilityNotReady;
     }
 
-    if (mode == .hybrid) return searchHybrid(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options);
-    if (mode == .semantic) return searchSemantic(alloc, query, platform_filter, since_filter, author_filter, options);
-    return searchKeyword(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options);
+    switch (effectiveMode(query, mode)) {
+        .hybrid => return searchHybrid(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options),
+        .semantic => return searchSemantic(alloc, query, platform_filter, since_filter, author_filter, options),
+        .keyword => return searchKeyword(alloc, query, tag_filter, platform_filter, since_filter, author_filter, options),
+    }
+}
+
+/// Browse (no query text) is mode-independent: there is nothing to embed, so
+/// semantic/hybrid would return [] even when author/tag/platform filters have
+/// results — a filtered browse in the semantic UI tab looked like the author
+/// had nothing indexed (2026-08-11). The MCP server fixed this client-side
+/// (b11f1bd); the backend owns it for every client.
+fn effectiveMode(query: []const u8, mode: SearchMode) SearchMode {
+    if (query.len == 0) return .keyword;
+    return mode;
 }
 
 fn includeDid(did: []const u8, show_labeled: bool) bool {
@@ -2336,6 +2348,14 @@ test "keyword doc search: candidate pass stays on the covering index" {
     const out = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true });
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/2") == null);
+}
+
+test "empty-query browse is mode-independent (semantic author browse returned [])" {
+    try std.testing.expectEqual(SearchMode.keyword, effectiveMode("", .semantic));
+    try std.testing.expectEqual(SearchMode.keyword, effectiveMode("", .hybrid));
+    try std.testing.expectEqual(SearchMode.keyword, effectiveMode("", .keyword));
+    try std.testing.expectEqual(SearchMode.semantic, effectiveMode("atproto", .semantic));
+    try std.testing.expectEqual(SearchMode.hybrid, effectiveMode("atproto", .hybrid));
 }
 
 test "search refuses to serve before the visibility set loads" {

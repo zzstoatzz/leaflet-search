@@ -287,6 +287,18 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
         std.process.exit(0);
     };
     logfire.info("promote: adopted build {s} in-process", .{m.build_id});
+
+    // adopt-then-compact (crash-safe order): everything at or below the new
+    // snapshot's watermark is now baked into the serving file, so the overlay
+    // can drop it. A crash before this leaves shadowed-but-correct overlay
+    // rows; the next adoption prunes them.
+    if (db.getOverlay()) |o| {
+        o.compact(m.source_watermark) catch |err| {
+            logfire.warn("promote: overlay compact failed ({s}) — stale rows shadow until next adoption", .{@errorName(err)});
+        };
+        const s = o.stats();
+        logfire.info("promote: overlay compacted to watermark {s}; {d} rows remain", .{ m.source_watermark, s.rows });
+    }
 }
 
 /// Cap for the snapshot pull (rclone --bwlimit units). Default trades a

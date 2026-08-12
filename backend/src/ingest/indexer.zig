@@ -296,6 +296,30 @@ pub fn insertDocument(
     });
     var writes = try c.queryBatch(write_stmts);
     writes.deinit();
+
+    // overlay projection AFTER the turso commit: at-least-once + idempotent.
+    // Failure never fails ingest — the next snapshot heals a missed write.
+    if (db.getOverlay()) |o| {
+        o.upsert(.{
+            .uri = uri,
+            .did = did,
+            .rkey = rkey,
+            .title = title,
+            .content = content,
+            .created_at = created_at orelse "",
+            .publication_uri = pub_uri,
+            .platform = actual_platform,
+            .path = path orelse "",
+            .base_path = base_path,
+            .has_publication = has_pub,
+            .cover_image = cover_image orelse "",
+            .is_bridgyfed = is_bridgyfed,
+            .tags = tags,
+        }) catch |err| {
+            logfire.counter("overlay.write_errors", 1);
+            logfire.warn("overlay: upsert failed for {s}: {s}", .{ uri, @errorName(err) });
+        };
+    }
 }
 
 pub const DocWriteParams = struct {
@@ -546,6 +570,15 @@ pub fn deleteDocument(uri: []const u8) void {
     c.exec("DELETE FROM documents_fts WHERE rowid = (SELECT rowid FROM documents WHERE uri = ?)", &.{uri}) catch {};
     c.exec("DELETE FROM documents WHERE uri = ?", &.{uri}) catch {};
     c.exec("DELETE FROM document_tags WHERE document_uri = ?", &.{uri}) catch {};
+
+    // overlay tombstone suppresses any snapshot hit for this uri until a
+    // snapshot built after the delete is adopted
+    if (db.getOverlay()) |o| {
+        o.tombstone(uri) catch |err| {
+            logfire.counter("overlay.write_errors", 1);
+            logfire.warn("overlay: tombstone failed for {s}: {s}", .{ uri, @errorName(err) });
+        };
+    }
 }
 
 pub fn insertRecommend(

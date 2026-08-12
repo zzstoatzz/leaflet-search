@@ -162,6 +162,10 @@ pub fn run(allocator: Allocator, io: Io) !void {
         try conn.exec("INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_sync', ?)", .{ts_str});
     }
 
+    // self-describing artifact: the overlay compaction watermark travels in
+    // the snapshot too, not only the manifest (turso indexed_at domain)
+    try conn.exec("INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('source_watermark', ?)", .{watermark});
+
     // gate 1: row count vs turso, both sides pinned to the watermark + the
     // same policy filters. The set is immutable below the watermark, so any
     // mismatch beyond deletes-during-build is a real bug; keep a small

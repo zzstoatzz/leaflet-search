@@ -142,6 +142,9 @@ fn initServices(allocator: std.mem.Allocator, io: Io) void {
     db.initLocalDb(io);
     db.startSync(io);
 
+    // live overlay beside the frozen snapshot (inert unless OVERLAY_WRITE=1)
+    db.initOverlay(io);
+
     // Backstop for the visibility set: if turso was unreachable at boot the
     // refresher is still unloaded, and the replica can answer instead — its
     // publications table is complete at or below the snapshot watermark, which

@@ -178,6 +178,8 @@ fn handleRequest(server: *http.Server, request: *http.Server.Request, io: Io) !v
         try handleLabelerSummary(request);
     } else if (mem.eql(u8, path, "/snapshot")) {
         try handleSnapshot(request, io);
+    } else if (mem.eql(u8, path, "/admin/overlay/status")) {
+        try handleOverlayStatus(request);
     } else {
         try sendNotFound(request);
     }
@@ -1164,6 +1166,43 @@ fn handleSnapshot(request: *http.Server.Request, io: Io) !void {
         else => return err,
     };
     try sendJson(request, try alloc.dupe(u8, buf[0..n]));
+}
+
+/// Stage-1 verification surface: overlay row/tombstone counts, watermark, and
+/// the most recent uris — read-only, so spot-checks against turso
+/// (`SELECT uri FROM documents WHERE indexed_at > <watermark>`) need no ssh.
+fn handleOverlayStatus(request: *http.Server.Request) !void {
+    const o = db.getOverlay() orelse {
+        try request.respond("{\"enabled\":false}", .{
+            .status = .ok,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        });
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const s = o.stats();
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(alloc,
+        \\{{"enabled":true,"rows":{d},"tombstones":{d},"min_indexed_at":"{s}","max_indexed_at":"{s}","compacted_watermark":"{s}","recent":[
+    , .{ s.rows, s.tombstones, s.min_indexed_at[0..s.min_len], s.max_indexed_at[0..s.max_len], s.compacted_watermark[0..s.watermark_len] });
+
+    var rows = o.query("SELECT uri, deleted, indexed_at FROM documents_overlay ORDER BY indexed_at DESC LIMIT 50", .{}) catch null;
+    if (rows) |*r| {
+        defer r.deinit();
+        var first = true;
+        while (r.next()) |row| {
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try out.print(alloc, "{{\"uri\":{f},\"deleted\":{d},\"indexed_at\":\"{s}\"}}", .{
+                std.json.fmt(row.text(0), .{}), row.int(1), row.text(2),
+            });
+        }
+    }
+    try out.appendSlice(alloc, "]}");
+    try sendJson(request, out.items);
 }
 
 fn sendJson(request: *http.Server.Request, body: []const u8) !void {

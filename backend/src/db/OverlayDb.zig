@@ -40,6 +40,7 @@ mutex: Io.Mutex = Io.Mutex.init, // guards write conn
 allocator: Allocator,
 io: Io,
 max_rows: i64 = DEFAULT_MAX_ROWS,
+upserts_since_cap_check: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
 pub fn init(allocator: Allocator, io: Io) OverlayDb {
     return .{ .allocator = allocator, .io = io };
@@ -174,6 +175,21 @@ pub fn deinit(self: *OverlayDb) void {
 /// stamped here in the same format turso uses so compaction watermarks (which
 /// come from turso MAX(indexed_at)) compare in one domain.
 pub fn upsert(self: *OverlayDb, row: DocRow) !void {
+    try self.upsertInner(row);
+
+    // backfill-flood guard, amortized: one COUNT per 512 upserts.
+    // Outside upsertInner so enforceCap can take the (non-reentrant) mutex.
+    if (self.upserts_since_cap_check.fetchAdd(1, .monotonic) >= 511) {
+        self.upserts_since_cap_check.store(0, .monotonic);
+        const pruned = self.enforceCap() catch 0;
+        if (pruned > 0) {
+            logfire.counter("overlay.pruned", @intCast(pruned));
+            logfire.warn("overlay: cap exceeded, shed {d} oldest rows", .{pruned});
+        }
+    }
+}
+
+fn upsertInner(self: *OverlayDb, row: DocRow) !void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     const c = self.conn orelse return error.NotOpen;

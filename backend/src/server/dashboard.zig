@@ -31,12 +31,21 @@ fn refreshApi(slot: ApiSlot, alloc: Allocator) anyerror![]const u8 {
 /// at query time as `now - last_indexed_at` so the emit needs no clock.
 fn emitOpsSnapshot(data: Data) void {
     const backlog = if (data.documents > data.embeddings) data.documents - data.embeddings else 0;
+    var overlay_rows: i64 = -1; // -1 = overlay not enabled
+    var overlay_tombstones: i64 = -1;
+    if (db.getOverlay()) |o| {
+        const s = o.stats();
+        overlay_rows = s.rows;
+        overlay_tombstones = s.tombstones;
+    }
     logfire.span("ops.snapshot", .{
         .documents = data.documents,
         .embeddings = data.embeddings,
         .embed_backlog = backlog,
         .publications = data.publications,
         .last_indexed_at = data.last_indexed_at,
+        .overlay_rows = overlay_rows,
+        .overlay_tombstones = overlay_tombstones,
     }).end();
 }
 

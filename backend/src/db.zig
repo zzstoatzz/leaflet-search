@@ -20,6 +20,9 @@ var client: ?Client = null;
 // an adopted snapshot without a restart: readers load the pointer once per
 // query and the displaced instance drains in the background (retireAsync).
 var local_db: std.atomic.Value(?*LocalDb) = .init(null);
+// The overlay is opened once and never swapped — it persists across snapshot
+// adoptions by design, so a plain pointer (set before serving starts) is enough.
+var overlay_db: ?*OverlayDb = null;
 
 /// Initialize Turso client only (fast, call synchronously at startup).
 /// Schema migrations run separately via initSchema() in the background thread
@@ -78,6 +81,27 @@ pub fn swapLocalDb(io: Io) !void {
     fresh.setReady(true);
     const old = local_db.swap(fresh, .acq_rel);
     if (old) |o| o.retireAsync();
+}
+
+/// Open the live overlay (OVERLAY_WRITE gate — Stage 1 flag). Failure is
+/// non-fatal: the overlay is a freshness cache; serving works without it.
+pub fn initOverlay(io: Io) void {
+    if (std.c.getenv("OVERLAY_WRITE")) |p| {
+        if (!std.mem.eql(u8, std.mem.span(p), "1")) return;
+    } else return;
+    const o = allocator.create(OverlayDb) catch return;
+    o.* = OverlayDb.init(allocator, io);
+    o.open() catch |err| {
+        logfire.err("overlay: open failed ({s}) — running without overlay", .{@errorName(err)});
+        allocator.destroy(o);
+        return;
+    };
+    overlay_db = o;
+    std.debug.print("overlay: open\n", .{});
+}
+
+pub fn getOverlay() ?*OverlayDb {
+    return overlay_db;
 }
 
 pub fn getClient() ?*Client {

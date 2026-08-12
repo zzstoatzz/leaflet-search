@@ -4,6 +4,9 @@ primary_region = 'ewr'
 [build]
 
 [env]
+  # Stage 1 (docs/scaling-plan overlay rollout): overlay writes flow + compact
+  # on adoption, but serving stays snapshot-only until OVERLAY_SERVE = '1'.
+  OVERLAY_WRITE = '1'
   ENABLE_SNAPSHOT_PROMOTE = '1'
   PROMOTE_CHANNEL = 'prod'
   INGESTER_HOST = 'leaflet-search-ingester.internal'

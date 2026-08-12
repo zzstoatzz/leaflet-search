@@ -1,0 +1,64 @@
+name: Turso Stall Probe
+# temporary diagnostic: turso writes have stalled ~03:00:45-03:05 UTC nightly
+# since at least 2026-08-08 (backend db.query/db.batch spans hit the 180s
+# fetchBounded deadline). This probes turso directly from GHA — independent of
+# the backend process, its connection pool, and fly networking — every 5s
+# across the window, both a read and a write, with 5s timeouts. If the probe
+# stalls too, the outage is turso-side; if it stays green while the backend
+# stalls, the problem is our connection path. Delete once answered.
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # GHA cron drifts late; start early, probe long
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: probe turso across the 03:00 window
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: |
+          host="${TURSO_URL#libsql://}"; host="${host#https://}"
+          echo "probing https://$host/v2/pipeline until 03:20 UTC"
+          fails=0
+          iters=0
+          # scheduled runs probe until 03:20 UTC; manual dispatch does 12
+          # iterations (~1min) as a smoke test whatever the clock says
+          in_window() {
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              [ "$iters" -lt 12 ]
+            else
+              [ "$((10#$(date -u +%H%M)))" -lt 320 ]
+            fi
+          }
+          while in_window; do
+            iters=$((iters+1))
+            for kind in read write; do
+              if [ "$kind" = read ]; then
+                sql='SELECT 1'
+              else
+                sql="INSERT INTO traffic_hourly (hour, endpoint, count, sum_us, max_us) VALUES (0, 'stall_probe', 1, 0, 0) ON CONFLICT(hour, endpoint) DO UPDATE SET count = count + 1"
+              fi
+              start=$(date -u +%s.%N)
+              code=$(curl -s -o /tmp/resp -w '%{http_code}' --max-time 5 \
+                -X POST "https://$host/v2/pipeline" \
+                -H "Authorization: Bearer $TURSO_TOKEN" \
+                -H 'content-type: application/json' \
+                -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":\"$sql\"}},{\"type\":\"close\"}]}" \
+                || echo TIMEOUT)
+              end=$(date -u +%s.%N)
+              dur=$(echo "$end $start" | awk '{printf "%.2f", $1-$2}')
+              if [ "$code" = "200" ] && ! grep -q '"error"' /tmp/resp; then
+                echo "$(date -u +%H:%M:%S) $kind ok ${dur}s"
+              else
+                fails=$((fails+1))
+                echo "$(date -u +%H:%M:%S) $kind FAIL code=$code ${dur}s $(head -c 200 /tmp/resp)"
+              fi
+            done
+            sleep 5
+          done
+          echo "done: $fails failures"

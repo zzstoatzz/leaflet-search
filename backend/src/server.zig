@@ -278,10 +278,19 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
         try sendJson(request, "{\"error\":\"hybrid search supports the top 200 results\"}");
         return;
     }
+    // live-overlay serving (Stage 2): default from OVERLAY_SERVE=1, per-request
+    // override via ?overlay=0/1 for prod A/B parity checks
+    const overlay_pref = parseQueryParam(alloc, target, "overlay") catch null;
+    const use_overlay = if (overlay_pref) |v|
+        mem.eql(u8, v, "1")
+    else
+        (std.c.getenv("OVERLAY_SERVE") != null and mem.eql(u8, mem.span(std.c.getenv("OVERLAY_SERVE").?), "1"));
+
     const raw_results = search.search(alloc, query, tag_filter, platform_filter, since_filter, author_filter, mode, .{
         .max_results = result_window,
         .show_labeled = show_labeled,
         .include_undiscoverable = include_undiscoverable,
+        .use_overlay = use_overlay,
     }) catch |err| {
         // Startup window: the visibility set has not loaded, so we cannot tell
         // which publications opted out. An empty result set would be

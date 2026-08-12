@@ -561,6 +561,10 @@ pub const Row = struct {
     pub fn int(self: Row, index: usize) i64 {
         return self.stmt.int(index);
     }
+
+    pub fn float(self: Row, index: usize) f64 {
+        return self.stmt.float(index);
+    }
 };
 
 /// Iterator for query results

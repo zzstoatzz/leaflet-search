@@ -104,6 +104,11 @@ pub fn getOverlay() ?*OverlayDb {
     return overlay_db;
 }
 
+/// Test-only: point the process-global overlay at a fixture (and back to null).
+pub fn setOverlayForTest(o: ?*OverlayDb) void {
+    overlay_db = o;
+}
+
 pub fn getClient() ?*Client {
     if (client) |*c| return c;
     return null;

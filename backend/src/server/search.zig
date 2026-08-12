@@ -20,6 +20,9 @@ pub const Options = struct {
     /// `include_undiscoverable=true`. The default is exclusion, and a path
     /// that cannot resolve the preference excludes rather than shows.
     include_undiscoverable: bool = false,
+    /// Merge live-overlay hits into keyword/tag serving (Stage 2 flag; see
+    /// OVERLAY_SERVE + the ?overlay= debug param in server.zig).
+    use_overlay: bool = false,
 };
 
 pub const SearchMode = enum {
@@ -593,7 +596,16 @@ fn addBridgyFedExclusion(alloc: Allocator, stmt: db.Client.Statement) !db.Client
 }
 
 /// Check if a URI is from bridgy fed by looking up is_bridgyfed in local SQLite.
+/// Overlay first: a doc newer than the snapshot only exists there, and a
+/// tombstoned doc must be excluded from semantic results too.
 fn isBridgyFed(uri: []const u8) bool {
+    if (db.getOverlay()) |o| {
+        var orows = o.query("SELECT is_bridgyfed, deleted FROM documents_overlay WHERE uri = ?", .{uri}) catch null;
+        if (orows) |*r| {
+            defer r.deinit();
+            if (r.next()) |row| return row.int(0) != 0 or row.int(1) != 0;
+        }
+    }
     const local = db.getLocalDb() orelse return false;
     var rows = local.query(
         "SELECT is_bridgyfed FROM documents WHERE uri = ?",
@@ -906,7 +918,8 @@ fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
     \\  COALESCE(d.cover_image, '') as cover_image,
-    \\  COALESCE(p.name, '') as publication_name
+    \\  COALESCE(p.name, '') as publication_name,
+    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
     \\FROM documents_fts f
     \\JOIN documents d ON f.uri = d.uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
@@ -945,7 +958,11 @@ const LOCAL_TAG_BROWSE_SQL =
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
     \\  COALESCE(d.cover_image, '') as cover_image,
-    \\  COALESCE(p.name, '') as publication_name
+    \\  COALESCE(p.name, '') as publication_name,
+    \\  COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0)
+    \\  -
+++ RECOMMEND_LIFT ++
+    \\ * ln(1 + COALESCE(r.rc, 0)) AS merge_score
     \\FROM document_tags dt
     \\JOIN documents d ON d.uri = dt.document_uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
@@ -971,7 +988,8 @@ const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
     \\  COALESCE(d.cover_image, '') as cover_image,
-    \\  COALESCE(p.name, '') as publication_name
+    \\  COALESCE(p.name, '') as publication_name,
+    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
     \\FROM documents_fts f
     \\JOIN documents d ON f.uri = d.uri
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
@@ -981,6 +999,174 @@ const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
     \\AND (? = '' OR d.created_at >= ?)
     \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0) AND (d.url_dead IS NULL OR d.url_dead = 0)
 );
+
+// ---------------------------------------------------------------------------
+// Live-overlay merge (docs/scaling-plan.md, typeahead's snapshot+overlay
+// design). The overlay holds docs newer than the adopted snapshot's watermark;
+// serving interleaves overlay hits with snapshot hits on the SAME score
+// expression (bm25 rank + recency). BM25 from two FTS tables is not one scale
+// in general, but ranking is recency-dominant and overlay rows are at most one
+// build-cadence old, so recency dominates exactly where it must. Every column
+// index matches docCol's projection; merge_score rides as a 13th column.
+const DOC_MERGE_SCORE_COL = 12;
+
+const OVERLAY_DOCS_FTS_SQL =
+    \\SELECT d.uri, d.did, d.title,
+    \\  snippet(overlay_fts, 2, '', '', '...', 32) as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(d.publication_name, '') as publication_name,
+    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
+    \\FROM overlay_fts f
+    \\JOIN documents_overlay d ON f.uri = d.uri
+    \\WHERE overlay_fts MATCH ? AND d.deleted = 0
+    \\AND (? = '' OR d.platform = ?)
+    \\AND (? = '' OR d.did = ?)
+    \\AND (? = '' OR d.created_at >= ?)
+    \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0)
+    \\ORDER BY merge_score, d.uri LIMIT ?
+;
+
+// overlay docs have no recommend_counts (snapshot-side materialization);
+// rc=0 keeps the same formula with a zero lift, which is exact for the
+// overwhelmingly-common case (fresh docs have no recommends yet)
+const OVERLAY_TAG_BROWSE_SQL =
+    \\SELECT d.uri, d.did, d.title, '' as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(d.publication_name, '') as publication_name,
+    \\  COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
+    \\FROM overlay_doc_tags t
+    \\JOIN documents_overlay d ON d.uri = t.uri
+    \\WHERE t.tag = ? AND d.deleted = 0
+    \\AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
+    \\AND (? = '' OR d.created_at >= ?)
+    \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0)
+    \\ORDER BY merge_score, d.uri LIMIT ?
+;
+
+const OVERLAY_TAG_FTS_SQL =
+    \\SELECT d.uri, d.did, d.title,
+    \\  snippet(overlay_fts, 2, '', '', '...', 32) as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(d.publication_name, '') as publication_name,
+    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
+    \\FROM overlay_fts f
+    \\JOIN documents_overlay d ON f.uri = d.uri
+    \\WHERE overlay_fts MATCH ?
+    \\AND d.uri IN (SELECT uri FROM overlay_doc_tags WHERE tag = ?)
+    \\AND (? = '' OR d.platform = ?) AND (? = '' OR d.did = ?)
+    \\AND (? = '' OR d.created_at >= ?)
+    \\AND (d.is_bridgyfed IS NULL OR d.is_bridgyfed = 0)
+    \\ORDER BY merge_score, d.uri LIMIT ?
+;
+
+const OVERLAY_HIT_CAP: usize = 50;
+
+const OverlayHit = struct {
+    doc: Doc,
+    score: f64,
+};
+
+/// Materialized overlay contribution to one search: score-ascending hits plus
+/// a suppression set of EVERY overlay uri (live rows shadow their snapshot
+/// versions — the overlay copy is at least as new; tombstones suppress
+/// outright). Materialized so no overlay read connection is held while the
+/// snapshot rows stream.
+const OverlaySlice = struct {
+    hits: std.ArrayList(OverlayHit) = .empty,
+    suppress: std.StringHashMap(void),
+    next: usize = 0,
+
+    fn init(alloc: Allocator) OverlaySlice {
+        return .{ .suppress = std.StringHashMap(void).init(alloc) };
+    }
+
+    fn suppresses(self: *const OverlaySlice, uri: []const u8) bool {
+        return self.suppress.contains(uri);
+    }
+
+    /// Emit every not-yet-emitted overlay hit ranked at or above `score`
+    /// (lower = better), running the same policy/dedup gates snapshot rows go
+    /// through. Pass -inf... = math.inf(f64) to drain at the end.
+    fn emitUpTo(
+        self: *OverlaySlice,
+        score: f64,
+        alloc: Allocator,
+        jw: *json.Stringify,
+        seen_uris: *std.StringHashMap(void),
+        seen_authors: *std.StringHashMap(void),
+        result_count: *usize,
+        options: Options,
+    ) !void {
+        while (self.next < self.hits.items.len) {
+            const hit = self.hits.items[self.next];
+            if (hit.score > score) return;
+            self.next += 1;
+            if (result_count.* >= options.max_results) return;
+            const doc = hit.doc;
+            if (seen_uris.contains(doc.uri)) continue;
+            if (!includeDid(doc.did, options.show_labeled)) continue;
+            if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
+            if (try isDuplicateAuthorTitle(seen_authors, alloc, doc.did, doc.title)) continue;
+            try seen_uris.put(doc.uri, {});
+            try jw.write(doc.toJson(alloc));
+            result_count.* += 1;
+        }
+    }
+};
+
+fn dupeDocFromOverlayRow(alloc: Allocator, row: db.OverlayDb.Row) !Doc {
+    return .{
+        .uri = try alloc.dupe(u8, row.text(docCol("uri"))),
+        .did = try alloc.dupe(u8, row.text(docCol("did"))),
+        .title = try alloc.dupe(u8, row.text(docCol("title"))),
+        .snippet = try alloc.dupe(u8, row.text(docCol("snippet"))),
+        .createdAt = try alloc.dupe(u8, row.text(docCol("created_at"))),
+        .rkey = try alloc.dupe(u8, row.text(docCol("rkey"))),
+        .basePath = try alloc.dupe(u8, row.text(docCol("base_path"))),
+        .hasPublication = row.int(docCol("has_publication")) != 0,
+        .platform = try alloc.dupe(u8, row.text(docCol("platform"))),
+        .path = try alloc.dupe(u8, row.text(docCol("path"))),
+        .coverImage = try alloc.dupe(u8, row.text(docCol("cover_image"))),
+        .publicationName = try alloc.dupe(u8, row.text(docCol("publication_name"))),
+    };
+}
+
+/// Fetch the overlay's contribution for one search. Any failure returns what
+/// was gathered so far — overlay trouble must degrade to snapshot-only
+/// serving, never break search.
+fn fetchOverlaySlice(alloc: Allocator, comptime sql: []const u8, args: anytype) OverlaySlice {
+    var slice = OverlaySlice.init(alloc);
+    const o = db.getOverlay() orelse return slice;
+
+    blk: {
+        var rows = o.query(sql, args) catch break :blk;
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const doc = dupeDocFromOverlayRow(alloc, row) catch break :blk;
+            slice.hits.append(alloc, .{ .doc = doc, .score = row.float(DOC_MERGE_SCORE_COL) }) catch break :blk;
+            slice.suppress.put(doc.uri, {}) catch break :blk;
+        }
+    }
+    blk: {
+        var rows = o.query("SELECT uri FROM documents_overlay WHERE deleted = 1", .{}) catch break :blk;
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const uri = alloc.dupe(u8, row.text(0)) catch break :blk;
+            slice.suppress.put(uri, {}) catch break :blk;
+        }
+    }
+    return slice;
+}
+
+fn overlayEnabled(options: Options) bool {
+    return options.use_overlay and db.getOverlay() != null;
+}
 
 fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: []const u8, platform_filter: ?[]const u8, since_filter: ?[]const u8, author_filter: ?[]const u8, options: Options) ![]const u8 {
     const platform_val: []const u8 = platform_filter orelse "";
@@ -995,8 +1181,29 @@ fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: 
     var seen_authors = std.StringHashMap(void).init(alloc);
     defer seen_authors.deinit();
 
+    var seen_uris = std.StringHashMap(void).init(alloc);
+    defer seen_uris.deinit();
+
     var result_count: usize = 0;
     const candidate_limit = queryCandidateLimit(options.max_results);
+
+    // overlay contribution first (materialized), so snapshot rows can stream
+    var ov = if (!overlayEnabled(options))
+        OverlaySlice.init(alloc)
+    else if (query.len == 0)
+        fetchOverlaySlice(alloc, OVERLAY_TAG_BROWSE_SQL, .{
+            tag,       platform_val, platform_val, author_val,
+            author_val, since_val,   since_val,    OVERLAY_HIT_CAP,
+        })
+    else blk: {
+        const fts_query = try buildFtsQuery(alloc, query);
+        break :blk fetchOverlaySlice(alloc, OVERLAY_TAG_FTS_SQL, .{
+            fts_query, tag,        platform_val, platform_val,
+            author_val, author_val, since_val,   since_val,
+            OVERLAY_HIT_CAP,
+        });
+    };
+
     var rows = if (query.len == 0)
         try local.query(LOCAL_TAG_BROWSE_SQL, .{
             tag,        platform_val,    platform_val,
@@ -1014,13 +1221,19 @@ fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: 
     defer rows.deinit();
     while (rows.next()) |row| {
         if (result_count >= options.max_results) break;
+        try ov.emitUpTo(row.float(DOC_MERGE_SCORE_COL), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
+        if (result_count >= options.max_results) break;
         const doc = Doc.fromLocalRow(row);
+        if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
+        if (seen_uris.contains(doc.uri)) continue;
         if (!includeDid(doc.did, options.show_labeled)) continue;
         if (!options.include_undiscoverable and isUndiscoverableDoc(doc.did, doc.basePath)) continue;
         if (try isDuplicateAuthorTitle(&seen_authors, alloc, doc.did, doc.title)) continue;
+        try seen_uris.put(try alloc.dupe(u8, doc.uri), {});
         try jw.write(doc.toJson(alloc));
         result_count += 1;
     }
+    try ov.emitUpTo(std.math.inf(f64), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
 
     try jw.endArray();
     return try output.toOwnedSlice();
@@ -1058,6 +1271,17 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
     var seen_authors = std.StringHashMap(void).init(alloc);
     defer seen_authors.deinit();
 
+    // live-overlay contribution (docs newer than the adopted snapshot),
+    // materialized up front and interleaved by merge_score below
+    const platform_val: []const u8 = platform_filter orelse "";
+    var ov = if (overlayEnabled(options))
+        fetchOverlaySlice(alloc, OVERLAY_DOCS_FTS_SQL, .{
+            fts_query, platform_val, platform_val, author_val,
+            author_val, since_val,   since_val,    OVERLAY_HIT_CAP,
+        })
+    else
+        OverlaySlice.init(alloc);
+
     // document content search
     if (platform_filter) |platform| {
         var rows = try local.query(LOCAL_DOCS_FTS_PLATFORM_SQL, .{ fts_query, fts_query, platform, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
@@ -1065,7 +1289,10 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
 
         while (rows.next()) |row| {
             if (result_count >= options.max_results) break;
+            try ov.emitUpTo(row.float(DOC_MERGE_SCORE_COL), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
+            if (result_count >= options.max_results) break;
             const doc = Doc.fromLocalRow(row);
+            if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
             if (author_filter) |af| {
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
@@ -1078,6 +1305,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             try jw.write(doc.toJson(alloc));
             result_count += 1;
         }
+        try ov.emitUpTo(std.math.inf(f64), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
 
         // base_path search with platform
         var bp_rows = try local.query(withLocalDocRecencyOrder(
@@ -1098,6 +1326,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
         while (bp_rows.next()) |row| {
             if (result_count >= options.max_results) break;
             const doc = Doc.fromLocalRow(row);
+            if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
             if (author_filter) |af| {
                 if (!std.mem.eql(u8, doc.did, af)) continue;
             }
@@ -1120,7 +1349,10 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             var doc_count: u32 = 0;
             while (rows.next()) |row| {
                 if (result_count >= options.max_results) break;
+                try ov.emitUpTo(row.float(DOC_MERGE_SCORE_COL), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
+                if (result_count >= options.max_results) break;
                 const doc = Doc.fromLocalRow(row);
+                if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
                 if (author_filter) |af| {
                     if (!std.mem.eql(u8, doc.did, af)) continue;
                 }
@@ -1134,6 +1366,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                 doc_count += 1;
                 result_count += 1;
             }
+            try ov.emitUpTo(std.math.inf(f64), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
             logfire.info("search.iterate.docs_fts rows={d}", .{doc_count});
         }
 
@@ -1160,6 +1393,7 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             while (bp_rows.next()) |row| {
                 if (result_count >= options.max_results) break;
                 const doc = Doc.fromLocalRow(row);
+                if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
                 if (author_filter) |af| {
                     if (!std.mem.eql(u8, doc.did, af)) {
                         bp_count += 1;
@@ -1767,6 +2001,35 @@ fn fetchLocalExtras(alloc: Allocator, uris: []const []const u8) LocalExtras {
     const empty: LocalExtras = .{ .snippets = snippets, .cover_images = cover_images, .pub_names = pub_names, .platforms = platforms, .base_paths = base_paths, .paths = paths };
     const local = db.getLocalDb() orelse return empty;
     for (uris) |uri| {
+        // overlay first: docs newer than the snapshot hydrate from the overlay
+        // (otherwise semantic mode shows stale/empty fields for fresh docs)
+        if (db.getOverlay()) |o| {
+            var orows = o.query(
+                "SELECT substr(content, 1, 200), COALESCE(cover_image, ''), COALESCE(publication_name, ''), platform, COALESCE(base_path, ''), COALESCE(path, '') FROM documents_overlay WHERE uri = ? AND deleted = 0",
+                .{uri},
+            ) catch null;
+            if (orows) |*r| {
+                defer r.deinit();
+                if (r.next()) |row| {
+                    const preview = row.text(0);
+                    if (preview.len > 0) {
+                        if (alloc.dupe(u8, preview)) |d| snippets.put(uri, d) catch {} else |_| {}
+                    }
+                    const cover = row.text(1);
+                    if (cover.len > 0) {
+                        if (alloc.dupe(u8, cover)) |d| cover_images.put(uri, d) catch {} else |_| {}
+                    }
+                    const pub_name = row.text(2);
+                    if (pub_name.len > 0) {
+                        if (alloc.dupe(u8, pub_name)) |d| pub_names.put(uri, d) catch {} else |_| {}
+                    }
+                    if (alloc.dupe(u8, row.text(3))) |p| platforms.put(uri, p) catch {} else |_| {}
+                    if (alloc.dupe(u8, row.text(4))) |b| base_paths.put(uri, b) catch {} else |_| {}
+                    if (alloc.dupe(u8, row.text(5))) |pa| paths.put(uri, pa) catch {} else |_| {}
+                    continue;
+                }
+            }
+        }
         var rows = local.query(
             "SELECT substr(content, 1, 200), COALESCE(cover_image, ''), COALESCE((SELECT name FROM publications WHERE uri = documents.publication_uri), ''), platform, COALESCE(base_path, ''), COALESCE(path, '') FROM documents WHERE uri = ?",
             .{uri},
@@ -2348,6 +2611,194 @@ test "keyword doc search: candidate pass stays on the covering index" {
     const out = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true });
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/2") == null);
+}
+
+test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress" {
+    const zqlite = @import("zqlite");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+
+    var path_buf: [64]u8 = undefined;
+    const zpath = std.fmt.bufPrintZ(&path_buf, "/tmp/overlay-merge-{d}.db", .{std.c.getpid()}) catch unreachable;
+    var opath_buf: [64]u8 = undefined;
+    const opath = std.fmt.bufPrintZ(&opath_buf, "/tmp/overlay-merge-ov-{d}.db", .{std.c.getpid()}) catch unreachable;
+    const cleanup = struct {
+        fn rm(p: []const u8) void {
+            var b: [80]u8 = undefined;
+            inline for (.{ "", "-wal", "-shm" }) |sfx| {
+                const z = std.fmt.bufPrintZ(&b, "{s}{s}", .{ p, sfx }) catch return;
+                _ = std.c.unlink(z.ptr);
+            }
+        }
+    };
+    cleanup.rm(zpath);
+    cleanup.rm(opath);
+    defer cleanup.rm(zpath);
+    defer cleanup.rm(opath);
+
+    // snapshot: an old atproto doc, a doc the overlay will shadow with a newer
+    // version, and a doc the overlay has tombstoned
+    {
+        const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+        defer w.close();
+        try w.exec(
+            \\CREATE TABLE documents (
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  created_at TEXT, publication_uri TEXT, platform TEXT,
+            \\  path TEXT, base_path TEXT, has_publication INTEGER,
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\)
+        , .{});
+        try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
+        try w.exec("CREATE INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON documents" ++ db.LocalDb.SEARCH_COVER_INDEX_COLUMNS, .{});
+        try w.exec(
+            \\INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image)
+            \\VALUES ('at://doc/old', 'did:plc:a', 'r1', 'atproto archives', 'old atproto writing', datetime('now', '-30 days'), 'other', '', 0, '', ''),
+            \\       ('at://doc/shadowed', 'did:plc:b', 'r2', 'atproto draft stale', 'stale snapshot body', datetime('now', '-10 days'), 'other', '', 0, '', ''),
+            \\       ('at://doc/gone', 'did:plc:c', 'r3', 'atproto deleted post', 'was deleted after the build', datetime('now', '-5 days'), 'other', '', 0, '', '')
+        , .{});
+        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+    }
+
+    var ldb = db.LocalDb.init(std.testing.allocator, tio);
+    for (&ldb.read_pool) |*slot| slot.* = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadOnly);
+    defer for (&ldb.read_pool) |*slot| {
+        if (slot.*) |c| c.close();
+        slot.* = null;
+    };
+    ldb.read_conn = ldb.read_pool[0];
+    ldb.setReady(true);
+
+    // overlay: one brand-new doc, one newer version of at://doc/shadowed,
+    // one tombstone for at://doc/gone
+    var ov = db.OverlayDb.init(std.testing.allocator, tio);
+    try ov.openAt(opath);
+    defer ov.deinit();
+    const mkdoc = struct {
+        fn d(uri: []const u8, title: []const u8, content: []const u8, created: []const u8) db.OverlayDb.DocRow {
+            return .{
+                .uri = uri, .did = "did:plc:ov", .rkey = "rk", .title = title, .content = content,
+                .created_at = created, .publication_uri = "", .platform = "other", .path = "",
+                .base_path = "", .has_publication = "0", .cover_image = "", .is_bridgyfed = "0",
+            };
+        }
+    };
+    try ov.upsert(mkdoc.d("at://doc/fresh", "fresh atproto post", "just written about atproto", "2026-08-12T00:00:00"));
+    try ov.upsert(mkdoc.d("at://doc/shadowed", "atproto draft REVISED", "revised overlay body", "2026-08-12T00:00:00"));
+    try ov.tombstone("at://doc/gone");
+
+    db.setOverlayForTest(&ov);
+    defer db.setOverlayForTest(null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // overlay ON: fresh appears, shadowed serves the overlay version, gone is suppressed
+    const merged = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{
+        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, merged, "at://doc/fresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "at://doc/old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "REVISED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "stale snapshot body") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "at://doc/gone") == null);
+    // exactly one row for the shadowed uri
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, merged, "at://doc/shadowed"));
+
+    // overlay OFF: snapshot-only serving unchanged (gate works)
+    const plain = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{
+        .include_undiscoverable = true, .show_labeled = true, .use_overlay = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, plain, "at://doc/gone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "at://doc/fresh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "stale") != null);
+}
+
+test "overlay merge: tag browse includes fresh tagged docs" {
+    const zqlite = @import("zqlite");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+
+    var path_buf: [64]u8 = undefined;
+    const zpath = std.fmt.bufPrintZ(&path_buf, "/tmp/overlay-tag-{d}.db", .{std.c.getpid()}) catch unreachable;
+    var opath_buf: [64]u8 = undefined;
+    const opath = std.fmt.bufPrintZ(&opath_buf, "/tmp/overlay-tag-ov-{d}.db", .{std.c.getpid()}) catch unreachable;
+    const cleanup = struct {
+        fn rm(p: []const u8) void {
+            var b: [80]u8 = undefined;
+            inline for (.{ "", "-wal", "-shm" }) |sfx| {
+                const z = std.fmt.bufPrintZ(&b, "{s}{s}", .{ p, sfx }) catch return;
+                _ = std.c.unlink(z.ptr);
+            }
+        }
+    };
+    cleanup.rm(zpath);
+    cleanup.rm(opath);
+    defer cleanup.rm(zpath);
+    defer cleanup.rm(opath);
+
+    {
+        const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+        defer w.close();
+        try w.exec(
+            \\CREATE TABLE documents (
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  created_at TEXT, publication_uri TEXT, platform TEXT,
+            \\  path TEXT, base_path TEXT, has_publication INTEGER,
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\)
+        , .{});
+        try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
+        try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT, PRIMARY KEY (document_uri, tag))", .{});
+        try w.exec("CREATE TABLE recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER)", .{});
+        try w.exec("INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) VALUES ('at://doc/snap', 'did:plc:a', 'r1', 'snapshot zig post', 'zig writing', datetime('now', '-20 days'), 'other', '', 0, '', '')", .{});
+        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        try w.exec("INSERT INTO document_tags (document_uri, tag) VALUES ('at://doc/snap', 'zig')", .{});
+    }
+
+    var ldb = db.LocalDb.init(std.testing.allocator, tio);
+    for (&ldb.read_pool) |*slot| slot.* = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadOnly);
+    defer for (&ldb.read_pool) |*slot| {
+        if (slot.*) |c| c.close();
+        slot.* = null;
+    };
+    ldb.read_conn = ldb.read_pool[0];
+    ldb.setReady(true);
+
+    var ov = db.OverlayDb.init(std.testing.allocator, tio);
+    try ov.openAt(opath);
+    defer ov.deinit();
+    try ov.upsert(.{
+        .uri = "at://doc/freshtag", .did = "did:plc:ov", .rkey = "rk", .title = "fresh zig post",
+        .content = "new zig writing", .created_at = "2026-08-12T00:00:00", .publication_uri = "",
+        .platform = "other", .path = "", .base_path = "", .has_publication = "0",
+        .cover_image = "", .is_bridgyfed = "0", .tags = &.{"zig"},
+    });
+    db.setOverlayForTest(&ov);
+    defer db.setOverlayForTest(null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // tag browse (empty query): fresh overlay doc merges in ahead of the old one
+    const browse = try searchLocal(arena.allocator(), &ldb, "", "zig", null, null, null, .{
+        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, browse, "at://doc/freshtag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, browse, "at://doc/snap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, browse, "at://doc/freshtag").? < std.mem.indexOf(u8, browse, "at://doc/snap").?);
+
+    // tag + text: overlay FTS restricted to the tag
+    const tagfts = try searchLocal(arena.allocator(), &ldb, "zig", "zig", null, null, null, .{
+        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, tagfts, "at://doc/freshtag") != null);
 }
 
 test "empty-query browse is mode-independent (semantic author browse returned [])" {

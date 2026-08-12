@@ -227,6 +227,7 @@ test {
     _ = @import("visibility.zig");
     _ = @import("promote.zig");
     _ = @import("db/LocalDb.zig");
+    _ = @import("db/OverlayDb.zig");
     _ = @import("server/pubkey.zig");
     _ = @import("server/cache.zig");
     _ = @import("labeler.zig");

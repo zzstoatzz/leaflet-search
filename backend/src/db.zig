@@ -8,6 +8,7 @@ const result = @import("db/result.zig");
 // re-exports
 pub const Client = @import("db/Client.zig");
 pub const LocalDb = @import("db/LocalDb.zig");
+pub const OverlayDb = @import("db/OverlayDb.zig");
 pub const Row = result.Row;
 pub const Result = result.Result;
 pub const BatchResult = result.BatchResult;

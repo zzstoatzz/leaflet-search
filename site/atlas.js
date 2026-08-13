@@ -2350,7 +2350,7 @@
   }
 
   // --- search ---
-  var API_URL = 'https://leaflet-search-backend.fly.dev';
+  var API_URL = '/api';
   var searchInput = document.getElementById('search-input');
   var searchForm = document.getElementById('search-form');
   var searchStatusEl = null;

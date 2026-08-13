@@ -1,4 +1,4 @@
-const API_BASE = 'https://leaflet-search-backend.fly.dev';
+const API_BASE = '/api';
 
 let startedAt = 0;
 let lastIndexedAt = 0;

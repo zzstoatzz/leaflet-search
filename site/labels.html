@@ -109,7 +109,7 @@
   </div>
 
   <script>
-    const API_URL = 'https://leaflet-search-backend.fly.dev';
+    const API_URL = '/api';
     function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
     function host(s) { return (s || '').replace(/^https?:\/\//, ''); }
     function labelsUrl(did) { return `https://labeler.pub-search.waow.tech/xrpc/com.atproto.label.queryLabels?uriPatterns=${encodeURIComponent(did)}`; }

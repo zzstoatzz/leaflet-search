@@ -11,6 +11,14 @@ operating invariant this whole pipeline encodes:
 > serving reads immutable, already-built artifacts. corpus-scale data
 > movement happens off the serving box, always.
 
+**2026-08-13 update**: snapshots are no longer the freshness mechanism — a
+live overlay (`/data/overlay.db`) carries docs newer than the adopted
+snapshot's watermark and is merged at read time, then compacted to the new
+watermark on each adoption. the invariant above is unchanged (the overlay is
+bounded and local; the snapshot stays gated + atomic); what changed is that
+adoption cadence can now stretch without costing freshness. see
+[overlay-serving.md](overlay-serving.md).
+
 ## why: the patents incident
 
 in june 2026 a single patent-mirroring bot

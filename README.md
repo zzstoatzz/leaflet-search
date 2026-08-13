@@ -11,10 +11,10 @@ search ATProto publishing platforms ([leaflet](https://leaflet.pub), [pckt](http
 ## how it works
 
 1. **ingester** (`ingester/`, our own firehose consumer) subscribes to an ATProto relay, filters to publishing collections (`pub.leaflet.*`, `site.standard.*`, `com.whtwnd.*`), cryptographically verifies each commit (signature + MST diff), and re-emits verified records over a websocket channel
-2. **backend** consumes the channel, extracts content per platform, and writes to [Turso](https://turso.tech) (source of truth); serves search with keyword (SQLite FTS5 on a local replica), semantic ([turbopuffer](https://turbopuffer.com) ANN), and hybrid modes
-3. **builder** (the same backend binary in `BUILDER_MODE`) rebuilds the keyword replica offline from Turso every hour and publishes it to R2 with a sha256 manifest — serving adopts verified snapshots instead of syncing in place, an architecture borrowed from [typeahead](https://tangled.sh/@zzstoatzz.io/typeahead) (see [docs/snapshot-pipeline.md](docs/snapshot-pipeline.md))
+2. **backend** consumes the channel, extracts content per platform, and writes to [Turso](https://turso.tech) (source of truth) plus a small live **overlay** beside the serving replica; serves search with keyword (SQLite FTS5, snapshot + overlay merged at read — fresh docs are searchable in ~a minute), semantic ([turbopuffer](https://turbopuffer.com) ANN), and hybrid modes. runs as two fly process groups (`app` serves, `worker` runs the reconciler/embedder) so background work never shares a core with search (see [docs/overlay-serving.md](docs/overlay-serving.md))
+3. **builder** (the same backend binary in `BUILDER_MODE`) rebuilds the keyword replica offline from Turso on a schedule and publishes it to R2 with a sha256 manifest — serving adopts verified snapshots instead of syncing in place, an architecture borrowed from [typeahead](https://tangled.sh/@zzstoatzz.io/typeahead) (see [docs/snapshot-pipeline.md](docs/snapshot-pipeline.md))
 4. **labeler** — pub-search is also an AT Protocol [labeler](https://atproto.com/specs/label): an autonomous classifier watches the firehose and labels accounts that generate documents from a dataset (one per record) rather than composing them; labeled accounts are excluded from search. see [pub-search.waow.tech/labels](https://pub-search.waow.tech/labels)
-5. **site** static frontend on Cloudflare Pages
+5. **site** static frontend on Cloudflare Pages; its `functions/api/[[route]].js` proxies `/api/*` to the backend with a 60s edge cache (stale-while-revalidate), so repeated queries answer at the edge
 6. **mcp** server for AI agents (Claude Code, etc.) — see [docs/agent-surfaces.md](docs/agent-surfaces.md)
 
 ## MCP server

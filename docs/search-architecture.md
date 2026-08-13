@@ -4,7 +4,16 @@ current state, rationale, and future options.
 
 ## current: SQLite FTS5
 
-keyword search uses SQLite's FTS5 on a local read replica built from Turso (the source of truth). the replica is an immutable snapshot, rebuilt hourly offline and adopted atomically after verification — see [snapshot-pipeline.md](snapshot-pipeline.md) for the pipeline, its scaling properties, and how production edits propagate.
+keyword search uses SQLite's FTS5 on a local read replica built from Turso (the source of truth). the replica is an immutable snapshot, rebuilt offline and adopted atomically after verification — see [snapshot-pipeline.md](snapshot-pipeline.md) for the pipeline, its scaling properties, and how production edits propagate.
+
+since 2026-08-13 the frozen snapshot is paired with a **live overlay**
+(`/data/overlay.db`) that carries documents newer than the adopted snapshot's
+watermark, merged at read time — so freshness is minutes, independent of
+snapshot cadence, and common-word queries run a **bounded candidate pass**
+(bm25 top-K inside the FTS index before any table probes). serving sits behind
+a CF edge cache (`/api/*`, 60s + stale-while-revalidate). see
+[overlay-serving.md](overlay-serving.md) for the full design, measurements,
+and flags.
 
 ### why FTS5 works for now
 

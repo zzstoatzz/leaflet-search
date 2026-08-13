@@ -9,7 +9,10 @@ name: Turso Stall Probe
 
 on:
   schedule:
-    - cron: '30 2 * * *' # GHA cron drifts late; start early, probe long
+    # GHA cron drifts LATE by up to ~50min (2026-08-13: a 02:30 cron fired
+    # 03:18 and missed the whole stall window). Fire a full hour early and
+    # sleep until the window opens instead.
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,6 +26,14 @@ jobs:
           TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
         run: |
           host="${TURSO_URL#libsql://}"; host="${host#https://}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "waiting for the 02:54 UTC window open (now $(date -u +%H:%M))"
+            while [ "$((10#$(date -u +%H%M)))" -lt 254 ]; do sleep 20; done
+            if [ "$((10#$(date -u +%H%M)))" -ge 320 ]; then
+              echo "MISSED WINDOW: runner started after 03:20 UTC — no data tonight"
+              exit 0
+            fi
+          fi
           echo "probing https://$host/v2/pipeline until 03:20 UTC"
           fails=0
           iters=0

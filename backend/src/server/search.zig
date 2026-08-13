@@ -944,6 +944,43 @@ fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
 const LOCAL_DOCS_FTS_SQL = localDocsFtsSql("");
 const LOCAL_DOCS_FTS_PLATFORM_SQL = localDocsFtsSql("\n    AND d2.platform = ?");
 
+/// Bounded candidate pass for unfiltered searches. The two-phase query above
+/// still probes the covering index once per FTS match, which for common words
+/// is corpus-proportional ("what" = 24.6k of 71k docs; 7.4s in prod,
+/// 2026-08-13). Phase 0 here lets FTS5 rank all matches by bm25 entirely
+/// inside its own index (posting-list scan, no per-row table probes) and
+/// keeps a generous top-K; only that bounded set gets covering-index probes for
+/// the recency + policy re-rank. Trade-off: recency can only promote docs
+/// out of the bm25 top-K, so a stale-but-fresh doc below it is missed — K is
+/// 24x the final candidate set, and docs newer than the snapshot come from
+/// the overlay regardless. Used only when author/since/platform are empty
+/// (filters must see the full match set; filtered queries keep the old shape).
+const CANDIDATE_PREFILTER_K: usize = 2000;
+
+const LOCAL_DOCS_FTS_PREFILTER_SQL =
+    \\SELECT f.uri, d.did, d.title,
+    \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(p.name, '') as publication_name,
+    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
+    \\FROM documents_fts f
+    \\JOIN documents d ON f.uri = d.uri
+    \\LEFT JOIN publications p ON d.publication_uri = p.uri
+    \\WHERE documents_fts MATCH ? AND f.uri IN (
+    \\  SELECT uri FROM (
+    \\    SELECT c.uri AS uri,
+    \\      c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
+    \\    FROM (SELECT uri, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
+++ "\n    JOIN documents d2 INDEXED BY " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON c.uri = d2.uri\n" ++
+    \\    WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
+    \\    ORDER BY score, c.uri LIMIT ?
+    \\  )
+    \\)
+    \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
+;
+
 // Tag browse (no FTS text): fully local — document_tags and recommends both
 // live in the replica. Ranked by recency with a recommendation lift: score is
 // months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
@@ -1339,8 +1376,13 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             }
         }
     } else {
-        // no platform filter
-        var rows = try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
+        // no platform filter. Unfiltered searches take the bounded candidate
+        // pass (common words otherwise probe the covering index once per
+        // match — corpus-proportional); author/since need the full match set.
+        var rows = if (author_val.len == 0 and since_val.len == 0)
+            try local.query(LOCAL_DOCS_FTS_PREFILTER_SQL, .{ fts_query, fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
+        else
+            try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
         defer rows.deinit();
 
         {
@@ -2605,12 +2647,30 @@ test "keyword doc search: candidate pass stays on the covering index" {
         try std.testing.expect(saw_cover);
     }
 
-    // end-to-end: the matching doc comes back with its snippet
+    // the bounded (prefilter) variant must also resolve its re-rank from the
+    // covering index, with the bm25 phase staying inside the FTS index
+    {
+        var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_DOCS_FTS_PREFILTER_SQL, .{ "\"atproto\"*", "\"atproto\"*", @as(usize, 2000), @as(usize, 83), @as(usize, 83) });
+        defer plan.deinit();
+        var saw_cover = false;
+        while (plan.next()) |prow| {
+            const detail = prow.text(3);
+            if (std.mem.indexOf(u8, detail, "COVERING INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX) != null) saw_cover = true;
+            try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
+        }
+        try std.testing.expect(saw_cover);
+    }
+
+    // end-to-end: the matching doc comes back with its snippet — and the
+    // unfiltered path (which routes through the prefilter SQL) agrees with it
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const out = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true });
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/2") == null);
+    // filtered path (author present) still uses the full-scan SQL and agrees
+    const out_author = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, "did:plc:a", .{ .include_undiscoverable = true, .show_labeled = true });
+    try std.testing.expect(std.mem.indexOf(u8, out_author, "at://doc/1") != null);
 }
 
 test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress" {

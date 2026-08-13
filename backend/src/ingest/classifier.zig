@@ -896,7 +896,11 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
         // 503 = no provider serving the model right now (cocore dispatch is
         // fail-fast, no server-side queue — WE are the queue). Distinct error
         // so the worker pauses instead of burning review attempts.
-        if (res.status == .service_unavailable) return error.NoCapacity;
+        // 404 = the model left cocore's roster entirely (2026-08-13:
+        // gemma-4-12B vanished and the worker hot-looped 3 failing TLS calls
+        // per author on the serving vCPU). Same treatment: pause, stay
+        // PENDING, resume when the model returns or REVIEW_MODEL changes.
+        if (res.status == .service_unavailable or res.status == .not_found) return error.NoCapacity;
         return error.CocoreApiError;
     }
     return text;

@@ -16,6 +16,15 @@ primary_region = 'ewr'
   INGESTER_PORT = '2480'
   INGESTER_RELAY_URL = 'https://relay.waow.tech'
 
+# app/worker split (plyr.fm's pattern): serving + ingest + labeler on `app`
+# (everything touching the /data volume), the noisy stateless tenants
+# (reconciler's PDS-check storms, embedder batches) on `worker` so background
+# bursts never share a vCPU with search. Keep `worker` at exactly ONE machine
+# — the embedder must be a single writer (turso DiskANN).
+[processes]
+  app = "sh -c 'PROCESS_ROLE=app exec ./pub-search'"
+  worker = "sh -c 'PROCESS_ROLE=worker exec ./pub-search'"
+
 [http_service]
   internal_port = 3000
   force_https = true
@@ -33,6 +42,7 @@ primary_region = 'ewr'
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
+  processes = ['app']
 
   [[services.ports]]
     port = 8443
@@ -41,6 +51,7 @@ primary_region = 'ewr'
 [mounts]
   source = 'leaflet_data'
   destination = '/data'
+  processes = ['app']
 
 [[vm]]
   memory = '1gb'

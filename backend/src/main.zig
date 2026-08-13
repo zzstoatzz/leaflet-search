@@ -44,6 +44,14 @@ pub fn main() !void {
         std.debug.print("logfire init failed: {}, continuing without observability\n", .{err});
     };
 
+    // Fly process-group role (plyr.fm's app/worker split; see fly.toml).
+    // `app` serves HTTP + ingest + labeler (everything touching /data);
+    // `worker` runs the noisy stateless tenants (reconciler, embedder) on
+    // their own machine so background storms can't sit on the serving vCPU
+    // (2026-08-13: a review-loop + reconcile burst made 'what' take 14s).
+    // Default `all` keeps dev and un-updated deploys byte-identical.
+    const role = processRole();
+
     // builder mode: offline snapshot build + R2 publish, then exit.
     // never starts the server, never touches /data — scaling-plan invariant
     // #1 (background data movement stays off the serving box).
@@ -90,17 +98,20 @@ pub fn main() !void {
     // available" for the whole startup window. keepalive (network) stays async.
     tpuf.init(io);
 
-    // labeler: serves com.atproto.label.* on its own port + emits bulk-generated
-    // account labels. No-op unless LABELER_DID is set, so this is safe to ship
-    // before the labeler identity is provisioned.
-    labeler.start(allocator, io);
+    if (role != .worker) {
+        // labeler: serves com.atproto.label.* on its own port + emits bulk-generated
+        // account labels. No-op unless LABELER_DID is set, so this is safe to ship
+        // before the labeler identity is provisioned.
+        labeler.start(allocator, io);
 
-    // autonomous bulk-generated classifier — fed per-document from the firehose
-    // (see ingest/ingester.zig processDocument); emits via the labeler on its own.
-    labeler_classifier.init();
+        // autonomous bulk-generated classifier — fed per-document from the firehose
+        // (see ingest/ingester.zig processDocument); emits via the labeler on its own.
+        // State (author-stats.db) lives on the serving volume, so it stays here.
+        labeler_classifier.init();
+    }
 
     // init local db and other services in background (slow)
-    const init_thread = try Thread.spawn(.{}, initServices, .{ allocator, io });
+    const init_thread = try Thread.spawn(.{}, initServices, .{ allocator, io, role });
     init_thread.detach();
 
     // thread-per-connection (Thread.Pool removed in 0.16)
@@ -124,82 +135,111 @@ pub fn main() !void {
     }
 }
 
-fn initServices(allocator: std.mem.Allocator, io: Io) void {
-    // FIRST: the search paths fail closed until the visibility set loads, so
-    // anything ordered ahead of this lands directly in the window where
-    // /search answers 503. Non-blocking — it seeds from turso (already
-    // initialized, before the listener) on its own thread.
-    visibility.start(io);
+/// Which services this process runs. `all` (no PROCESS_ROLE env) is the
+/// pre-split behavior — dev and any deploy without updated fly.toml are
+/// unchanged. `app` and `worker` partition the tenants; see fly.toml.
+const Role = enum { all, app, worker };
 
-    // run schema migrations first (idempotent, but may be slow if turso is laggy)
-    db.initSchema();
+fn processRole() Role {
+    const v = std.c.getenv("PROCESS_ROLE") orelse return .all;
+    const s = std.mem.span(v);
+    if (std.mem.eql(u8, s, "app")) return .app;
+    if (std.mem.eql(u8, s, "worker")) return .worker;
+    return .all;
+}
 
-    // hydrate the hourly request-metrics ring buffer from turso (durable across
-    // restarts + endpoint-enum resets). Runs after migrations so the table exists.
-    metrics.timing.loadFromTurso();
+fn initServices(allocator: std.mem.Allocator, io: Io, role: Role) void {
+    if (role != .worker) {
+        // FIRST: the search paths fail closed until the visibility set loads, so
+        // anything ordered ahead of this lands directly in the window where
+        // /search answers 503. Non-blocking — it seeds from turso (already
+        // initialized, before the listener) on its own thread.
+        visibility.start(io);
+    }
 
-    // init local db (slow - turso already initialized)
-    db.initLocalDb(io);
-    db.startSync(io);
+    // run schema migrations first (idempotent, but may be slow if turso is laggy).
+    // App-only: zug is checksum-serialized, but two groups racing the same
+    // migration list on every deploy is pointless — the worker assumes schema.
+    if (role != .worker) db.initSchema();
 
-    // live overlay beside the frozen snapshot (inert unless OVERLAY_WRITE=1)
-    db.initOverlay(io);
+    if (role != .worker) {
+        // hydrate the hourly request-metrics ring buffer from turso (durable across
+        // restarts + endpoint-enum resets). Runs after migrations so the table exists.
+        metrics.timing.loadFromTurso();
 
-    // Backstop for the visibility set: if turso was unreachable at boot the
-    // refresher is still unloaded, and the replica can answer instead — its
-    // publications table is complete at or below the snapshot watermark, which
-    // is enough to serve while turso recovers.
-    if (!visibility.isLoaded()) visibility.seedFromLocal();
+        // init local db (slow - turso already initialized). The worker has no
+        // volume: everything below here that touches /data is app-only.
+        db.initLocalDb(io);
+        db.startSync(io);
 
-    // one-time: feed the existing corpus through the classifier so it evaluates
-    // every already-indexed author, not just ones publishing after deploy.
-    // Background thread — the replica is open, this just reads it.
-    if (Thread.spawn(.{}, labeler_classifier.bootstrap, .{})) |t| t.detach() else |_| {}
+        // live overlay beside the frozen snapshot (inert unless OVERLAY_WRITE=1)
+        db.initOverlay(io);
 
-    // model-pass gate: background worker that confirms flagged authors are
-    // bulk-generated (reads content, asks an LLM) before the labeler emits.
-    // No-op without COCORE_API_KEY — flagged authors just queue unlabeled.
-    labeler_classifier.startReview(allocator, io);
+        // Backstop for the visibility set: if turso was unreachable at boot the
+        // refresher is still unloaded, and the replica can answer instead — its
+        // publications table is complete at or below the snapshot watermark, which
+        // is enough to serve while turso recovers.
+        if (!visibility.isLoaded()) visibility.seedFromLocal();
 
-    // snapshot promote watcher (inert unless ENABLE_SNAPSHOT_PROMOTE is set)
-    promote.start(allocator, io);
+        // one-time: feed the existing corpus through the classifier so it evaluates
+        // every already-indexed author, not just ones publishing after deploy.
+        // Background thread — the replica is open, this just reads it.
+        if (Thread.spawn(.{}, labeler_classifier.bootstrap, .{})) |t| t.detach() else |_| {}
 
-    // metrics.activity / metrics.buffer / metrics.timing are now initialized
-    // up in main() before the listener starts so request handlers can safely
-    // call record() on them.
+        // model-pass gate: background worker that confirms flagged authors are
+        // bulk-generated (reads content, asks an LLM) before the labeler emits.
+        // No-op without COCORE_API_KEY — flagged authors just queue unlabeled.
+        // Stays on app: its queue lives in author-stats.db on the volume.
+        labeler_classifier.startReview(allocator, io);
 
-    // tpuf.init() ran synchronously in main() before the accept loop (it is
-    // env-only and gates semantic search). keepalive does network I/O, so it
-    // stays here in the background.
-    tpuf.startKeepalive(allocator);
+        // snapshot promote watcher (inert unless ENABLE_SNAPSHOT_PROMOTE is set)
+        promote.start(allocator, io);
+
+        // tpuf.init() ran synchronously in main() before the accept loop (it is
+        // env-only and gates semantic search). keepalive does network I/O, so it
+        // stays here in the background.
+        tpuf.startKeepalive(allocator);
+    }
 
     // keep turso connection warm (avoids ~1s TLS handshake on first query after idle)
     db.startKeepalive();
 
-    // seed + start the background refresh for /recommended and /curators
-    // so leaderboard pages never block user requests on a remote Turso query.
-    server.initRecommendedCache(io);
-    server.initCuratorsCache(io);
-    server.initSubscribedCache(io);
-    server.initDashboardCache(io);
-    server.initTagsCache(io);
-    server.initPopularCache(io);
+    if (role != .worker) {
+        // seed + start the background refresh for /recommended and /curators
+        // so leaderboard pages never block user requests on a remote Turso query.
+        server.initRecommendedCache(io);
+        server.initCuratorsCache(io);
+        server.initSubscribedCache(io);
+        server.initDashboardCache(io);
+        server.initTagsCache(io);
+        server.initPopularCache(io);
 
-    // prune search_events older than 90 days on each boot. Bounded
-    // growth + natural privacy hygiene; the popular-searches window is
-    // only 7 days so anything older has no read consumer.
-    if (db.getClient()) |c| {
-        c.exec("DELETE FROM search_events WHERE at < strftime('%s', 'now') - 90 * 86400", &.{}) catch {};
+        // prune search_events older than 90 days on each boot. Bounded
+        // growth + natural privacy hygiene; the popular-searches window is
+        // only 7 days so anything older has no read consumer.
+        if (db.getClient()) |c| {
+            c.exec("DELETE FROM search_events WHERE at < strftime('%s', 'now') - 90 * 86400", &.{}) catch {};
+        }
     }
 
-    // start reconciler (verifies documents still exist at source PDS)
-    ingest.reconciler.start(allocator, io);
+    if (role != .app) {
+        // the noisy stateless tenants — parallel PDS checks and embedding
+        // batches — run on the worker machine so their bursts never share a
+        // vCPU with search. Both talk only to turso/voyage/tpuf, no /data.
 
-    // start embedder (voyage-4-lite, 1024 dims, 1 worker)
-    ingest.embedder.start(allocator, io);
+        // start reconciler (verifies documents still exist at source PDS)
+        ingest.reconciler.start(allocator, io);
 
-    // start ingester consumer
-    ingest.ingester.consumer(allocator, io);
+        // start embedder (voyage-4-lite, 1024 dims, 1 worker — exactly ONE
+        // process group instance runs this: turso DiskANN tolerates a single
+        // embedder writer, so the worker group must stay at one machine)
+        ingest.embedder.start(allocator, io);
+    }
+
+    if (role != .worker) {
+        // start ingester consumer (writes turso + the overlay on /data)
+        ingest.ingester.consumer(allocator, io);
+    }
 }
 
 fn setSocketTimeout(fd: std.posix.fd_t, secs: u32) !void {

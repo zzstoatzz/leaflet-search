@@ -87,7 +87,7 @@ def turso_pipeline(settings: Settings, requests: list[dict]) -> list[dict]:
 
 def enumerate_pckt_dids() -> list[str]:
     dids: set[str] = set()
-    with httpx.Client() as client:
+    with httpx.Client(headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client:
         for base in RELAY_ENDPOINTS:
             cursor: str | None = None
             while True:
@@ -206,7 +206,7 @@ def main() -> int:
     all_uris: list[str] = []
     started = time.time()
     done = 0
-    with httpx.Client(follow_redirects=True) as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with httpx.Client(follow_redirects=True, headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(pckt_publication_uris, client, did): did for did in dids}
         for fut in as_completed(futures):
             uris = fut.result()

@@ -231,7 +231,7 @@ def _enumerate_from_relay(client: httpx.Client, base: str, collection: str) -> l
 
 def enumerate_owner_dids() -> list[str]:
     all_dids: set[str] = set()
-    with httpx.Client() as client:
+    with httpx.Client(headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client:
         for collection in COLLECTIONS:
             for base in RELAY_ENDPOINTS:
                 from_relay = _enumerate_from_relay(client, base, collection)
@@ -442,7 +442,7 @@ def main() -> int:
     rows_acc: list[PubRow] = []
 
     # follow_redirects: some PDSes 301 getRepo to a canonical host.
-    with httpx.Client(follow_redirects=True) as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with httpx.Client(follow_redirects=True, headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(fetch_publications_for_did, client, did): did for did in dids}
         for fut in as_completed(futures):
             res = fut.result()

@@ -201,7 +201,7 @@ def _enumerate_from_relay(client: httpx.Client, base: str, collection: str) -> l
 
 def enumerate_subscriber_dids(collection: str) -> list[str]:
     all_dids: set[str] = set()
-    with httpx.Client() as client:
+    with httpx.Client(headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client:
         for base in RELAY_ENDPOINTS:
             from_relay = _enumerate_from_relay(client, base, collection)
             print(f"  {base}: {len(from_relay)} DIDs")
@@ -329,7 +329,7 @@ def main() -> int:
     statuses: dict[str, int] = {}
     rows_acc: list[tuple[str, str, str, str, str]] = []
 
-    with httpx.Client() as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with httpx.Client(headers={"User-Agent": "pub-search (zzstoatzz.io)"}) as client, ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(fetch_subscriptions_for_did, client, did): did for did in dids}
         for fut in as_completed(futures):
             res = fut.result()

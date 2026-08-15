@@ -18,9 +18,9 @@
     // means peak opacity is a bounded constant — wide and translucent at
     // every zoom, never accumulating into an opaque core.
     nebula: {
-      alpha: 0.22,         // peak opacity at the lantern's center
-      spread: 3.0,         // lantern radius as a multiple of the cluster's RMS spread
-      minHaloPx: 44,       // pixel floor at growRefZoom so tiny clusters still glow
+      alpha: 0.3,          // peak opacity at the lantern's center
+      spread: 3.3,         // lantern radius as a multiple of the cluster's RMS spread
+      minHaloPx: 56,       // pixel floor at growRefZoom so tiny clusters still glow
       growRefZoom: 2,      // zoom where the floor is exactly minHaloPx; grows as sqrt(zoom/this)
       maxHaloPx: 380,      // cap so no lantern swallows the screen at high zoom
       smallShrink: 0.85,   // small-viewport lantern shrink
@@ -32,7 +32,7 @@
     // centroids. Ends early — once fine cluster labels are readable, the
     // region-scale flares read as extreme rather than atmospheric.
     coarse: {
-      alphaDark: 0.12, alphaLight: 0.10, // peak opacity
+      alphaDark: 0.16, alphaLight: 0.13, // peak opacity
       outStart: 1.8, outRange: 1.0,      // fully gone by ~2.8
       smallShrink: 0.6,                  // small-viewport halo shrink
     },
@@ -43,9 +43,13 @@
       dark:  { core: [0.5, 0.72], mid: [0.45, 0.52], edge: [0.4, 0.34] },
       light: { core: [0.5, 0.5],  mid: [0.45, 0.62], edge: [0.4, 0.75] },
     },
+    // publication circle sizing: subscribers are the size signal (fetched
+    // from /subscribed), doc count only a faint fallback — a pub nobody
+    // follows stays a speck no matter how much it posts.
+    pubSize: { countWeight: 0.06, subWeight: 0.9, maxPx: 34 },
     // publication circles: progressive disclosure gates
     pubCircle: {
-      letterMinPx: 14, // letter glyph only once the circle is a real landmark
+      letterMinPx: 16, // letter glyph only once the circle is a real landmark
       nameMinPx: 10,   // name-label candidacy (drawn via the label economy)
       nameCandCap: 40, // max queued name candidates per frame
       ringAlphaBase: 0.2, ringAlphaMax: 0.4, ringAlphaPerPx: 35, // alpha = base + min(max, pr/perPx)
@@ -54,7 +58,7 @@
     // priority order: cluster labels (landmarks) first, then doc titles
     // (recommendation-ranked), then publication names with whatever's left.
     labels:    { titles: { s: 4, l: 12 }, coarse: { s: 5, l: 12 }, fine: { s: 6, l: 16 }, pubNames: { s: 3, l: 8 } },
-    avatars:   { budget: { s: 6, l: 22 }, cull: { s: 6, l: 4 }, imgThreshold: { s: 16, l: 11 } },
+    avatars:   { budget: { s: 4, l: 12 }, cull: { s: 6, l: 4 }, imgThreshold: { s: 16, l: 12 } },
     recommend: { limit: 250, boostFloor: 6 }, // popularity boost from /recommended
   };
 
@@ -140,6 +144,16 @@
   // --- publication state ---
   var pubData = null; // array from atlas.json
   var pubByBasePath = null; // Map<basePath, pub> for ?pub=<basePath> deep-links
+
+  // subscriber-weighted size score; pub.subs lands async from /subscribed
+  function pubSizeScore(pub) {
+    var t = ATLAS_TUNE.pubSize;
+    return t.countWeight * Math.sqrt(pub.count || 0) + t.subWeight * Math.sqrt(pub.subs || 0);
+  }
+
+  function pubRadius(pub, z) {
+    return Math.min(ATLAS_TUNE.pubSize.maxPx, pubSizeScore(pub) * z);
+  }
 
   // platform logos — drawn next to per-doc titles at high zoom for identity.
   // We snagged the best-available icon per platform (apple-touch-icon /
@@ -1103,9 +1117,9 @@
     }
 
     // --- publication circles ---
-    // radius = sqrt(count) * zoom * 0.35, capped at 28px
-    // at zoom 1: sqrt(236)≈15 → 5.4px (visible), sqrt(30)≈5.5 → 1.9px (culled)
-    // smaller than before — publications accent the map, not dominate it
+    // radius = pubRadius(): subscriber-driven, doc count a faint fallback.
+    // Most pubs have no subscribers and stay culled specks until deep zoom;
+    // the followed few read as real landmarks — accents, not confetti.
     var pubLabelCands = []; // deferred to the label economy below
     if (pubData && pubData.length > 0) {
       var pubLabelZoom = 3;
@@ -1119,7 +1133,7 @@
       var imgThreshold = ATLAS_TUNE.avatars.imgThreshold[avKey];
       for (var pi2 = 0; pi2 < pubData.length; pi2++) {
         var pub = pubData[pi2];
-        var pr = Math.min(28, Math.sqrt(pub.count) * zoom * 0.35);
+        var pr = pubRadius(pub, zoom);
         if (pr < pubCull) continue; // natural culling — small pubs disappear
         var psx = cx + pub.cx * scale, psy = cy + pub.cy * scale;
         // cull off-screen (with padding for labels)
@@ -1702,7 +1716,7 @@
     var z = view.zoom;
     for (var i = 0; i < pubData.length; i++) {
       var pub = pubData[i];
-      var pr = Math.min(28, Math.sqrt(pub.count) * z * 0.35);
+      var pr = pubRadius(pub, z);
       if (pr < 4) continue;
       var psx = cx + pub.cx * scale, psy = cy + pub.cy * scale;
       var dx = sx - psx, dy = sy - psy;
@@ -2135,6 +2149,30 @@
       .catch(function() {});
   }
 
+  // Layer real subscriber counts onto the publications — "following" is the
+  // size signal for publisher circles (see pubSizeScore). Best-effort: on
+  // failure everything just sizes by the faint doc-count fallback.
+  function fetchSubscriberCounts() {
+    fetch(API_URL + '/subscribed?view=publications&since=all&limit=500')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(rows) {
+        if (!rows || !rows.length || !pubByBasePath) return;
+        var bumped = 0;
+        for (var k = 0; k < rows.length; k++) {
+          var pub = rows[k].basePath && pubByBasePath.get(rows[k].basePath);
+          if (!pub) continue;
+          pub.subs = rows[k].subscriberCount || 0;
+          bumped++;
+        }
+        if (bumped > 0) {
+          // re-sort biggest-first so the avatar budget follows the new sizes
+          pubData.sort(function(a, b) { return pubSizeScore(b) - pubSizeScore(a); });
+          markDirty();
+        }
+      })
+      .catch(function() {});
+  }
+
   function loadData() {
     // start logo prefetch in parallel — they're small (<60KB total) and we
     // want them ready by the time the user zooms in far enough for titles.
@@ -2284,6 +2322,7 @@
         }
         rebuildLabelOrder();
         fetchRecommendBoost();
+        fetchSubscriberCounts();
 
         buildSpatialIndex();
         renderLegend();

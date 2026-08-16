@@ -51,7 +51,11 @@ const COLLECTIONS = [_][]const u8{
 /// by anything.
 const REWIND_US: i64 = 5_000_000;
 
-const CURSOR_PERSIST_EVERY: u64 = 200;
+/// persist the cursor at most this often. event-count gating (the first cut
+/// used every-200) left the whole session unpersisted at our volume — the
+/// 2026-08-16 wedge lost its replay position because 200 events never
+/// accumulated. one atomic rename per interval is cheap.
+const CURSOR_PERSIST_INTERVAL_NS: i96 = 2 * std.time.ns_per_s;
 
 /// our collections are quiet enough that minutes of silence are normal — a
 /// firehose-style 90s watchdog would false-trigger constantly. 15 min of
@@ -124,6 +128,37 @@ fn getHosts(allocator: Allocator) []const []const u8 {
     return list.toOwnedSlice(allocator) catch &DEFAULT_HOSTS;
 }
 
+/// hard wall-clock bound on one PDS resolution. the resolve runs on a
+/// detached thread and we poll for at most this long (verifier.zig's abandon
+/// pattern): fetchBounded's own bound is NOT trustworthy here — its
+/// io.concurrent fallback runs the request UNBOUNDED, and one hung
+/// plc.directory connection on the read loop froze ingestion permanently at
+/// the 2026-08-16 cutover. an abandoned task leaks a stuck thread until the
+/// kernel gives up on its socket; the read loop must never inherit that wait.
+const RESOLVE_DEADLINE_MS: u64 = 10_000;
+const RESOLVE_POLL_MS: u64 = 50;
+
+const TASK_RUNNING: u8 = 0;
+const TASK_DONE: u8 = 1;
+const TASK_ABANDONED: u8 = 2;
+
+const ResolveTask = struct {
+    io: Io,
+    allocator: Allocator,
+    did_buf: [512]u8 = undefined,
+    did_len: usize = 0,
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(TASK_RUNNING),
+    pds: ?[]u8 = null,
+
+    fn run(task: *ResolveTask) void {
+        task.pds = ingester.resolvePds(task.allocator, task.io, task.did_buf[0..task.did_len]) catch null;
+        if (task.state.swap(TASK_DONE, .acq_rel) == TASK_ABANDONED) {
+            if (task.pds) |p| task.allocator.free(p);
+            task.allocator.destroy(task);
+        }
+    }
+};
+
 /// cached brid.gy hosting check. keys are owned dupes; values true = bridged.
 /// only definitive resolutions are cached — a failed PLC lookup stays uncached
 /// so the next event from that DID retries.
@@ -134,11 +169,39 @@ const BridgeGate = struct {
     lookups: u64 = 0,
     bridged_dropped: u64 = 0,
 
+    /// resolve with a hard deadline; null = unresolved (timeout or failure).
+    fn resolvePdsBounded(self: *BridgeGate, did: []const u8) ?[]u8 {
+        if (did.len > 512) return null;
+        const task = self.allocator.create(ResolveTask) catch return null;
+        task.* = .{ .io = self.io, .allocator = self.allocator, .did_len = did.len };
+        @memcpy(task.did_buf[0..did.len], did);
+
+        const thread = std.Thread.spawn(.{}, ResolveTask.run, .{task}) catch {
+            self.allocator.destroy(task);
+            return null;
+        };
+        thread.detach();
+
+        var waited: u64 = 0;
+        while (task.state.load(.acquire) != TASK_DONE and waited < RESOLVE_DEADLINE_MS) {
+            self.io.sleep(Io.Duration.fromMilliseconds(RESOLVE_POLL_MS), .awake) catch {};
+            waited += RESOLVE_POLL_MS;
+        }
+        if (task.state.load(.acquire) != TASK_DONE) {
+            if (task.state.swap(TASK_ABANDONED, .acq_rel) != TASK_DONE) {
+                logfire.warn("jetstream: PDS resolve timed out for {s} after {d}ms", .{ did, RESOLVE_DEADLINE_MS });
+                return null;
+            }
+        }
+        defer self.allocator.destroy(task);
+        return task.pds;
+    }
+
     fn isBridged(self: *BridgeGate, did: []const u8) bool {
         if (self.cache.get(did)) |bridged| return bridged;
 
-        const pds = ingester.resolvePds(self.allocator, self.io, did) catch |err| {
-            logfire.warn("jetstream: PDS resolve failed for {s}: {s} — admitting (reconciler re-checks)", .{ did, @errorName(err) });
+        const pds = self.resolvePdsBounded(did) orelse {
+            logfire.warn("jetstream: PDS resolve failed for {s} — admitting (reconciler re-checks)", .{did});
             return false;
         };
         defer self.allocator.free(pds);
@@ -189,7 +252,7 @@ const Handler = struct {
     gate: *BridgeGate,
     cursor_path: [:0]const u8,
     last_time_us: i64 = 0,
-    events_since_persist: u64 = 0,
+    last_persist_ns: i96 = 0,
     // atomic: read by the staleness watchdog thread
     msg_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -253,10 +316,10 @@ const Handler = struct {
     fn advanceCursor(self: *Handler, time_us: i64) void {
         if (time_us <= self.last_time_us) return;
         self.last_time_us = time_us;
-        self.events_since_persist += 1;
-        if (self.events_since_persist >= CURSOR_PERSIST_EVERY) {
+        const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
+        if (now_ns - self.last_persist_ns >= CURSOR_PERSIST_INTERVAL_NS) {
             persistCursor(self.cursor_path, self.last_time_us);
-            self.events_since_persist = 0;
+            self.last_persist_ns = now_ns;
         }
     }
 
@@ -288,7 +351,23 @@ const Watchdog = struct {
             if (stale >= stale_limit) {
                 logfire.warn("jetstream: no events for {d}s, closing connection to force reconnect", .{stale_limit});
                 self.client.close(.{}) catch {};
-                return;
+                // closing unblocks a readLoop stuck in read(); it cannot
+                // unblock one stuck inside event processing (e.g. a hung
+                // outbound fetch). if frames still aren't flowing after the
+                // close, the loop is wedged, not idle — exit and let fly
+                // restart us into a clean process that replays from the
+                // cursor. (identity/account events bypass wantedCollections,
+                // so a healthy connection sees frames every few seconds —
+                // this can't false-trigger on quiet collections.)
+                var grace: u32 = 0;
+                while (grace < 60) : (grace += 1) {
+                    self.io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
+                    if (self.handler.msg_count.load(.monotonic) != last) return;
+                }
+                logfire.err("jetstream: read loop wedged through a socket close — exiting for a clean restart", .{});
+                // the loop is frozen, so last_time_us is stable to read here
+                if (self.handler.last_time_us > 0) persistCursor(self.handler.cursor_path, self.handler.last_time_us);
+                std.process.exit(1);
             }
         }
     }

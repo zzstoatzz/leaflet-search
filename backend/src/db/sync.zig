@@ -155,6 +155,13 @@ pub fn buildSnapshot(turso: *Client, local: *LocalDb, watermark: []const u8) !Bu
 
     try copyPaged(BUILD_POPULAR_PAGE_SQL, 1, false, insertPopularLocal, turso, conn, watermark, &counts.popular, "popular_searches");
 
+    // merge the incrementally-built FTS index into one b-tree: fewer, more
+    // contiguous posting-list pages, which is what cold reads on the serving
+    // volume pay for
+    conn.exec("INSERT INTO documents_fts (documents_fts) VALUES ('optimize')", .{}) catch |err| {
+        logfire.warn("build: fts optimize failed ({s}) — snapshot still valid", .{@errorName(err)});
+    };
+
     return counts;
 }
 
@@ -253,14 +260,16 @@ fn insertDocumentLocal(conn: zqlite.Conn, row: anytype) !void {
     // wedged everything sharing it — 2026-06-10 stats/dashboard outage).
     // INSERT OR REPLACE below assigns a FRESH rowid, so the stale FTS row must
     // be dropped by its CURRENT rowid now, before the replace. New docs (the
-    // majority) have no row and skip this entirely.
-    var old_rowid: ?i64 = null;
-    if (conn.row("SELECT rowid FROM documents WHERE uri = ?", .{row.text(0)}) catch null) |r| {
-        old_rowid = r.int(0);
-        r.deinit();
-    }
-    if (old_rowid) |rid| {
-        conn.exec("DELETE FROM documents_fts WHERE rowid = ?", .{rid}) catch {};
+    // majority) have no row and skip this entirely. documents_fts is external
+    // content (v5), so the drop is the fts5 'delete' command carrying the OLD
+    // row's indexed values — plain DELETE is an error on external content, and
+    // 'delete' with wrong values silently corrupts the index.
+    if (conn.row("SELECT rowid, title, content FROM documents WHERE uri = ?", .{row.text(0)}) catch null) |r| {
+        defer r.deinit();
+        conn.exec(
+            "INSERT INTO documents_fts (documents_fts, rowid, uri, title, content) VALUES ('delete', ?, ?, ?, ?)",
+            .{ r.int(0), row.text(0), r.text(1), r.text(2) },
+        ) catch {};
     }
 
     // insert into main table
@@ -335,16 +344,17 @@ fn insertPublicationLocal(conn: zqlite.Conn, row: anytype) !void {
 test "insertDocumentLocal keys FTS by rowid: no orphans on update, MATCH works" {
     const conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
     defer conn.close();
+    // mirrors LocalDb.createSchema v5: content last, external-content fts
     try conn.exec(
         \\CREATE TABLE documents (
-        \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+        \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT,
         \\  created_at TEXT, publication_uri TEXT, platform TEXT, source_collection TEXT,
         \\  path TEXT, base_path TEXT, has_publication INTEGER, indexed_at TEXT,
         \\  embedded_at TEXT, cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER,
-        \\  source_cid TEXT
+        \\  source_cid TEXT, content TEXT
         \\)
     , .{});
-    try conn.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+    try conn.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content, content='documents', content_rowid='rowid')", .{});
 
     // a fake turso row exposing the .text()/.int() accessors insertDocumentLocal reads
     const FakeRow = struct {

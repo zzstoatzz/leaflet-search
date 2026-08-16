@@ -904,16 +904,23 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
 }
 
 // Two-phase keyword search over document content. The inner pass ranks every
-// FTS match using only the covering index (rank + recency + policy flags) and
-// keeps the top candidate_limit uris; the outer pass re-runs the MATCH but
-// computes snippet() and reads full document rows only for rows in that set.
-// One-phase sorted the full SELECT (snippet included) for every match, which
-// tokenizes each matching document's whole body — 14s for 'atproto' on the
-// prod replica (2026-08-11). INDEXED BY is load-bearing: the planner prefers
-// the uri primary-key probe, which reads past the body for created_at.
+// FTS match (rank + recency + policy flags) and keeps the top candidate_limit
+// rowids; the outer pass re-runs the MATCH but computes snippet() and reads
+// full document rows only for rows in that set. One-phase sorted the full
+// SELECT (snippet included) for every match, which tokenizes each matching
+// document's whole body — 14s for 'atproto' on the prod replica (2026-08-11).
+//
+// All joins are on rowid: documents_fts is external-content over documents
+// (schema v5) so fts rowids ARE documents rowids, and reading f.uri from an
+// external-content table is itself a content-table probe per match. The v5
+// documents table stores `content` LAST, so the inner pass's rowid probes for
+// created_at/policy flags never read past a document body — that column-order
+// guarantee replaced the covering index (pre-v5 snapshots wrote fts rows keyed
+// to documents.rowid too, so these joins stay correct during the upgrade
+// window; they're just slower until the first v5 snapshot adopts).
 fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
     return
-    \\SELECT f.uri, d.did, d.title,
+    \\SELECT d.uri, d.did, d.title,
     \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
@@ -921,20 +928,20 @@ fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
     \\  COALESCE(p.name, '') as publication_name,
     \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
     \\FROM documents_fts f
-    \\JOIN documents d ON f.uri = d.uri
+    \\JOIN documents d ON d.rowid = f.rowid
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\WHERE documents_fts MATCH ? AND f.uri IN (
-    \\  SELECT uri FROM (
-    \\    SELECT f2.uri AS uri,
+    \\WHERE documents_fts MATCH ? AND f.rowid IN (
+    \\  SELECT rid FROM (
+    \\    SELECT f2.rowid AS rid,
     \\      f2.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
     \\    FROM documents_fts f2
-    ++ "\n    JOIN documents d2 INDEXED BY " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON f2.uri = d2.uri\n" ++
-        \\    WHERE f2.documents_fts MATCH ?
+    \\    JOIN documents d2 ON d2.rowid = f2.rowid
+    \\    WHERE f2.documents_fts MATCH ?
     ++ inner_extra_cond ++ "\n" ++
         \\    AND (? = '' OR d2.did = ?)
         \\    AND (? = '' OR d2.created_at >= ?)
         \\    AND (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
-        \\    ORDER BY score, f2.uri LIMIT ?
+        \\    ORDER BY score, f2.rowid LIMIT ?
         \\  )
         \\)
         \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
@@ -958,7 +965,7 @@ const LOCAL_DOCS_FTS_PLATFORM_SQL = localDocsFtsSql("\n    AND d2.platform = ?")
 const CANDIDATE_PREFILTER_K: usize = 2000;
 
 const LOCAL_DOCS_FTS_PREFILTER_SQL =
-    \\SELECT f.uri, d.did, d.title,
+    \\SELECT d.uri, d.did, d.title,
     \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
@@ -966,16 +973,16 @@ const LOCAL_DOCS_FTS_PREFILTER_SQL =
     \\  COALESCE(p.name, '') as publication_name,
     \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
     \\FROM documents_fts f
-    \\JOIN documents d ON f.uri = d.uri
+    \\JOIN documents d ON d.rowid = f.rowid
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\WHERE documents_fts MATCH ? AND f.uri IN (
-    \\  SELECT uri FROM (
-    \\    SELECT c.uri AS uri,
+    \\WHERE documents_fts MATCH ? AND f.rowid IN (
+    \\  SELECT rid FROM (
+    \\    SELECT c.rid AS rid,
     \\      c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
-    \\    FROM (SELECT uri, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
-++ "\n    JOIN documents d2 INDEXED BY " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON c.uri = d2.uri\n" ++
+    \\    FROM (SELECT rowid AS rid, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
+    \\    JOIN documents d2 ON d2.rowid = c.rid
     \\    WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
-    \\    ORDER BY score, c.uri LIMIT ?
+    \\    ORDER BY score, c.rid LIMIT ?
     \\  )
     \\)
     \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
@@ -1020,7 +1027,7 @@ const LOCAL_TAG_BROWSE_SQL =
 // a join let SQLite drive from the tag index and probe FTS per row, which
 // took ~8s on the real corpus (2026-08-04). The FTS index must drive.
 const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
-    \\SELECT f.uri, d.did, d.title,
+    \\SELECT d.uri, d.did, d.title,
     \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
@@ -1028,7 +1035,7 @@ const LOCAL_TAG_FTS_SQL = withLocalDocRecencyOrder(
     \\  COALESCE(p.name, '') as publication_name,
     \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
     \\FROM documents_fts f
-    \\JOIN documents d ON f.uri = d.uri
+    \\JOIN documents d ON d.rowid = f.rowid
     \\LEFT JOIN publications p ON d.publication_uri = p.uri
     \\WHERE documents_fts MATCH ?
     \\AND d.uri IN (SELECT document_uri FROM document_tags WHERE tag = ?)
@@ -2428,17 +2435,17 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
         defer w.close();
         try w.exec(
             \\CREATE TABLE documents (
-            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT,
             \\  created_at TEXT, publication_uri TEXT, platform TEXT,
             \\  path TEXT, base_path TEXT, has_publication INTEGER,
-            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER, content TEXT
             \\)
         , .{});
         try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, name TEXT)", .{});
         try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT)", .{});
         try w.exec("CREATE INDEX idx_document_tags_tag ON document_tags(tag)", .{});
         try w.exec("CREATE TABLE recommends (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, document_uri TEXT, created_at TEXT, indexed_at TEXT)", .{});
-        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content, content='documents', content_rowid='rowid')", .{});
         try w.exec("CREATE INDEX idx_recommends_document_uri ON recommends(document_uri)", .{});
 
         // 60k docs spread over ~700 days, every 80th tagged "photography" (~750)
@@ -2493,7 +2500,7 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     {
         const w = try zqlite.open(zpath.ptr, zqlite.OpenFlags.ReadWrite);
         defer w.close();
-        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        try w.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
         // mirrors LocalDb.createSchema's per-boot materialization
         try w.exec("CREATE TABLE recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER NOT NULL)", .{});
         try w.exec("INSERT INTO recommend_counts SELECT document_uri, COUNT(DISTINCT did) FROM recommends GROUP BY document_uri", .{});
@@ -2572,14 +2579,13 @@ test "local tag browse: recommend-lifted ranking, correct order at corpus scale"
     }
 }
 
-test "keyword doc search: candidate pass stays on the covering index" {
-    // Regression (2026-08-11): documents rows store the full body with
-    // created_at and policy flags AFTER content, so ranking every FTS match
-    // through the uri primary key read past every matching document's body —
-    // 14s for 'atproto' in prod. The candidate pass must resolve entirely
-    // from SEARCH_COVER_INDEX, and snippet() must only run for the top
-    // candidates. This test both prepares the INDEXED BY statement (fails if
-    // createSchema drops/renames the index) and asserts the plan.
+test "keyword doc search: candidate pass probes documents by rowid, never a scan" {
+    // Regression (2026-08-11): ranking every FTS match through the uri primary
+    // key read past every matching document's body — 14s for 'atproto' in
+    // prod. Since schema v5 the guarantee is column order (content is LAST) +
+    // rowid PK probes: the candidate pass must resolve d2 via INTEGER PRIMARY
+    // KEY seeks, snippet() must only run for the top candidates, and the
+    // planner must never fall back to a scan or automatic index.
     const zqlite = @import("zqlite");
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -2604,22 +2610,21 @@ test "keyword doc search: candidate pass stays on the covering index" {
         defer w.close();
         try w.exec(
             \\CREATE TABLE documents (
-            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT,
             \\  created_at TEXT, publication_uri TEXT, platform TEXT,
             \\  path TEXT, base_path TEXT, has_publication INTEGER,
-            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER, content TEXT
             \\)
         , .{});
         try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
-        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content, content='documents', content_rowid='rowid')", .{});
         try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
-        try w.exec("CREATE INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON documents" ++ db.LocalDb.SEARCH_COVER_INDEX_COLUMNS, .{});
         try w.exec(
             \\INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image)
             \\VALUES ('at://doc/1', 'did:plc:a', 'r1', 'atproto notes', 'a body about atproto', datetime('now', '-3 days'), 'other', '', 0, '', ''),
             \\       ('at://doc/2', 'did:plc:b', 'r2', 'unrelated', 'nothing here', datetime('now', '-1 days'), 'other', '', 0, '', '')
         , .{});
-        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        try w.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
     }
 
     var ldb = db.LocalDb.init(std.testing.allocator, tio);
@@ -2637,28 +2642,30 @@ test "keyword doc search: candidate pass stays on the covering index" {
         else
             try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "\"atproto\"*", "", "", "", "", @as(usize, 83), @as(usize, 83) });
         defer plan.deinit();
-        var saw_cover = false;
+        var saw_rowid_probe = false;
         while (plan.next()) |prow| {
             const detail = prow.text(3);
-            if (std.mem.indexOf(u8, detail, "COVERING INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX) != null) saw_cover = true;
+            if (std.mem.indexOf(u8, detail, "SEARCH d2 USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_rowid_probe = true;
             // the fat documents probe must never drive the candidate pass
             try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
+            try std.testing.expect(std.mem.indexOf(u8, detail, "SCAN d2") == null);
         }
-        try std.testing.expect(saw_cover);
+        try std.testing.expect(saw_rowid_probe);
     }
 
-    // the bounded (prefilter) variant must also resolve its re-rank from the
-    // covering index, with the bm25 phase staying inside the FTS index
+    // the bounded (prefilter) variant must also resolve its re-rank via rowid
+    // seeks, with the bm25 phase staying inside the FTS index
     {
         var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_DOCS_FTS_PREFILTER_SQL, .{ "\"atproto\"*", "\"atproto\"*", @as(usize, 2000), @as(usize, 83), @as(usize, 83) });
         defer plan.deinit();
-        var saw_cover = false;
+        var saw_rowid_probe = false;
         while (plan.next()) |prow| {
             const detail = prow.text(3);
-            if (std.mem.indexOf(u8, detail, "COVERING INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX) != null) saw_cover = true;
+            if (std.mem.indexOf(u8, detail, "SEARCH d2 USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_rowid_probe = true;
             try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
+            try std.testing.expect(std.mem.indexOf(u8, detail, "SCAN d2") == null);
         }
-        try std.testing.expect(saw_cover);
+        try std.testing.expect(saw_rowid_probe);
     }
 
     // end-to-end: the matching doc comes back with its snippet — and the
@@ -2704,23 +2711,22 @@ test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress
         defer w.close();
         try w.exec(
             \\CREATE TABLE documents (
-            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT,
             \\  created_at TEXT, publication_uri TEXT, platform TEXT,
             \\  path TEXT, base_path TEXT, has_publication INTEGER,
-            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER, content TEXT
             \\)
         , .{});
         try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
-        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content, content='documents', content_rowid='rowid')", .{});
         try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
-        try w.exec("CREATE INDEX " ++ db.LocalDb.SEARCH_COVER_INDEX ++ " ON documents" ++ db.LocalDb.SEARCH_COVER_INDEX_COLUMNS, .{});
         try w.exec(
             \\INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image)
             \\VALUES ('at://doc/old', 'did:plc:a', 'r1', 'atproto archives', 'old atproto writing', datetime('now', '-30 days'), 'other', '', 0, '', ''),
             \\       ('at://doc/shadowed', 'did:plc:b', 'r2', 'atproto draft stale', 'stale snapshot body', datetime('now', '-10 days'), 'other', '', 0, '', ''),
             \\       ('at://doc/gone', 'did:plc:c', 'r3', 'atproto deleted post', 'was deleted after the build', datetime('now', '-5 days'), 'other', '', 0, '', '')
         , .{});
-        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        try w.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
     }
 
     var ldb = db.LocalDb.init(std.testing.allocator, tio);
@@ -2806,19 +2812,19 @@ test "overlay merge: tag browse includes fresh tagged docs" {
         defer w.close();
         try w.exec(
             \\CREATE TABLE documents (
-            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT, content TEXT,
+            \\  uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, title TEXT,
             \\  created_at TEXT, publication_uri TEXT, platform TEXT,
             \\  path TEXT, base_path TEXT, has_publication INTEGER,
-            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER
+            \\  cover_image TEXT, is_bridgyfed INTEGER, url_dead INTEGER, content TEXT
             \\)
         , .{});
         try w.exec("CREATE TABLE publications (uri TEXT PRIMARY KEY, did TEXT, rkey TEXT, name TEXT, description TEXT, base_path TEXT, platform TEXT)", .{});
-        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content)", .{});
+        try w.exec("CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, title, content, content='documents', content_rowid='rowid')", .{});
         try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
         try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT, PRIMARY KEY (document_uri, tag))", .{});
         try w.exec("CREATE TABLE recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER)", .{});
         try w.exec("INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) VALUES ('at://doc/snap', 'did:plc:a', 'r1', 'snapshot zig post', 'zig writing', datetime('now', '-20 days'), 'other', '', 0, '', '')", .{});
-        try w.exec("INSERT INTO documents_fts (uri, title, content) SELECT uri, title, content FROM documents", .{});
+        try w.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
         try w.exec("INSERT INTO document_tags (document_uri, tag) VALUES ('at://doc/snap', 'zig')", .{});
     }
 

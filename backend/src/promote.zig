@@ -138,6 +138,7 @@ const SidecarInfo = struct {
     build_id_buf: [64]u8 = undefined,
     build_id_len: usize = 0,
     doc_count: u64 = 0,
+    schema_version: u32 = 0,
 
     fn buildId(self: *const SidecarInfo) []const u8 {
         return self.build_id_buf[0..self.build_id_len];
@@ -159,6 +160,7 @@ fn readSidecar(allocator: Allocator, io: Io, path: []const u8) SidecarInfo {
         info.build_id_len = id.len;
     }
     info.doc_count = parsed.value.doc_count;
+    info.schema_version = parsed.value.schema_version;
     return info;
 }
 
@@ -261,7 +263,11 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
         return error.ShrinkFloorGate;
     }
 
-    if (!adoptWindowOpen(currentUtcHour(io))) {
+    // a schema upgrade never waits for the window: the freshly deployed
+    // binary refuses old-schema builds, so until this adoption lands the
+    // serving snapshot is a schema behind the code it runs under
+    const schema_upgrade = live_info.schema_version != LocalDb.SCHEMA_VERSION;
+    if (!schema_upgrade and !adoptWindowOpen(currentUtcHour(io))) {
         logfire.info("promote: build {s} available; holding for the PROMOTE_ADOPT_UTC_HOURS window", .{m.build_id});
         return;
     }

@@ -20,13 +20,7 @@ const LocalDb = @This();
 /// an out-of-date builder image must stall freshness, not break serving.
 /// (Scheduled builder machines pin their creation image: recreate them
 /// after bumping this.)
-pub const SCHEMA_VERSION: u32 = 4; // v4: documents.source_cid for source-attested reconciliation
-
-/// Covering index for the keyword-search candidate pass; serving SQL binds to
-/// it with INDEXED BY, and createSchema (which runs on every open, including
-/// adopted snapshots) guarantees it exists before queries are served.
-pub const SEARCH_COVER_INDEX = "idx_documents_search_cover";
-pub const SEARCH_COVER_INDEX_COLUMNS = "(uri, created_at, is_bridgyfed, url_dead, platform, did)";
+pub const SCHEMA_VERSION: u32 = 5; // v5: external-content documents_fts + content-last column order (replica 816→518MB)
 
 const READ_POOL_SIZE = 12;
 
@@ -303,14 +297,18 @@ pub fn setReady(self: *LocalDb, ready: bool) void {
 fn createSchema(self: *LocalDb) !void {
     const c = self.conn orelse return error.NotOpen;
 
-    // documents table (no embedding/embedded_at — vectors are in turbopuffer)
+    // documents table (no embedding/embedded_at — vectors are in turbopuffer).
+    // `content` is deliberately the LAST column (schema v5): search's inner
+    // ranking pass probes rows by rowid for created_at/policy flags, and with
+    // the body last those probes never read a document's overflow pages (the
+    // 2026-08-11 fat-row regression; this ordering replaced the covering
+    // index). Keep any new column BEFORE content.
     c.exec(
         \\CREATE TABLE IF NOT EXISTS documents (
         \\  uri TEXT PRIMARY KEY,
         \\  did TEXT NOT NULL,
         \\  rkey TEXT NOT NULL,
         \\  title TEXT NOT NULL,
-        \\  content TEXT NOT NULL,
         \\  created_at TEXT,
         \\  publication_uri TEXT,
         \\  platform TEXT DEFAULT 'leaflet',
@@ -320,19 +318,27 @@ fn createSchema(self: *LocalDb) !void {
         \\  has_publication INTEGER DEFAULT 0,
         \\  indexed_at TEXT,
         \\  cover_image TEXT DEFAULT '',
-        \\  source_cid TEXT DEFAULT ''
+        \\  source_cid TEXT DEFAULT '',
+        \\  content TEXT NOT NULL
         \\)
     , .{}) catch |err| {
         std.debug.print("local db: failed to create documents table: {}\n", .{err});
         return err;
     };
 
-    // FTS5 index (unicode61 tokenizer to match Turso)
+    // FTS5 index (unicode61 tokenizer to match Turso). External content
+    // (schema v5): the index reads title/content from documents by rowid
+    // instead of storing a second copy of every body — 286MB of the 816MB
+    // replica was that duplicate (2026-08-16). Writers must key fts rows to
+    // documents.rowid (they already did pre-v5) and delete via the fts5
+    // 'delete' command with the OLD row values, never plain DELETE.
     c.exec(
         \\CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
         \\  uri UNINDEXED,
         \\  title,
         \\  content,
+        \\  content='documents',
+        \\  content_rowid='rowid',
         \\  tokenize='unicode61'
         \\)
     , .{}) catch |err| {
@@ -482,16 +488,10 @@ fn createSchema(self: *LocalDb) !void {
     addColumnIfMissing(c, "publications", "indexed_at", "TEXT");
     addColumnIfMissing(c, "publications", "show_in_discover", "INTEGER NOT NULL DEFAULT 1");
 
-    // Covering index for the keyword-search candidate pass. `documents` rows
-    // carry the full body with created_at and the policy flags stored AFTER
-    // content, so a plain uri-PK probe for the ranking columns reads past
-    // every document's body (overflow pages included) for every FTS match —
-    // measured 1.4s vs 34ms for 'atproto' (2.9k matches) on the prod replica
-    // (2026-08-11). Must be created after addColumnIfMissing gives older
-    // snapshots is_bridgyfed/url_dead. Serving SQL names this index via
-    // INDEXED BY (through SEARCH_COVER_INDEX), so it must exist wherever
-    // those queries run (guarded by plan test in server/search.zig).
-    c.exec("CREATE INDEX IF NOT EXISTS " ++ SEARCH_COVER_INDEX ++ " ON documents" ++ SEARCH_COVER_INDEX_COLUMNS, .{}) catch {};
+    // The pre-v5 covering index (idx_documents_search_cover) is obsolete:
+    // v5 stores `content` last, so the rowid probes the search SQL now does
+    // never read past a body. Pre-v5 snapshots may still carry the index;
+    // harmless, and it dies with them.
 
     // Materialized (did, rkey) for subscriptions so the publication join is a
     // sargable indexed equijoin instead of parsing publication_uri per row (see

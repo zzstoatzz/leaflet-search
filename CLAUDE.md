@@ -17,6 +17,7 @@
 - **overlay** (`/data/overlay.db`): live freshness beside the frozen replica — ingest projects every doc upsert/delete after the turso commit; keyword/tag serving merges snapshot + overlay (overlay wins on uri, tombstones suppress); promote compacts to the adopted `source_watermark`. Flags `OVERLAY_WRITE`/`OVERLAY_SERVE` (both `1` in fly.toml); `?overlay=0/1` per-request; `/admin/overlay/status` for verification. See docs/overlay-serving.md
 - **edge**: the frontend calls same-origin `/api/*` (Pages function `site/functions/api/[[route]].js`) — 60s edge cache + 10min stale-while-revalidate on GET /search; `?edge=0` bypasses; `/admin` never proxied; the fly hostname still serves directly (rollback path)
 - **ingester** (Zig): our own firehose consumer — verifies every commit (signature + MST diff via zat), drops bridgy/non-canonical repos, re-emits over a `/channel` websocket the backend consumes (`backend/src/ingest/ingester.zig`)
+- **jetstream ingest**: `INGEST_SOURCE=jetstream` swaps the /channel consumer for `backend/src/ingest/jetstream.zig` (stream.waow.tech + hosted Jetstream V2 fallbacks; all verify sig+MST at their own ingest) — see docs/jetstream-cutover.md
 - **site**: static frontend on Cloudflare Pages
 - **db**: Turso (source of truth) + local SQLite read replica (FTS queries; FROZEN by construction — in-place sync deleted 2026-06-26 — refreshed only by snapshot adoption, see docs/scaling-plan.md)
 - **R2**: `leaflet-search-index` bucket for builder snapshots (`INDEX_R2_*` secrets on the backend app)

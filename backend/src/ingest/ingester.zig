@@ -326,7 +326,7 @@ fn connect(allocator: Allocator, io: Io) !void {
 }
 
 /// ingester record envelope - extracted via zat.json.extractAt
-const IngesterRecord = struct {
+pub const IngesterRecord = struct {
     collection: []const u8,
     action: []const u8, // "create", "update", "delete"
     did: []const u8,
@@ -372,15 +372,23 @@ fn processMessage(allocator: Allocator, io: Io, payload: []const u8) !void {
         return;
     };
 
+    const inner_record = zat.json.getObject(parsed.value, "record.record");
+    dispatchRecord(allocator, io, rec, inner_record);
+}
+
+/// Shared record dispatch: both wire protocols (/channel frames and jetstream
+/// events) normalize into an IngesterRecord + optional inner record value and
+/// land here, so the two ingest sources index identically by construction.
+pub fn dispatchRecord(allocator: Allocator, io: Io, rec: IngesterRecord, inner: ?json.ObjectMap) void {
     // validate DID
     const did = zat.Did.parse(rec.did) orelse {
         logfire.span("ingest.dropped", .{ .reason = "invalid_did", .collection = rec.collection }).end();
         return;
     };
 
-    // note: bridgy fed content is no longer filtered — the indexer's HTTP site URL
-    // fallback resolves base_path from the publication's "site" field, so we can
-    // build working links for bridged standard.site documents.
+    // note: bridgy fed content from the /channel path is dropped upstream by
+    // the ingester's verifier; the jetstream path enforces the same policy in
+    // jetstream.zig before dispatch.
 
     // build AT-URI string (no allocation - uses stack buffer)
     var uri_buf: [256]u8 = undefined;
@@ -394,7 +402,7 @@ fn processMessage(allocator: Allocator, io: Io, payload: []const u8) !void {
     defer span.end();
 
     if (rec.isCreate() or rec.isUpdate()) {
-        const inner_record = zat.json.getObject(parsed.value, "record.record") orelse {
+        const inner_record = inner orelse {
             logfire.span("ingest.dropped", .{ .reason = "no_inner_record", .collection = rec.collection, .uri = uri }).end();
             return;
         };
@@ -960,7 +968,7 @@ fn listRecords(
 }
 
 /// Resolve a DID to its PDS endpoint via plc.directory. Caller owns the result.
-fn resolvePds(allocator: Allocator, io: Io, did: []const u8) ![]u8 {
+pub fn resolvePds(allocator: Allocator, io: Io, did: []const u8) ![]u8 {
     var url_buf: [256]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "https://plc.directory/{s}", .{did}) catch return error.UrlTooLong;
 
@@ -997,7 +1005,7 @@ fn resolvePds(allocator: Allocator, io: Io, did: []const u8) ![]u8 {
 }
 
 /// Host-match a PDS endpoint against brid.gy (mirrors ingester/src/verifier.zig).
-fn isBridgyPds(endpoint: []const u8) bool {
+pub fn isBridgyPds(endpoint: []const u8) bool {
     var host = endpoint;
     if (mem.indexOf(u8, host, "://")) |i| host = host[i + 3 ..];
     if (mem.indexOfScalar(u8, host, '/')) |i| host = host[0..i];

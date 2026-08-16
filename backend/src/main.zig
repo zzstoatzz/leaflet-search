@@ -237,8 +237,16 @@ fn initServices(allocator: std.mem.Allocator, io: Io, role: Role) void {
     }
 
     if (role != .worker) {
-        // start ingester consumer (writes turso + the overlay on /data)
-        ingest.ingester.consumer(allocator, io);
+        // start the live-ingest consumer (writes turso + the overlay on /data).
+        // INGEST_SOURCE=jetstream consumes a verified Jetstream V2 instance
+        // directly (ingest/jetstream.zig); default is the fly-app /channel
+        // path, kept as the rollback until the jetstream cutover soaks clean.
+        const source = if (std.c.getenv("INGEST_SOURCE")) |p| std.mem.span(p) else "channel";
+        if (std.mem.eql(u8, source, "jetstream")) {
+            ingest.jetstream.consumer(allocator, io);
+        } else {
+            ingest.ingester.consumer(allocator, io);
+        }
     }
 }
 
@@ -263,6 +271,7 @@ test {
     _ = @import("ingest/extractor.zig");
     _ = @import("ingest/reconciler.zig");
     _ = @import("ingest/ingester.zig");
+    _ = @import("ingest/jetstream.zig");
     _ = @import("server/search.zig");
     _ = @import("server/documents.zig");
     _ = @import("server.zig");

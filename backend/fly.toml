@@ -8,6 +8,10 @@ primary_region = 'ewr'
   # serving merges live-overlay hits (OVERLAY_SERVE — Stage 3, flipped
   # 2026-08-13 after 4 clean compaction cycles + A/B parity + the positive
   # freshness case). ?overlay=0 remains the per-request escape hatch.
+  # Jetstream cutover (docs/jetstream-cutover.md): live ingest consumes
+  # stream.waow.tech directly; rollback = remove this line (reverts to the
+  # leaflet-search-ingester /channel path).
+  INGEST_SOURCE = 'jetstream'
   OVERLAY_WRITE = '1'
   OVERLAY_SERVE = '1'
   ENABLE_SNAPSHOT_PROMOTE = '1'

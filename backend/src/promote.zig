@@ -22,6 +22,7 @@
 //! watcher, even if someone uploads it to the wrong key.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const zqlite = @import("zqlite");
@@ -174,6 +175,32 @@ fn passesShrinkFloor(candidate_docs: u64, live_docs: u64) bool {
     return candidate_docs >= live_docs / 2;
 }
 
+/// Adoption window: PROMOTE_ADOPT_UTC_HOURS ("8" or "8,9") restricts adoption
+/// of NEW builds to those UTC hours. Every adoption starts serving from a file
+/// with zero warm pages — on the 1GB app machine that meant a 10s+ cold
+/// common-word search after every 2h build (2026-08-16). The overlay carries
+/// live freshness between adoptions, so once a day off-peak is enough. Unset
+/// or empty = adopt on discovery (dev, boot, and pre-window behavior).
+fn adoptWindowOpen(hour_utc: u64) bool {
+    return hoursListContains(getenv("PROMOTE_ADOPT_UTC_HOURS"), hour_utc);
+}
+
+fn hoursListContains(raw_opt: ?[]const u8, hour_utc: u64) bool {
+    const raw = raw_opt orelse return true;
+    if (raw.len == 0) return true;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |tok| {
+        const h = std.fmt.parseInt(u64, std.mem.trim(u8, tok, " "), 10) catch continue;
+        if (h == hour_utc) return true;
+    }
+    return false;
+}
+
+fn currentUtcHour(io: Io) u64 {
+    const secs: u64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+    return (secs / 3600) % 24;
+}
+
 fn checkOnce(allocator: Allocator, io: Io) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -234,6 +261,11 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
         return error.ShrinkFloorGate;
     }
 
+    if (!adoptWindowOpen(currentUtcHour(io))) {
+        logfire.info("promote: build {s} available; holding for the PROMOTE_ADOPT_UTC_HOURS window", .{m.build_id});
+        return;
+    }
+
     logfire.info("promote: new build {s} on {s} channel ({d} docs, watermark {s})", .{
         m.build_id, channel, m.doc_count, m.source_watermark,
     });
@@ -288,6 +320,13 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
     };
     logfire.info("promote: adopted build {s} in-process", .{m.build_id});
 
+    // cache hygiene: the rollback copy (.prev) must not compete with the
+    // serving file for page cache, and the serving file must be warm BEFORE
+    // the first real search — a cold common-word FTS query reads thousands of
+    // scattered pages from the volume (measured 14s vs 0.2s warm, 2026-08-16)
+    dropPrevFromCache(arena, io, live);
+    warmFile(io, live);
+
     // adopt-then-compact (crash-safe order): everything at or below the new
     // snapshot's watermark is now baked into the serving file, so the overlay
     // can drop it. A crash before this leaves shadowed-but-correct overlay
@@ -299,6 +338,41 @@ fn checkOnce(allocator: Allocator, io: Io) !void {
         const s = o.stats();
         logfire.info("promote: overlay compacted to watermark {s}; {d} rows remain", .{ m.source_watermark, s.rows });
     }
+}
+
+/// Boot-time warm of the live replica, in a background thread so readiness
+/// isn't delayed. Same rationale as the post-adoption warmFile call.
+pub fn startBootWarm(io: Io) void {
+    const thread = std.Thread.spawn(.{}, warmFile, .{ io, localDbPath() }) catch return;
+    thread.detach();
+}
+
+/// Evict the rollback copy from the page cache. Best-effort and linux-only:
+/// the file stays on disk for `mv .prev .new` rollback, it just stops
+/// squatting on RAM the serving snapshot needs.
+fn dropPrevFromCache(arena: Allocator, io: Io, live: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+    const prev_path = std.fmt.allocPrint(arena, "{s}.prev", .{live}) catch return;
+    const file = Io.Dir.openFileAbsolute(io, prev_path, .{}) catch return;
+    defer file.close(io);
+    _ = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+}
+
+/// Touch every page of the freshly adopted snapshot so the first real search
+/// hits RAM instead of paying per-page volume reads.
+fn warmFile(io: Io, path: []const u8) void {
+    const started_ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    const file = Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer file.close(io);
+    var buf: [256 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = file.readStreaming(io, &.{&buf}) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const elapsed_ms = @divFloor(Io.Timestamp.now(io, .awake).nanoseconds - started_ns, std.time.ns_per_ms);
+    logfire.info("promote: warmed {d}MB of snapshot pages in {d}ms", .{ total >> 20, elapsed_ms });
 }
 
 /// Cap for the snapshot pull (rclone --bwlimit units). Default trades a
@@ -445,6 +519,16 @@ test "shrink floor: refuses <50% of serving count, tolerates growth and empty li
     try std.testing.expect(!passesShrinkFloor(29_999, 60_000)); // below half: refused
     try std.testing.expect(!passesShrinkFloor(0, 60_000)); // empty candidate: refused
     try std.testing.expect(passesShrinkFloor(10, 0)); // no live sidecar: allowed
+}
+
+test "adoption window: unset/empty always open, hours list gates by UTC hour" {
+    try std.testing.expect(hoursListContains(null, 0)); // unset: pre-window behavior
+    try std.testing.expect(hoursListContains("", 13)); // empty: same
+    try std.testing.expect(hoursListContains("8", 8));
+    try std.testing.expect(!hoursListContains("8", 9));
+    try std.testing.expect(hoursListContains("8, 9", 9)); // spaces tolerated
+    try std.testing.expect(!hoursListContains("garbage", 4)); // unparseable tokens skipped
+    try std.testing.expect(hoursListContains("garbage,4", 4));
 }
 
 test "latestKeyForChannel maps channels to pointer keys" {

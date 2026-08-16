@@ -16,6 +16,9 @@ primary_region = 'ewr'
   OVERLAY_SERVE = '1'
   ENABLE_SNAPSHOT_PROMOTE = '1'
   PROMOTE_CHANNEL = 'prod'
+  # adopt once a day off-peak (08:00 UTC = 4am ET): every adoption cold-starts
+  # the page cache, and the overlay carries freshness between adoptions
+  PROMOTE_ADOPT_UTC_HOURS = '8'
   INGESTER_HOST = 'leaflet-search-ingester.internal'
   INGESTER_PORT = '2480'
   INGESTER_RELAY_URL = 'https://relay.waow.tech'

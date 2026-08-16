@@ -195,6 +195,12 @@ fn initServices(allocator: std.mem.Allocator, io: Io, role: Role) void {
         // snapshot promote watcher (inert unless ENABLE_SNAPSHOT_PROMOTE is set)
         promote.start(allocator, io);
 
+        // warm the replica's pages in the background — a deploy boot serves
+        // from a file the page cache has never seen, and a cold common-word
+        // FTS query reads thousands of scattered volume pages (14s vs 0.2s
+        // warm, 2026-08-16). Serving proceeds during the warm, just slower.
+        promote.startBootWarm(io);
+
         // tpuf.init() ran synchronously in main() before the accept loop (it is
         // env-only and gates semantic search). keepalive does network I/O, so it
         // stays here in the background.

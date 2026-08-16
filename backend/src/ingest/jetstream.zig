@@ -1,20 +1,27 @@
 //! Jetstream V2 live-ingest consumer — the /channel replacement.
 //!
-//! Subscribes to a Jetstream instance (stream.waow.tech primary; Bluesky's
-//! hosted V2 instances as failover — every host in the list runs Sync 1.1
-//! signature/MST verification at its own ingest, so records arriving here are
-//! operator-verified even though the blocks needed to re-check are not on the
-//! wire) and normalizes each commit event into the same dispatchRecord path
-//! the /channel consumer uses, so both sources index identically.
+//! Transport is zat.JetstreamClient (host rotation, typed event parsing,
+//! reconnect backoff, 10s cursor rewind on host switch, TCP keepalive); this
+//! file owns only the pub-search concerns: which hosts we trust, durable
+//! cursor persistence, corpus policy (banned DIDs, bridgy fed), dispatch into
+//! the same path the /channel consumer uses, and wedge escalation.
 //!
-//! at-least-once contract: events are processed synchronously on the read
-//! loop and the durable cursor (time_us) is persisted only after dispatch
-//! returns, then rewound REWIND_US on every reconnect. Slow turso propagates
-//! as websocket backpressure; if the server drops us as a slow consumer we
-//! re-dial and replay from the cursor. No ack protocol, no outbox, no
-//! shedding — redelivery + idempotent upserts replace all three.
+//! Hosts: stream.waow.tech primary, Bluesky's hosted V2 instances as
+//! failover. Every host in the list runs Sync 1.1 signature/MST verification
+//! at its own ingest, so records arriving here are operator-verified even
+//! though the blocks needed to re-check are not on the wire. Jetstream v1
+//! instances do NOT verify — never add one (which is also why we override
+//! zat's default host list).
 //!
-//! policy parity with the fly-app ingester it replaces:
+//! at-least-once contract: events are processed synchronously in onEvent and
+//! the durable cursor (time_us) is persisted only after dispatch returns
+//! (2s time gate), then rewound REWIND_US on process start. Slow turso
+//! propagates as websocket backpressure; if a server drops us as a slow
+//! consumer, zat re-dials and resumes from its in-memory cursor. No ack
+//! protocol, no outbox, no shedding — redelivery + idempotent upserts
+//! replace all three.
+//!
+//! policy parity with the fly-app ingester this replaces:
 //!   - banned DIDs dropped via policy.isBanned (was the ingester's reader)
 //!   - bridgy fed dropped via a cached DID→PDS check (was verifier.zig's
 //!     bridged verdict); resolution failure admits the event — bridgy repos
@@ -26,7 +33,6 @@ const mem = std.mem;
 const json = std.json;
 const Allocator = mem.Allocator;
 const Io = std.Io;
-const websocket = @import("websocket");
 const zat = @import("zat");
 const logfire = @import("logfire");
 const ingester = @import("ingester.zig");
@@ -46,9 +52,17 @@ const COLLECTIONS = [_][]const u8{
     "com.whtwnd.blog.entry",
 };
 
-/// rewind applied to the persisted cursor on every (re)connect: redelivered
+/// Verified-V2-only. Overrides zat's default host list, which includes v1 and
+/// third-party instances we don't trust to have verified.
+const DEFAULT_HOSTS = [_][]const u8{
+    "stream.waow.tech",
+    "jetstream2.us-east.bsky.network",
+    "jetstream2.us-west.bsky.network",
+};
+
+/// rewind applied to the persisted cursor on process start: redelivered
 /// events are absorbed by idempotent upserts, missed events are not absorbed
-/// by anything.
+/// by anything. (In-process reconnects use zat's cursor handling.)
 const REWIND_US: i64 = 5_000_000;
 
 /// persist the cursor at most this often. event-count gating (the first cut
@@ -57,10 +71,11 @@ const REWIND_US: i64 = 5_000_000;
 /// accumulated. one atomic rename per interval is cheap.
 const CURSOR_PERSIST_INTERVAL_NS: i96 = 2 * std.time.ns_per_s;
 
-/// our collections are quiet enough that minutes of silence are normal — a
-/// firehose-style 90s watchdog would false-trigger constantly. 15 min of
-/// nothing (jetstream emits nothing when filters match nothing) still bounds
-/// a half-open socket to one rewind's worth of extra replay.
+/// wedge escalation threshold. identity/account events bypass
+/// wantedCollections, so a healthy connection sees frames every few seconds
+/// — minutes of true silence means the read loop is stuck (a hung outbound
+/// fetch inside processing) or every host is unreachable; either way a clean
+/// restart that replays from the cursor is the recovery.
 const STALE_SECONDS_DEFAULT: u32 = 900;
 
 /// bridged-DID cache bound; evict-one on overflow, never clear-all
@@ -107,12 +122,6 @@ fn persistCursor(path: [:0]const u8, time_us: i64) void {
     _ = std.c.rename(tmp.ptr, path.ptr);
 }
 
-const DEFAULT_HOSTS = [_][]const u8{
-    "stream.waow.tech",
-    "jetstream2.us-east.bsky.network",
-    "jetstream2.us-west.bsky.network",
-};
-
 /// Hosts to rotate through on reconnect, from JETSTREAM_HOSTS (comma-separated)
 /// or the default list. Leaks its allocation once at startup — process-lifetime.
 fn getHosts(allocator: Allocator) []const []const u8 {
@@ -132,8 +141,8 @@ fn getHosts(allocator: Allocator) []const []const u8 {
 /// detached thread and we poll for at most this long (verifier.zig's abandon
 /// pattern): fetchBounded's own bound is NOT trustworthy here — its
 /// io.concurrent fallback runs the request UNBOUNDED, and one hung
-/// plc.directory connection on the read loop froze ingestion permanently at
-/// the 2026-08-16 cutover. an abandoned task leaks a stuck thread until the
+/// plc.directory connection on the read loop froze ingestion at the
+/// 2026-08-16 cutover. an abandoned task leaks a stuck thread until the
 /// kernel gives up on its socket; the read loop must never inherit that wait.
 const RESOLVE_DEADLINE_MS: u64 = 10_000;
 const RESOLVE_POLL_MS: u64 = 50;
@@ -222,31 +231,8 @@ const BridgeGate = struct {
     }
 };
 
-pub fn consumer(allocator: Allocator, io: Io) void {
-    const hosts = getHosts(allocator);
-    var gate = BridgeGate{ .allocator = allocator, .io = io };
-    var backoff: u64 = 1;
-    const max_backoff: u64 = 30;
-    var host_idx: usize = 0;
-
-    logfire.info("jetstream: consumer starting, {d} host(s), primary={s}, cursor_path={s}", .{ hosts.len, hosts[0], cursorPath() });
-
-    while (true) {
-        const host = hosts[host_idx];
-        if (connect(allocator, io, host, &gate)) |_| {
-            backoff = 1;
-            host_idx = 0; // clean close: go back to the primary
-            logfire.info("jetstream: connection closed, reconnecting", .{});
-        } else |err| {
-            logfire.warn("jetstream: {s} error: {}, next host in {d}s", .{ host, err, backoff });
-            host_idx = (host_idx + 1) % hosts.len;
-            io.sleep(Io.Duration.fromSeconds(@intCast(backoff)), .awake) catch {};
-            backoff = @min(backoff * 2, max_backoff);
-        }
-    }
-}
-
-const Handler = struct {
+/// zat.JetstreamClient handler: policy gates + dispatch + cursor persistence.
+const EventHandler = struct {
     allocator: Allocator,
     io: Io,
     gate: *BridgeGate,
@@ -254,66 +240,58 @@ const Handler = struct {
     last_time_us: i64 = 0,
     last_persist_ns: i96 = 0,
     // atomic: read by the staleness watchdog thread
-    msg_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    event_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    pub fn serverMessage(self: *Handler, data: []const u8) !void {
-        const count = self.msg_count.fetchAdd(1, .monotonic) + 1;
+    pub fn onConnect(_: *EventHandler, host: []const u8) void {
+        logfire.info("jetstream: connected to {s}", .{host});
+    }
+
+    pub fn onError(_: *EventHandler, err: anyerror) void {
+        logfire.warn("jetstream: connection error: {s}, zat reconnecting", .{@errorName(err)});
+    }
+
+    pub fn onEvent(self: *EventHandler, event: zat.JetstreamEvent) void {
+        const count = self.event_count.fetchAdd(1, .monotonic) + 1;
         if (count % 1000 == 0) {
             logfire.info("jetstream: recv {d}, cursor {d}, pds lookups {d}, bridged dropped {d}", .{
                 count, self.last_time_us, self.gate.lookups, self.gate.bridged_dropped,
             });
         }
-        self.processEvent(data) catch |err| {
-            logfire.err("jetstream: event processing error: {}", .{err});
-            // cursor does NOT advance past a failed event; the reconnect
-            // rewind re-delivers it.
-            return;
+        defer self.advanceCursor(event.timeUs());
+
+        const commit = switch (event) {
+            .commit => |c| c,
+            // identity/account: nothing to evict without a key cache
+            else => return,
         };
-    }
 
-    fn processEvent(self: *Handler, data: []const u8) !void {
-        const parsed = json.parseFromSlice(json.Value, self.allocator, data, .{}) catch {
-            logfire.err("jetstream: JSON parse failed, first 100 bytes: {s}", .{data[0..@min(data.len, 100)]});
-            return;
-        };
-        defer parsed.deinit();
-
-        const time_us = zat.json.getInt(parsed.value, "time_us") orelse return;
-        defer self.advanceCursor(time_us);
-
-        const kind = zat.json.getString(parsed.value, "kind") orelse return;
-        if (!mem.eql(u8, kind, "commit")) return; // identity/account: nothing to evict without a key cache
-
-        const did = zat.json.getString(parsed.value, "did") orelse return;
-        const operation = zat.json.getString(parsed.value, "commit.operation") orelse return;
-        const collection = zat.json.getString(parsed.value, "commit.collection") orelse return;
-        const rkey = zat.json.getString(parsed.value, "commit.rkey") orelse return;
-
-        if (policy.isBanned(did)) {
-            logfire.span("ingest.dropped", .{ .reason = "banned_did", .collection = collection }).end();
+        if (policy.isBanned(commit.did)) {
+            logfire.span("ingest.dropped", .{ .reason = "banned_did", .collection = commit.collection }).end();
             return;
         }
         // upserts only: deleting a bridged repo's leftovers is harmless, and
         // deletes shouldn't cost a PLC roundtrip
-        const is_delete = mem.eql(u8, operation, "delete");
-        if (!is_delete and self.gate.isBridged(did)) {
+        if (commit.operation != .delete and self.gate.isBridged(commit.did)) {
             self.gate.bridged_dropped += 1;
-            logfire.span("ingest.dropped", .{ .reason = "bridged_repo", .collection = collection }).end();
+            logfire.span("ingest.dropped", .{ .reason = "bridged_repo", .collection = commit.collection }).end();
             return;
         }
 
         const rec = ingester.IngesterRecord{
-            .collection = collection,
-            .action = operation, // jetstream operations are create/update/delete — same vocabulary
-            .did = did,
-            .rkey = rkey,
-            .cid = zat.json.getString(parsed.value, "commit.cid"),
+            .collection = commit.collection,
+            .action = @tagName(commit.operation), // same vocabulary: create/update/delete
+            .did = commit.did,
+            .rkey = commit.rkey,
+            .cid = commit.cid,
         };
-        const inner = zat.json.getObject(parsed.value, "commit.record");
+        const inner: ?json.ObjectMap = if (commit.record) |r| switch (r) {
+            .object => |o| o,
+            else => null,
+        } else null;
         ingester.dispatchRecord(self.allocator, self.io, rec, inner);
     }
 
-    fn advanceCursor(self: *Handler, time_us: i64) void {
+    fn advanceCursor(self: *EventHandler, time_us: i64) void {
         if (time_us <= self.last_time_us) return;
         self.last_time_us = time_us;
         const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
@@ -322,26 +300,26 @@ const Handler = struct {
             self.last_persist_ns = now_ns;
         }
     }
-
-    pub fn close(self: *Handler) void {
-        // flush the cursor so a clean shutdown doesn't replay a whole batch
-        if (self.last_time_us > 0) persistCursor(self.cursor_path, self.last_time_us);
-    }
 };
 
+/// zat's subscribe loop already re-dials half-open sockets (TCP keepalive)
+/// and rotates hosts; what it cannot recover is a read loop wedged INSIDE
+/// event processing (e.g. a hung outbound fetch — the 2026-08-16 stall).
+/// Frames flow every few seconds when healthy (identity/account events
+/// bypass wantedCollections), so prolonged silence = wedged or fully
+/// partitioned: persist the cursor and exit for a clean restart that
+/// replays the gap.
 const Watchdog = struct {
     io: Io,
-    client: *websocket.Client,
-    handler: *Handler,
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    handler: *EventHandler,
 
     fn run(self: *Watchdog) void {
         const stale_limit = staleSeconds();
         var last: usize = 0;
         var stale: u32 = 0;
-        while (!self.stop.load(.acquire)) {
+        while (true) {
             self.io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
-            const n = self.handler.msg_count.load(.monotonic);
+            const n = self.handler.event_count.load(.monotonic);
             if (n != last) {
                 last = n;
                 stale = 0;
@@ -349,22 +327,7 @@ const Watchdog = struct {
             }
             stale += 1;
             if (stale >= stale_limit) {
-                logfire.warn("jetstream: no events for {d}s, closing connection to force reconnect", .{stale_limit});
-                self.client.close(.{}) catch {};
-                // closing unblocks a readLoop stuck in read(); it cannot
-                // unblock one stuck inside event processing (e.g. a hung
-                // outbound fetch). if frames still aren't flowing after the
-                // close, the loop is wedged, not idle — exit and let fly
-                // restart us into a clean process that replays from the
-                // cursor. (identity/account events bypass wantedCollections,
-                // so a healthy connection sees frames every few seconds —
-                // this can't false-trigger on quiet collections.)
-                var grace: u32 = 0;
-                while (grace < 60) : (grace += 1) {
-                    self.io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
-                    if (self.handler.msg_count.load(.monotonic) != last) return;
-                }
-                logfire.err("jetstream: read loop wedged through a socket close — exiting for a clean restart", .{});
+                logfire.err("jetstream: no events for {d}s — exiting for a clean restart", .{stale_limit});
                 // the loop is frozen, so last_time_us is stable to read here
                 if (self.handler.last_time_us > 0) persistCursor(self.handler.cursor_path, self.handler.last_time_us);
                 std.process.exit(1);
@@ -373,94 +336,77 @@ const Watchdog = struct {
     }
 };
 
-fn connect(allocator: Allocator, io: Io, host: []const u8, gate: *BridgeGate) !void {
+pub fn consumer(allocator: Allocator, io: Io) void {
+    const hosts = getHosts(allocator);
     const path = cursorPath();
 
-    var path_buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&path_buf);
-    w.writeAll("/subscribe") catch return error.PathTooLong;
-    var sep: u8 = '?';
-    inline for (COLLECTIONS) |c| {
-        w.print("{c}wantedCollections={s}", .{ sep, c }) catch return error.PathTooLong;
-        sep = '&';
-    }
     // no cursor file yet (first cutover boot): seed from wall clock minus a
     // minute so the deploy window between the old consumer stopping and this
     // one connecting is replayed instead of skipped (time_us is the stream's
     // witness clock, ~wall time).
     const now_us: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_us));
     const persisted = readCursor(path) orelse now_us - 60 * std.time.us_per_s;
-    w.print("&cursor={d}", .{persisted - REWIND_US}) catch return error.PathTooLong;
-    const subscribe_path = w.buffered();
+    const start_cursor = persisted - REWIND_US;
 
-    logfire.info("jetstream: connecting to wss://{s}{s}", .{ host, subscribe_path });
+    logfire.info("jetstream: consumer starting, {d} host(s), primary={s}, cursor={d} ({s})", .{
+        hosts.len, hosts[0], start_cursor, path,
+    });
 
-    var client = websocket.Client.init(io, allocator, .{
-        .host = host,
-        .port = 443,
-        .tls = true,
-        .max_size = 5 * 1024 * 1024,
-    }) catch |err| {
-        logfire.err("jetstream: websocket client init failed: {}", .{err});
-        return err;
-    };
-    defer client.deinit();
+    var gate = BridgeGate{ .allocator = allocator, .io = io };
+    var handler = EventHandler{ .allocator = allocator, .io = io, .gate = &gate, .cursor_path = path };
 
-    var host_header_buf: [256]u8 = undefined;
-    const host_header = std.fmt.bufPrint(&host_header_buf, "Host: {s}\r\n", .{host}) catch return error.PathTooLong;
-
-    client.handshake(subscribe_path, .{ .headers = host_header }) catch |err| {
-        logfire.err("jetstream: handshake with {s} failed: {}", .{ host, err });
-        return err;
-    };
-
-    logfire.info("jetstream: connected to {s}", .{host});
-
-    var handler = Handler{ .allocator = allocator, .io = io, .gate = gate, .cursor_path = path };
-
-    var watchdog = Watchdog{ .io = io, .client = &client, .handler = &handler };
-    const wd_thread = std.Thread.spawn(.{}, Watchdog.run, .{&watchdog}) catch |err| {
+    var watchdog = Watchdog{ .io = io, .handler = &handler };
+    if (std.Thread.spawn(.{}, Watchdog.run, .{&watchdog})) |t| t.detach() else |err| {
         logfire.err("jetstream: failed to spawn watchdog: {}", .{err});
-        return err;
-    };
-    defer {
-        watchdog.stop.store(true, .release);
-        wd_thread.join();
     }
 
-    client.readLoop(&handler) catch |err| {
-        logfire.err("jetstream: read loop error: {}", .{err});
-        return err;
+    var client = zat.JetstreamClient.init(io, allocator, .{
+        .hosts = hosts,
+        .wanted_collections = &COLLECTIONS,
+        .cursor = start_cursor,
+        .max_message_size = 5 * 1024 * 1024,
+    });
+    defer client.deinit();
+
+    // blocks forever: zat owns reconnect backoff + host rotation
+    client.subscribe(&handler) catch |err| {
+        logfire.err("jetstream: subscribe loop ended: {} — exiting for restart", .{err});
+        if (handler.last_time_us > 0) persistCursor(path, handler.last_time_us);
+        std.process.exit(1);
     };
 }
 
-test "jetstream commit event maps onto the shared record envelope" {
+test "zat jetstream event maps onto the shared record envelope" {
     const allocator = std.testing.allocator;
-    const event =
+    const event_json =
         \\{"did":"did:plc:abc123","time_us":1755230000000000,"kind":"commit","commit":{"rev":"3m","operation":"create","collection":"site.standard.document","rkey":"3mn3z7u7jgsgl","record":{"$type":"site.standard.document","title":"hi"},"cid":"bafyabc"}}
     ;
-    var parsed = try json.parseFromSlice(json.Value, allocator, event, .{});
-    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const event = try zat.jetstream.parseEvent(arena.allocator(), event_json);
 
-    try std.testing.expectEqualStrings("commit", zat.json.getString(parsed.value, "kind").?);
-    try std.testing.expectEqualStrings("create", zat.json.getString(parsed.value, "commit.operation").?);
-    try std.testing.expectEqualStrings("site.standard.document", zat.json.getString(parsed.value, "commit.collection").?);
-    try std.testing.expectEqualStrings("bafyabc", zat.json.getString(parsed.value, "commit.cid").?);
-    try std.testing.expect(zat.json.getObject(parsed.value, "commit.record") != null);
-    try std.testing.expectEqual(@as(i64, 1755230000000000), zat.json.getInt(parsed.value, "time_us").?);
+    const commit = event.commit;
+    try std.testing.expectEqual(zat.jetstream.CommitAction.create, commit.operation);
+    try std.testing.expectEqualStrings("create", @tagName(commit.operation));
+    try std.testing.expectEqualStrings("site.standard.document", commit.collection);
+    try std.testing.expectEqualStrings("bafyabc", commit.cid.?);
+    try std.testing.expect(commit.record.? == .object);
+    try std.testing.expectEqual(@as(i64, 1755230000000000), event.timeUs());
 }
 
-test "jetstream delete event has no record and maps to delete action" {
+test "zat jetstream delete event has no record and maps to delete action" {
     const allocator = std.testing.allocator;
-    const event =
+    const event_json =
         \\{"did":"did:plc:abc123","time_us":1755230000000001,"kind":"commit","commit":{"rev":"3m","operation":"delete","collection":"pub.leaflet.document","rkey":"3mn3z7u7jgsgl"}}
     ;
-    var parsed = try json.parseFromSlice(json.Value, allocator, event, .{});
-    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const event = try zat.jetstream.parseEvent(arena.allocator(), event_json);
 
-    try std.testing.expectEqualStrings("delete", zat.json.getString(parsed.value, "commit.operation").?);
-    try std.testing.expect(zat.json.getObject(parsed.value, "commit.record") == null);
-    try std.testing.expect(zat.json.getString(parsed.value, "commit.cid") == null);
+    const commit = event.commit;
+    try std.testing.expectEqual(zat.jetstream.CommitAction.delete, commit.operation);
+    try std.testing.expectEqual(@as(?json.Value, null), commit.record);
+    try std.testing.expectEqual(@as(?[]const u8, null), commit.cid);
 }
 
 test "cursor round-trips through the persist file" {

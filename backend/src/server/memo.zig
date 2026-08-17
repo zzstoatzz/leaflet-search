@@ -23,7 +23,13 @@ const Io = std.Io;
 
 const MAX_ENTRIES = 512;
 
-var generation = std.atomic.Value(u64).init(1);
+// Generation = boot-time seconds (lazily seeded) + adoption count. Seeding
+// from the wall clock instead of a constant keeps tokens unique across
+// process restarts: a restart plus an adoption inside one 5-min bucket must
+// not reuse a pre-adoption token, or a held ETag turns into a wrong 304.
+// Monotone because uptime seconds grow far faster than adoptions (~1 per 2h).
+var boot_seed = std.atomic.Value(u64).init(0);
+var adoptions = std.atomic.Value(u64).init(0);
 
 var mutex: Io.Mutex = Io.Mutex.init;
 var entries: ?std.StringHashMap(Entry) = null;
@@ -35,14 +41,24 @@ const Entry = struct {
 
 /// Called when a new snapshot is adopted (boot + promote watcher).
 pub fn bumpGeneration() void {
-    _ = generation.fetchAdd(1, .monotonic);
+    _ = adoptions.fetchAdd(1, .monotonic);
+}
+
+fn generationValue(io: Io) u64 {
+    var s = boot_seed.load(.monotonic);
+    if (s == 0) {
+        const secs: u64 = @intCast(@divTrunc(Io.Timestamp.now(io, .real).toMicroseconds(), 1_000_000));
+        _ = boot_seed.cmpxchgStrong(0, secs, .monotonic, .monotonic);
+        s = boot_seed.load(.monotonic);
+    }
+    return s +% adoptions.load(.monotonic);
 }
 
 /// Opaque validity token: changes on adoption and every 300s.
 pub fn token(io: Io) u64 {
     const secs = @divTrunc(Io.Timestamp.now(io, .real).toMicroseconds(), 1_000_000);
     const bucket: u64 = @intCast(@divTrunc(secs, 300));
-    return generation.load(.monotonic) *% 0x1_0000_0000 +% bucket;
+    return generationValue(io) *% 0x1_0000_0000 +% bucket;
 }
 
 /// Render the current token as an ETag value into `buf`.

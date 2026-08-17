@@ -1702,8 +1702,11 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
     // Fusion must use the same source depth on every page. If source depth
     // grew with offset, a result found by both sources at rank 30 could enter
     // ahead of a first-page single-source result and shift page boundaries.
+    // Depth 75: RRF weighs rank r at 1/(60+r), so ranks past ~75 contribute
+    // noise-level score while costing a proportionally larger candidate pass.
+    // This also caps hybrid pagination depth at 75 results.
     const fusion_options: Options = .{
-        .max_results = 200,
+        .max_results = 75,
         .show_labeled = options.show_labeled,
         .include_undiscoverable = options.include_undiscoverable,
         .include_snippets = false,

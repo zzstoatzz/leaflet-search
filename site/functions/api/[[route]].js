@@ -11,8 +11,12 @@
 // bypasses the cache entirely for A/B and debugging.
 
 const BACKEND = 'https://leaflet-search-backend.fly.dev';
-const EDGE_TTL_MS = 60_000; // fresh window
-const STALE_MAX_S = 600; // how long a copy stays servable-while-revalidating
+// The replica behind /search only refreshes on ~2h snapshot adoption (overlay
+// adds live rows at the origin, but cached pages tolerating 10min of staleness
+// is well inside our own data cadence) — a long fresh window multiplies edge
+// capacity on repeated/agent queries for free.
+const EDGE_TTL_MS = 600_000; // fresh window
+const STALE_MAX_S = 1800; // how long a copy stays servable-while-revalidating
 const CACHED_AT = 'x-edge-cached-at';
 
 export async function onRequest(context) {

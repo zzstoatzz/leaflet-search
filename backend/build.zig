@@ -40,8 +40,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const jetstream = b.dependency("jetstream", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "websocket", .module = websocket.module("websocket") },
+        .{ .name = "jetstream", .module = jetstream.module("jetstream") },
         .{ .name = "zql", .module = zql.module("zql") },
         .{ .name = "zat", .module = zat.module("zat") },
         .{ .name = "zqlite", .module = zqlite.module("zqlite") },

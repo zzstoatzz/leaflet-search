@@ -1,25 +1,33 @@
 //! Jetstream V2 live-ingest consumer — the /channel replacement.
 //!
-//! Transport is zat.JetstreamClient (host rotation, typed event parsing,
-//! reconnect backoff, 10s cursor rewind on host switch, TCP keepalive); this
-//! file owns only the pub-search concerns: which hosts we trust, durable
-//! cursor persistence, corpus policy (banned DIDs, bridgy fed), dispatch into
-//! the same path the /channel consumer uses, and wedge escalation.
+//! Transport is the zat.dev/jetstream SDK's unified client
+//! (`jetstream.subscribe`): archive sweep from `after_seq`, gapless seq-dedup
+//! cutover to the live subscribeEvents tail, CursorTooOld re-entering
+//! backfill — recovery is gap-free at ANY outage length, not bounded by a
+//! subscribe replay window. This file owns only the pub-search concerns:
+//! host policy, durable cursor persistence, corpus policy (banned DIDs,
+//! bridgy fed), dispatch into the same path the /channel consumer uses, and
+//! wedge escalation.
 //!
-//! Hosts: stream.waow.tech primary, Bluesky's hosted V2 instances as
-//! failover. Every host in the list runs Sync 1.1 signature/MST verification
-//! at its own ingest, so records arriving here are operator-verified even
-//! though the blocks needed to re-check are not on the wire. Jetstream v1
-//! instances do NOT verify — never add one (which is also why we override
-//! zat's default host list).
+//! Hosts: stream.waow.tech only by default. Its ingest runs full Sync 1.1
+//! signature/MST verification ("no event is served or archived unverified"),
+//! so records arriving here are operator-verified even though the blocks
+//! needed to re-check are not on the wire. Multi-host failover exists in the
+//! SDK (witnessed-time re-anchoring) but needs a per-host archive bearer
+//! key, and only verified-V2 instances qualify — extend JETSTREAM_HOSTS
+//! deliberately, never with a v1 instance.
 //!
-//! at-least-once contract: events are processed synchronously in onEvent and
-//! the durable cursor (time_us) is persisted only after dispatch returns
-//! (2s time gate), then rewound REWIND_US on process start. Slow turso
-//! propagates as websocket backpressure; if a server drops us as a slow
-//! consumer, zat re-dials and resumes from its in-memory cursor. No ack
-//! protocol, no outbox, no shedding — redelivery + idempotent upserts
-//! replace all three.
+//! at-least-once contract: events are processed synchronously in onEvent
+//! and the durable cursor (the instance seq) is persisted only after
+//! dispatch returns (2s time gate). The SDK's seq dedup makes the
+//! archive→live seam exact; process restarts resume from the persisted seq
+//! with no rewind margin needed. Slow turso propagates as websocket
+//! backpressure; a server-side drop re-dials inside the SDK. No ack
+//! protocol, no outbox, no shedding.
+//!
+//! cursor migration: the file used to hold a v1 time_us (≥1e15); a v2 seq
+//! is ~1e10. On boot a time_us value is converted once via the archive's
+//! segment metadata (`fetchAnchor`), same magnitude split the server uses.
 //!
 //! policy parity with the fly-app ingester this replaces:
 //!   - banned DIDs dropped via policy.isBanned (was the ingester's reader)
@@ -34,6 +42,7 @@ const json = std.json;
 const Allocator = mem.Allocator;
 const Io = std.Io;
 const zat = @import("zat");
+const jetstream = @import("jetstream");
 const logfire = @import("logfire");
 const ingester = @import("ingester.zig");
 const policy = @import("../policy.zig");
@@ -52,17 +61,17 @@ const COLLECTIONS = [_][]const u8{
     "com.whtwnd.blog.entry",
 };
 
-/// Verified-V2-only. Overrides zat's default host list, which includes v1 and
-/// third-party instances we don't trust to have verified.
 const DEFAULT_HOSTS = [_][]const u8{
-    "stream.waow.tech",
-    "jetstream2.us-east.bsky.network",
-    "jetstream2.us-west.bsky.network",
+    "https://stream.waow.tech",
 };
 
-/// rewind applied to the persisted cursor on process start: redelivered
-/// events are absorbed by idempotent upserts, missed events are not absorbed
-/// by anything. (In-process reconnects use zat's cursor handling.)
+/// v1→v2 cursor magnitude split (the server's own convention): at or above
+/// this the persisted value is a time_us needing anchor conversion; below
+/// it, an instance seq.
+const TIME_US_THRESHOLD: i64 = 1_000_000_000_000_000;
+
+/// rewind applied when deriving a replay floor from wall-clock time (first
+/// boot, or v1 cursor conversion): witnessed-time skew cover.
 const REWIND_US: i64 = 5_000_000;
 
 /// persist the cursor at most this often. event-count gating (the first cut
@@ -71,11 +80,11 @@ const REWIND_US: i64 = 5_000_000;
 /// accumulated. one atomic rename per interval is cheap.
 const CURSOR_PERSIST_INTERVAL_NS: i96 = 2 * std.time.ns_per_s;
 
-/// wedge escalation threshold. identity/account events bypass
-/// wantedCollections, so a healthy connection sees frames every few seconds
-/// — minutes of true silence means the read loop is stuck (a hung outbound
-/// fetch inside processing) or every host is unreachable; either way a clean
-/// restart that replays from the cursor is the recovery.
+/// wedge escalation threshold. identity/account events flow on the
+/// unfiltered kinds stream every few seconds, so minutes of true silence
+/// means the read loop is stuck (a hung outbound fetch inside processing)
+/// or the host is unreachable; either way a clean restart that resumes
+/// from the persisted seq is the recovery.
 const STALE_SECONDS_DEFAULT: u32 = 900;
 
 /// bridged-DID cache bound; evict-one on overflow, never clear-all
@@ -91,6 +100,10 @@ fn staleSeconds() u32 {
     return std.fmt.parseInt(u32, raw, 10) catch STALE_SECONDS_DEFAULT;
 }
 
+fn apiKey() ?[]const u8 {
+    return if (std.c.getenv("JETSTREAM_API_KEY")) |p| std.mem.span(p) else null;
+}
+
 fn readCursor(path: [:0]const u8) ?i64 {
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
@@ -102,13 +115,13 @@ fn readCursor(path: [:0]const u8) ?i64 {
     return std.fmt.parseInt(i64, trimmed, 10) catch null;
 }
 
-fn persistCursor(path: [:0]const u8, time_us: i64) void {
+fn persistCursor(path: [:0]const u8, value: i64) void {
     var tmp_buf: [256]u8 = undefined;
     const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path}) catch return;
     const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return;
     var num_buf: [32]u8 = undefined;
-    const body = std.fmt.bufPrint(&num_buf, "{d}", .{time_us}) catch {
+    const body = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch {
         _ = std.c.close(fd);
         return;
     };
@@ -122,8 +135,8 @@ fn persistCursor(path: [:0]const u8, time_us: i64) void {
     _ = std.c.rename(tmp.ptr, path.ptr);
 }
 
-/// Hosts to rotate through on reconnect, from JETSTREAM_HOSTS (comma-separated)
-/// or the default list. Leaks its allocation once at startup — process-lifetime.
+/// Hosts from JETSTREAM_HOSTS (comma-separated base URLs) or the default.
+/// Leaks its allocation once at startup — process-lifetime.
 fn getHosts(allocator: Allocator) []const []const u8 {
     const raw = std.c.getenv("JETSTREAM_HOSTS") orelse return &DEFAULT_HOSTS;
     const spanned = std.mem.span(raw);
@@ -231,56 +244,48 @@ const BridgeGate = struct {
     }
 };
 
-/// zat.JetstreamClient handler: policy gates + dispatch + cursor persistence.
+/// unified-client handler: policy gates + dispatch + cursor persistence.
 const EventHandler = struct {
     allocator: Allocator,
     io: Io,
     gate: *BridgeGate,
     cursor_path: [:0]const u8,
-    last_time_us: i64 = 0,
+    last_seq: u64 = 0,
     last_persist_ns: i96 = 0,
     // atomic: read by the staleness watchdog thread
     event_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    pub fn onConnect(_: *EventHandler, host: []const u8) void {
-        logfire.info("jetstream: connected to {s}", .{host});
-    }
-
-    pub fn onError(_: *EventHandler, err: anyerror) void {
-        logfire.warn("jetstream: connection error: {s}, zat reconnecting", .{@errorName(err)});
-    }
-
-    pub fn onEvent(self: *EventHandler, event: zat.JetstreamEvent) void {
+    pub fn onEvent(self: *EventHandler, event: jetstream.livedecode.Event) bool {
         const count = self.event_count.fetchAdd(1, .monotonic) + 1;
         if (count % 1000 == 0) {
-            logfire.info("jetstream: recv {d}, cursor {d}, pds lookups {d}, bridged dropped {d}", .{
-                count, self.last_time_us, self.gate.lookups, self.gate.bridged_dropped,
+            logfire.info("jetstream: recv {d}, seq {d}, pds lookups {d}, bridged dropped {d}", .{
+                count, self.last_seq, self.gate.lookups, self.gate.bridged_dropped,
             });
         }
-        defer self.advanceCursor(event.timeUs());
+        defer self.advanceCursor(event.seq);
 
-        const commit = switch (event) {
+        const commit = switch (event.payload) {
             .commit => |c| c,
-            // identity/account: nothing to evict without a key cache
-            else => return,
+            // identity/account/sync: nothing to evict without a key cache
+            else => return true,
         };
 
-        if (policy.isBanned(commit.did)) {
+        if (policy.isBanned(event.did)) {
             logfire.span("ingest.dropped", .{ .reason = "banned_did", .collection = commit.collection }).end();
-            return;
+            return true;
         }
         // upserts only: deleting a bridged repo's leftovers is harmless, and
         // deletes shouldn't cost a PLC roundtrip
-        if (commit.operation != .delete and self.gate.isBridged(commit.did)) {
+        if (commit.operation != .delete and self.gate.isBridged(event.did)) {
             self.gate.bridged_dropped += 1;
             logfire.span("ingest.dropped", .{ .reason = "bridged_repo", .collection = commit.collection }).end();
-            return;
+            return true;
         }
 
         const rec = ingester.IngesterRecord{
             .collection = commit.collection,
             .action = @tagName(commit.operation), // same vocabulary: create/update/delete
-            .did = commit.did,
+            .did = event.did,
             .rkey = commit.rkey,
             .cid = commit.cid,
         };
@@ -289,26 +294,35 @@ const EventHandler = struct {
             else => null,
         } else null;
         ingester.dispatchRecord(self.allocator, self.io, rec, inner);
+        return true;
     }
 
-    fn advanceCursor(self: *EventHandler, time_us: i64) void {
-        if (time_us <= self.last_time_us) return;
-        self.last_time_us = time_us;
+    pub fn onError(_: *EventHandler, err: anyerror) bool {
+        logfire.warn("jetstream: recoverable stream error: {s}", .{@errorName(err)});
+        return true;
+    }
+
+    pub fn onInfo(_: *EventHandler, info: jetstream.livedecode.Info) void {
+        logfire.info("jetstream: server info {s}: {s}", .{ info.name, info.message });
+    }
+
+    fn advanceCursor(self: *EventHandler, seq: u64) void {
+        if (seq <= self.last_seq) return;
+        self.last_seq = seq;
         const now_ns = Io.Timestamp.now(self.io, .awake).nanoseconds;
         if (now_ns - self.last_persist_ns >= CURSOR_PERSIST_INTERVAL_NS) {
-            persistCursor(self.cursor_path, self.last_time_us);
+            persistCursor(self.cursor_path, @intCast(self.last_seq));
             self.last_persist_ns = now_ns;
         }
     }
 };
 
-/// zat's subscribe loop already re-dials half-open sockets (TCP keepalive)
-/// and rotates hosts; what it cannot recover is a read loop wedged INSIDE
-/// event processing (e.g. a hung outbound fetch — the 2026-08-16 stall).
-/// Frames flow every few seconds when healthy (identity/account events
-/// bypass wantedCollections), so prolonged silence = wedged or fully
-/// partitioned: persist the cursor and exit for a clean restart that
-/// replays the gap.
+/// The SDK re-dials, dedups, and re-enters backfill on its own; what it
+/// cannot recover is a read loop wedged INSIDE event processing (e.g. a
+/// hung outbound fetch — the 2026-08-16 stall). Frames flow every few
+/// seconds when healthy (identity/account events on the unfiltered kinds
+/// stream), so prolonged silence = wedged or fully partitioned: persist
+/// the cursor and exit for a clean restart that resumes from the seq.
 const Watchdog = struct {
     io: Io,
     handler: *EventHandler,
@@ -328,28 +342,45 @@ const Watchdog = struct {
             stale += 1;
             if (stale >= stale_limit) {
                 logfire.err("jetstream: no events for {d}s — exiting for a clean restart", .{stale_limit});
-                // the loop is frozen, so last_time_us is stable to read here
-                if (self.handler.last_time_us > 0) persistCursor(self.handler.cursor_path, self.handler.last_time_us);
+                // the loop is frozen, so last_seq is stable to read here
+                if (self.handler.last_seq > 0) persistCursor(self.handler.cursor_path, @intCast(self.handler.last_seq));
                 std.process.exit(1);
             }
         }
     }
 };
 
+/// Resolve the replay start seq. Persisted seq → use it directly (the SDK's
+/// dedup makes exact resume safe). Persisted v1 time_us, or nothing → derive
+/// a seq from the archive's segment metadata for (value|now) − rewind.
+fn resolveAfterSeq(allocator: Allocator, io: Io, host: []const u8, path: [:0]const u8, key: ?[]const u8) ?u64 {
+    const persisted = readCursor(path);
+    if (persisted) |v| {
+        if (v < TIME_US_THRESHOLD) return @intCast(v);
+    }
+    const now_us: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_us));
+    const floor_us = (persisted orelse now_us - 60 * std.time.us_per_s) - REWIND_US;
+    const anchor = jetstream.ArchiveBackfill.fetchAnchor(io, allocator, host, floor_us, key) catch |err| {
+        logfire.err("jetstream: seq anchor fetch failed ({s}) — starting live from the tip", .{@errorName(err)});
+        return null;
+    };
+    logfire.info("jetstream: anchored floor_us={d} → after_seq={?d}", .{ floor_us, anchor.after_seq });
+    return anchor.after_seq;
+}
+
 pub fn consumer(allocator: Allocator, io: Io) void {
     const hosts = getHosts(allocator);
     const path = cursorPath();
+    const key = apiKey();
 
-    // no cursor file yet (first cutover boot): seed from wall clock minus a
-    // minute so the deploy window between the old consumer stopping and this
-    // one connecting is replayed instead of skipped (time_us is the stream's
-    // witness clock, ~wall time).
-    const now_us: i64 = @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_us));
-    const persisted = readCursor(path) orelse now_us - 60 * std.time.us_per_s;
-    const start_cursor = persisted - REWIND_US;
+    if (key == null) {
+        logfire.warn("jetstream: no JETSTREAM_API_KEY — archive sweep/anchor unavailable, gap recovery degrades to the live replay window", .{});
+    }
 
-    logfire.info("jetstream: consumer starting, {d} host(s), primary={s}, cursor={d} ({s})", .{
-        hosts.len, hosts[0], start_cursor, path,
+    const after_seq = resolveAfterSeq(allocator, io, hosts[0], path, key);
+
+    logfire.info("jetstream: consumer starting, {d} host(s), primary={s}, after_seq={?d} ({s})", .{
+        hosts.len, hosts[0], after_seq, path,
     });
 
     var gate = BridgeGate{ .allocator = allocator, .io = io };
@@ -360,53 +391,49 @@ pub fn consumer(allocator: Allocator, io: Io) void {
         logfire.err("jetstream: failed to spawn watchdog: {}", .{err});
     }
 
-    var client = zat.JetstreamClient.init(io, allocator, .{
+    // blocks until a terminal error; the SDK owns reconnects, seq dedup,
+    // and CursorTooOld → re-backfill
+    jetstream.subscribe(io, allocator, .{
         .hosts = hosts,
-        .wanted_collections = &COLLECTIONS,
-        .cursor = start_cursor,
-        .max_message_size = 5 * 1024 * 1024,
-    });
-    defer client.deinit();
-
-    // blocks forever: zat owns reconnect backoff + host rotation
-    client.subscribe(&handler) catch |err| {
-        logfire.err("jetstream: subscribe loop ended: {} — exiting for restart", .{err});
-        if (handler.last_time_us > 0) persistCursor(path, handler.last_time_us);
-        std.process.exit(1);
+        .after_seq = after_seq,
+        .collections = &COLLECTIONS,
+        .api_key = key,
+    }, &handler) catch |err| {
+        logfire.err("jetstream: subscribe ended: {} — exiting for restart", .{err});
     };
+    if (handler.last_seq > 0) persistCursor(path, @intCast(handler.last_seq));
+    std.process.exit(1);
 }
 
-test "zat jetstream event maps onto the shared record envelope" {
-    const allocator = std.testing.allocator;
-    const event_json =
-        \\{"did":"did:plc:abc123","time_us":1755230000000000,"kind":"commit","commit":{"rev":"3m","operation":"create","collection":"site.standard.document","rkey":"3mn3z7u7jgsgl","record":{"$type":"site.standard.document","title":"hi"},"cid":"bafyabc"}}
-    ;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const event = try zat.jetstream.parseEvent(arena.allocator(), event_json);
+test "commit events map onto the shared record envelope" {
+    // livedecode's typed contract is what dispatch consumes; pin the pieces
+    // dispatchRecord relies on (operation tag names, payload union shape).
+    try std.testing.expectEqualStrings("create", @tagName(jetstream.livedecode.Operation.create));
+    try std.testing.expectEqualStrings("update", @tagName(jetstream.livedecode.Operation.update));
+    try std.testing.expectEqualStrings("delete", @tagName(jetstream.livedecode.Operation.delete));
 
-    const commit = event.commit;
-    try std.testing.expectEqual(zat.jetstream.CommitAction.create, commit.operation);
-    try std.testing.expectEqualStrings("create", @tagName(commit.operation));
-    try std.testing.expectEqualStrings("site.standard.document", commit.collection);
-    try std.testing.expectEqualStrings("bafyabc", commit.cid.?);
-    try std.testing.expect(commit.record.? == .object);
-    try std.testing.expectEqual(@as(i64, 1755230000000000), event.timeUs());
+    const ev = jetstream.livedecode.Event{
+        .seq = 42,
+        .time_us = 1755230000000000,
+        .did = "did:plc:abc123",
+        .payload = .{ .commit = .{
+            .operation = .create,
+            .collection = "site.standard.document",
+            .rkey = "3mn3z7u7jgsgl",
+            .rev = "3m",
+            .cid = "bafyabc",
+        } },
+    };
+    try std.testing.expectEqual(@as(u64, 42), ev.seq);
+    switch (ev.payload) {
+        .commit => |c| try std.testing.expectEqualStrings("site.standard.document", c.collection),
+        else => unreachable,
+    }
 }
 
-test "zat jetstream delete event has no record and maps to delete action" {
-    const allocator = std.testing.allocator;
-    const event_json =
-        \\{"did":"did:plc:abc123","time_us":1755230000000001,"kind":"commit","commit":{"rev":"3m","operation":"delete","collection":"pub.leaflet.document","rkey":"3mn3z7u7jgsgl"}}
-    ;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const event = try zat.jetstream.parseEvent(arena.allocator(), event_json);
-
-    const commit = event.commit;
-    try std.testing.expectEqual(zat.jetstream.CommitAction.delete, commit.operation);
-    try std.testing.expectEqual(@as(?json.Value, null), commit.record);
-    try std.testing.expectEqual(@as(?[]const u8, null), commit.cid);
+test "v1 time_us cursors are detected for anchor conversion" {
+    try std.testing.expect(1786850647440646 >= TIME_US_THRESHOLD); // a real v1 cursor
+    try std.testing.expect(23417264498 < TIME_US_THRESHOLD); // a real v2 seq
 }
 
 test "cursor round-trips through the persist file" {
@@ -415,8 +442,8 @@ test "cursor round-trips through the persist file" {
     defer _ = std.c.unlink(path.ptr);
 
     try std.testing.expectEqual(@as(?i64, null), readCursor(path));
-    persistCursor(path, 1755230000000000);
-    try std.testing.expectEqual(@as(?i64, 1755230000000000), readCursor(path));
-    persistCursor(path, 1755230000000005);
-    try std.testing.expectEqual(@as(?i64, 1755230000000005), readCursor(path));
+    persistCursor(path, 23417264498);
+    try std.testing.expectEqual(@as(?i64, 23417264498), readCursor(path));
+    persistCursor(path, 23417264999);
+    try std.testing.expectEqual(@as(?i64, 23417264999), readCursor(path));
 }

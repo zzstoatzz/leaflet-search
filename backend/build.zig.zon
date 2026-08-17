@@ -5,16 +5,16 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .websocket = .{
-            .url = "https://tangled.org/zzstoatzz.io/websocket.zig/archive/v0.1.8.tar.gz",
-            .hash = "websocket-0.1.8-ZPISdZ1cBADCBRYrCAZ8ueTIEN2T9ns7U7rtDE-IAvkr",
+            .url = "https://tangled.org/zzstoatzz.io/websocket.zig/archive/v0.1.12.tar.gz",
+            .hash = "websocket-0.1.12-ZPISdTJEBQDiqWKUP5mPPK9IXJ5xscVHybOlUbPHM9Rr",
         },
         .zql = .{
             .url = "https://github.com/zzstoatzz/zql/archive/main.tar.gz",
             .hash = "zql-0.0.1-alpha-xNRI4IRNAABUb9gLat5FWUaZDD5HvxAxet_-elgR_A_y",
         },
         .zat = .{
-            .url = "https://tangled.org/zat.dev/zat/archive/v0.3.8.tar.gz",
-            .hash = "zat-0.3.8-5PuC7glgCgCVn18R0k6AuXiNok-jjqDRGgaBFj5JsI_N",
+            .url = "https://tangled.org/zat.dev/zat/archive/v0.4.2.tar.gz",
+            .hash = "zat-0.4.2-5PuC7iaJDACQSazzCxGb6_e75EIOPHAG2JU_WDdO3qW6",
         },
         .zqlite = .{
             .url = "https://github.com/karlseguin/zqlite.zig/archive/5ac4cabe95a6d7faa7baf0da8057a8e6e8a227a1.tar.gz",
@@ -31,6 +31,10 @@
         .poolio = .{
             .url = "https://tangled.org/zzstoatzz.io/poolio/archive/v0.0.1-alpha.1.tar.gz",
             .hash = "poolio-0.0.1-alpha.1-qYctK2JcAADiWqRISK92yk_GjGTVYeBEUGMrE4QtJE0N",
+        },
+        .jetstream = .{
+            .url = "https://tangled.org/zat.dev/jetstream/archive/v0.1.0.tar.gz",
+            .hash = "jetstream-0.1.0-6CDX5mjXAgBgMzNKvzevcCn2REPiSXtrL5Jh3H5bKz1F",
         },
     },
     .paths = .{

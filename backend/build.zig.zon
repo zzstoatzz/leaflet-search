@@ -34,7 +34,7 @@
         },
         .jetstream = .{
             .url = "https://tangled.org/zat.dev/jetstream/archive/v0.1.0.tar.gz",
-            .hash = "jetstream-0.1.0-6CDX5mjXAgBgMzNKvzevcCn2REPiSXtrL5Jh3H5bKz1F",
+            .hash = "jetstream-0.1.0-6CDX5pbvAgAlmwrChL-Hhsyq2VOr03dmjjZNjus6MWUS",
         },
     },
     .paths = .{

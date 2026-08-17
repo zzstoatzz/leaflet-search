@@ -1,14 +1,16 @@
 name: Ingestion Watchdog
 
-# Alerts the Discord ops channel (same one logfire alerts use) if ingestion
-# freshness or serving health fails — deliberately not bsky, so an atproto
-# outage can't eat its own alert. Freshness = max(indexed_at) in turso
-# (catches the whole ingest chain dying); serving = backend endpoints with
-# bodies inspected. Dedup: only the first failing run in a 3h window posts
-# (reads this workflow's run history via GITHUB_TOKEN).
+# Emits a logfire error event if ingestion freshness or serving health
+# fails; the "watchdog: ingestion stalled" logfire alert routes it to the
+# pub-search ingestion alerts Discord channel (same pipeline as every other
+# alert). Direct Discord webhook is the fallback if the logfire emit fails.
+# Deliberately not bsky, so an atproto outage can't eat its own alert.
+# Dedup: only the first failing run in a 3h window emits (reads this
+# workflow's run history via GITHUB_TOKEN).
 #
-# Requires repo secrets: DISCORD_WEBHOOK_URL, TURSO_DB_TOKEN. Optional:
-# PREFECT_API_URL + PREFECT_API_AUTH_STRING (builder cause-level check).
+# Requires repo secrets: LOGFIRE_TOKEN, TURSO_DB_TOKEN. Optional:
+# DISCORD_WEBHOOK_URL (fallback), PREFECT_API_URL + PREFECT_API_AUTH_STRING
+# (builder cause-level check).
 
 on:
   schedule:
@@ -29,6 +31,7 @@ jobs:
 
       - name: Check ingestion (posts to discord + fails the run if stalled)
         env:
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
           PREFECT_API_URL: ${{ secrets.PREFECT_API_URL }}

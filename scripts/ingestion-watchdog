@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "httpx",
+#     "logfire",
 #     "websockets",
 #     "pydantic-settings",
 # ]
@@ -24,14 +25,18 @@ tap is GONE (replaced by the ingester 2026-06-09; machine stopped with
 autostart disabled). The old tap-outbox/cursor checks alerted on a zombie
 machine that fly auto-started whenever this watchdog probed it.
 
-Alerts go to Discord (same channel logfire's alerts use) via a plain
-webhook — deliberately NOT bsky: an atproto outage stalls ingest AND eats
-the alert if the alert rides atproto. Repeat-alert dedup reads this
-workflow's own recent run conclusions from the GitHub API (a stall keeps
-the run failing; only the first failure in the window posts).
+Alerting is consolidated on logfire: a stall emits a logfire error event
+and the "watchdog: ingestion stalled" logfire alert routes it to the
+pub-search ingestion alerts Discord channel — the same pipeline every
+other alert uses. Deliberately NOT bsky (an atproto outage stalls ingest
+AND eats the alert if the alert rides atproto). If the logfire emit
+fails, a direct Discord webhook (DISCORD_WEBHOOK_URL) is the fallback.
+Repeat-alert dedup reads this workflow's own recent run conclusions from
+the GitHub API (a stall keeps the run failing; only the first failure in
+the window emits).
 
-Requires: DISCORD_WEBHOOK_URL, TURSO_DB_TOKEN. Optional: GITHUB_TOKEN +
-GITHUB_REPOSITORY (dedup; without them every stalled run posts).
+Requires: LOGFIRE_TOKEN, TURSO_DB_TOKEN. Optional: DISCORD_WEBHOOK_URL
+(fallback), GITHUB_TOKEN + GITHUB_REPOSITORY (dedup).
 
 Usage:
     ./scripts/ingestion-watchdog                 # check; post only if stalled
@@ -196,6 +201,23 @@ def check(window_secs: int) -> tuple[bool, str]:
     return False, "healthy: ingestion fresh, serving green"
 
 
+def _emit_logfire(detail: str) -> bool:
+    """Primary alert path: one error event; the logfire alert does routing."""
+    token = os.environ.get("LOGFIRE_TOKEN", "")
+    if not token:
+        return False
+    try:
+        import logfire
+
+        logfire.configure(token=token, service_name="ingestion-watchdog", console=False)
+        logfire.error("watchdog: pub-search ingestion stalled", detail=detail)
+        logfire.force_flush()
+        return True
+    except Exception as e:
+        print(f"logfire emit failed: {e!r}")
+        return False
+
+
 def _post(webhook_url: str, message: str) -> str:
     """Post to Discord; returns the message id (for --test cleanup)."""
     r = httpx.post(webhook_url, params={"wait": "true"}, json={"content": message}, timeout=15)
@@ -244,11 +266,11 @@ def main() -> None:
 
     settings = Settings()
     webhook = settings.discord_webhook_url
-    if not webhook:
-        print("DISCORD_WEBHOOK_URL not set — skipping (configure to enable)")
-        return
 
     if args.test:
+        if not webhook:
+            print("DISCORD_WEBHOOK_URL not set — cannot wiring-test the fallback")
+            return
         msg_id = _post(webhook, "pub-search ingestion watchdog wiring test — ignore (auto-deleting).")
         print(f"posted test message {msg_id}")
         httpx.delete(f"{webhook}/messages/{msg_id}", timeout=15).raise_for_status()
@@ -259,10 +281,14 @@ def main() -> None:
     print(detail)
     if stalled:
         if _alerted_recently(args.dedup_hours):
-            print(f"stalled, but already alerted within {args.dedup_hours}h — not reposting")
-        else:
+            print(f"stalled, but already alerted within {args.dedup_hours}h — not re-alerting")
+        elif _emit_logfire(detail):
+            print("ALERT emitted to logfire (alert routes it to discord)")
+        elif webhook:
             _post(webhook, f"⚠️ {ALERT_MARKER} — {detail}. check logfire + fly logs -a leaflet-search-backend")
-            print("ALERT posted to discord")
+            print("ALERT posted to discord (logfire fallback)")
+        else:
+            print("ALERT: no logfire token and no webhook — alert NOT delivered")
         sys.exit(1)
 
 

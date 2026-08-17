@@ -555,6 +555,44 @@ fn currentTimestamp(io: Io) i64 {
     return @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
 }
 
+/// CID gate for re-ingest of blob-hydrated documents. True ⇒ the stored row
+/// was indexed from exactly this record CID AND its content is longer than
+/// the inline extraction — evidence the prior blobPages hydration succeeded.
+/// atproto records are DRISL/DAG-CBOR deterministic, so an unchanged record
+/// CID pins the record bytes and every blob CID it references; re-fetching
+/// provably returns what we already indexed. The length condition keeps the
+/// gate from sealing in rows whose hydration previously failed (those store
+/// source_cid too and must stay healable by replays).
+pub fn cidGateSkips(stored_cid: []const u8, incoming_cid: []const u8, stored_content_len: i64, inline_len: usize) bool {
+    if (stored_cid.len == 0 or incoming_cid.len == 0) return false;
+    if (!std.mem.eql(u8, stored_cid, incoming_cid)) return false;
+    return stored_content_len > inline_len;
+}
+
+/// Turso probe backing the gate: PK lookup of (source_cid, content length)
+/// for `uri`. Any error fails open (hydrate as before).
+pub fn hydratedRowMatchesCid(uri: []const u8, incoming_cid: []const u8, inline_len: usize) bool {
+    const c = db.getClient() orelse return false;
+    var reads = c.queryBatch(&.{
+        .{ .sql = "SELECT COALESCE(source_cid, ''), length(COALESCE(content, '')) FROM documents WHERE uri = ?", .args = &.{uri} },
+    }) catch return false;
+    defer reads.deinit();
+    const row = reads.getFirst(0) orelse return false;
+    return cidGateSkips(row.text(0), incoming_cid, row.int(1), inline_len);
+}
+
+test "cidGateSkips: match + hydrated skips; failure/mismatch/empty heal" {
+    // unchanged record, prior hydration succeeded (stored longer than inline)
+    try std.testing.expect(cidGateSkips("bafyreiaaa", "bafyreiaaa", 5000, 120));
+    // unchanged record but prior hydration failed (inline-only row) — re-hydrate
+    try std.testing.expect(!cidGateSkips("bafyreiaaa", "bafyreiaaa", 120, 120));
+    // record actually changed
+    try std.testing.expect(!cidGateSkips("bafyreiaaa", "bafyreibbb", 5000, 120));
+    // no stored/incoming cid — never gate
+    try std.testing.expect(!cidGateSkips("", "bafyreiaaa", 5000, 120));
+    try std.testing.expect(!cidGateSkips("bafyreiaaa", "", 5000, 120));
+}
+
 pub fn deleteDocument(uri: []const u8) void {
     const c = db.getClient() orelse return;
 

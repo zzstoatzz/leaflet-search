@@ -467,6 +467,17 @@ fn processDocument(allocator: Allocator, io: Io, uri: []const u8, did: []const u
     };
     defer doc.deinit();
 
+    // CID gate: blob hydration is a PDS fetch per long doc, and archive
+    // replays / re-puts mostly carry records we already indexed. An unchanged
+    // record CID with a successfully-hydrated stored row means the upsert
+    // would be a byte-for-byte no-op — skip the fetch AND the write.
+    if (doc.blob_pages_cid != null) if (source_cid) |cid| {
+        if (indexer.hydratedRowMatchesCid(uri, cid, doc.content.len)) {
+            logfire.counter("ingest.hydrate_skipped_cid", 1);
+            return;
+        }
+    };
+
     // a fetch failure indexes the inline text (title/description) rather than
     // dropping the doc — the reconciler's next pass gets another shot
     hydrateBlobPages(allocator, io, did, &doc) catch |err| {

@@ -49,7 +49,7 @@ export async function onRequest(context) {
   if (cached) {
     const age = Date.now() - Number(cached.headers.get(CACHED_AT) || 0);
     if (age > EDGE_TTL_MS) {
-      context.waitUntil(refresh(cache, cacheKey, backendUrl).catch(() => {}));
+      context.waitUntil(refresh(cache, cacheKey, backendUrl, cached.clone()).catch(() => {}));
     }
     const resp = new Response(cached.body, cached);
     resp.headers.set('x-edge-cache', age > EDGE_TTL_MS ? 'stale' : 'hit');
@@ -69,20 +69,29 @@ export async function onRequest(context) {
 }
 
 // fetch from the backend and, on success, store an edge copy. Returns a
-// mutable Response for the caller.
-async function refresh(cache, cacheKey, backendUrl) {
-  const r = await fetch(backendUrl, { signal: AbortSignal.timeout(20_000) });
-  if (r.status === 200) {
-    const body = await r.arrayBuffer();
-    const store = new Response(body, {
+// mutable Response for the caller. When `prev` (a clone of the expired copy)
+// is given, revalidate with If-None-Match: the origin's ETag encodes
+// (snapshot generation, 5min bucket), so an unchanged origin answers 304 and
+// the stored body is re-stamped without a search running.
+async function refresh(cache, cacheKey, backendUrl, prev) {
+  const headers = {};
+  const prevEtag = prev && prev.headers.get('etag');
+  if (prevEtag) headers['if-none-match'] = prevEtag;
+  const r = await fetch(backendUrl, { headers, signal: AbortSignal.timeout(20_000) });
+  if (r.status === 304 && prev) {
+    const body = await prev.arrayBuffer();
+    await cache.put(cacheKey, storeResponse(body, prev.headers.get('content-type'), prevEtag));
+    return new Response(body, {
       status: 200,
       headers: {
-        'content-type': r.headers.get('content-type') || 'application/json',
-        'cache-control': `public, max-age=${STALE_MAX_S}`,
-        [CACHED_AT]: String(Date.now()),
+        'content-type': prev.headers.get('content-type') || 'application/json',
+        'access-control-allow-origin': '*',
       },
     });
-    await cache.put(cacheKey, store.clone());
+  }
+  if (r.status === 200) {
+    const body = await r.arrayBuffer();
+    await cache.put(cacheKey, storeResponse(body, r.headers.get('content-type'), r.headers.get('etag')));
     return new Response(body, {
       status: 200,
       headers: {
@@ -92,4 +101,14 @@ async function refresh(cache, cacheKey, backendUrl) {
     });
   }
   return r;
+}
+
+function storeResponse(body, contentType, etag) {
+  const headers = {
+    'content-type': contentType || 'application/json',
+    'cache-control': `public, max-age=${STALE_MAX_S}`,
+    [CACHED_AT]: String(Date.now()),
+  };
+  if (etag) headers['etag'] = etag;
+  return new Response(body, { status: 200, headers });
 }

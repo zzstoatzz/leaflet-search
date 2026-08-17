@@ -176,6 +176,7 @@ fn adoptPending(path_env: []const u8) void {
 
     if (std.c.rename(new_path.ptr, cur_path.ptr) == 0) {
         std.debug.print("local db: adopted pending snapshot {s}\n", .{new_path});
+        @import("../server/memo.zig").bumpGeneration();
     } else {
         std.debug.print("local db: snapshot adopt FAILED, serving existing file\n", .{});
     }

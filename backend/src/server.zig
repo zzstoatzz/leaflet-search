@@ -32,6 +32,7 @@ pub const initTagsCache = TagsCache.init;
 pub const initPopularCache = PopularCache.init;
 
 const server_cache = @import("server/cache.zig");
+const memo = @import("server/memo.zig");
 
 /// /tags reads local-then-turso live; both stall during sync write bursts
 /// (soak 2026-06-10). Tag aggregates tolerate minutes of staleness.
@@ -69,7 +70,8 @@ const HTTP_BUF_SIZE = 65536;
 const QUERY_PARAM_BUF_SIZE = 64;
 const SEARCH_MAX_LIMIT: usize = 40;
 const SEARCH_MAX_OFFSET: usize = 1000;
-const HYBRID_MAX_WINDOW: usize = 200;
+// Must match searchHybrid's fusion depth (search.zig fusion_options).
+const HYBRID_MAX_WINDOW: usize = 75;
 
 fn microTimestamp(io: Io) i64 {
     return Io.Timestamp.now(io, .real).toMicroseconds();
@@ -192,6 +194,33 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    // Origin memo + ETag (see server/memo.zig). Skipped for ?overlay= A/B
+    // requests. Memo hits and 304s bypass the per-mode timing metric on
+    // purpose — they'd drown the p50 the alerting watches.
+    var etag_buf: [64]u8 = undefined;
+    const etag_val = memo.etag(io, &etag_buf);
+    const memo_eligible = mem.indexOf(u8, target, "overlay=") == null;
+    if (memo_eligible) {
+        var hdrs = request.iterateHeaders();
+        while (hdrs.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "if-none-match") and
+                mem.indexOf(u8, h.value, etag_val) != null)
+            {
+                logfire.counter("search.etag_304", 1);
+                try request.respond("", .{
+                    .status = .not_modified,
+                    .extra_headers = &.{.{ .name = "etag", .value = etag_val }},
+                });
+                return;
+            }
+        }
+        if (memo.get(io, alloc, target)) |cached_body| {
+            logfire.counter("search.memo_hit", 1);
+            try sendJsonEtag(request, cached_body, etag_val);
+            return;
+        }
+    }
+
     const query = parseQueryParam(alloc, target, "q") catch "";
     const tag_filter = parseQueryParam(alloc, target, "tag") catch null;
     const platform_filter = parseQueryParam(alloc, target, "platform") catch null;
@@ -275,7 +304,7 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
         return;
     };
     if (mode == .hybrid and offset + limit > HYBRID_MAX_WINDOW) {
-        try sendJson(request, "{\"error\":\"hybrid search supports the top 200 results\"}");
+        try sendJson(request, "{\"error\":\"hybrid search supports the top 75 results\"}");
         return;
     }
     // live-overlay serving (Stage 2): default from OVERLAY_SERVE=1, per-request
@@ -313,10 +342,12 @@ fn handleSearch(request: *http.Server.Request, target: []const u8, io: Io) !void
     metrics.stats.recordSearch(query);
     logfire.counter("search.requests", 1);
 
-    try sendResults(request, alloc, raw_results, format, query, @tagName(mode), limit, offset, .{
+    const body = try buildResults(alloc, raw_results, format, query, @tagName(mode), limit, offset, .{
         .show_labeled = show_labeled,
         .include_undiscoverable = include_undiscoverable,
     });
+    if (memo_eligible) memo.put(io, target, body);
+    try sendJsonEtag(request, body, etag_val);
 }
 
 pub const ResultPolicy = struct {
@@ -388,16 +419,29 @@ fn sendResults(
     offset: usize,
     opts: ResultPolicy,
 ) !void {
+    try sendJson(request, try buildResults(alloc, raw, format, query, mode, limit, offset, opts));
+}
+
+/// Policy-filtered, formatted, paginated response body — the exact bytes a
+/// success response carries, so callers can memoize them.
+fn buildResults(
+    alloc: Allocator,
+    raw: []const u8,
+    format: []const u8,
+    query: []const u8,
+    mode: []const u8,
+    limit: usize,
+    offset: usize,
+    opts: ResultPolicy,
+) ![]const u8 {
     const results = applyResultPolicy(alloc, raw, opts) catch raw;
     if (mem.eql(u8, format, "v2")) {
-        const wrapped = try wrapResponse(alloc, results, query, mode, limit, offset, false);
-        try sendJson(request, wrapped);
+        return try wrapResponse(alloc, results, query, mode, limit, offset, false);
     } else {
         // Always slice the bounded candidate array. The old `limit < 40`
         // shortcut leaked every candidate when limit was exactly 40 (or larger),
         // so `limit=40` could return 80+ document/base-path/publication rows.
-        const paginated = try paginateJsonArray(alloc, results, limit, offset);
-        try sendJson(request, paginated);
+        return try paginateJsonArray(alloc, results, limit, offset);
     }
 }
 
@@ -1212,6 +1256,19 @@ fn handleOverlayStatus(request: *http.Server.Request) !void {
     }
     try out.appendSlice(alloc, "]}");
     try sendJson(request, out.items);
+}
+
+fn sendJsonEtag(request: *http.Server.Request, body: []const u8, etag_val: []const u8) !void {
+    try request.respond(body, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "access-control-allow-origin", .value = "*" },
+            .{ .name = "access-control-allow-methods", .value = "GET, OPTIONS" },
+            .{ .name = "access-control-allow-headers", .value = "content-type" },
+            .{ .name = "etag", .value = etag_val },
+        },
+    });
 }
 
 fn sendJson(request: *http.Server.Request, body: []const u8) !void {

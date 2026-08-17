@@ -23,6 +23,10 @@ pub const Options = struct {
     /// Merge live-overlay hits into keyword/tag serving (Stage 2 flag; see
     /// OVERLAY_SERVE + the ?overlay= debug param in server.zig).
     use_overlay: bool = false,
+    /// Hybrid fusion only needs (uri, rank) from its keyword pass — snippet()
+    /// on the external-content FTS reads every candidate's body, so the fused
+    /// page fetches snippets afterward for just the rows that survive RRF.
+    include_snippets: bool = true,
 };
 
 pub const SearchMode = enum {
@@ -988,6 +992,31 @@ const LOCAL_DOCS_FTS_PREFILTER_SQL =
     \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
 ;
 
+// Snippet-free prefilter: the outer MATCH in LOCAL_DOCS_FTS_PREFILTER_SQL
+// exists only to give snippet() an FTS cursor, and FTS5 executes it as a
+// second full scan of the posting union. When the caller doesn't need
+// snippets (hybrid fusion), resolve the candidate set by rowid alone.
+// Args: (fts_query, prefilter_k, candidate_limit, candidate_limit).
+const LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL =
+    \\SELECT d.uri, d.did, d.title, '' as snippet,
+    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+    \\  d.platform, COALESCE(d.path, '') as path,
+    \\  COALESCE(d.cover_image, '') as cover_image,
+    \\  COALESCE(p.name, '') as publication_name,
+    \\  cand.score AS merge_score
+    \\FROM (
+    \\  SELECT c.rid AS rid,
+    \\    c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
+    \\  FROM (SELECT rowid AS rid, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
+    \\  JOIN documents d2 ON d2.rowid = c.rid
+    \\  WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
+    \\  ORDER BY score, c.rid LIMIT ?
+    \\) cand
+    \\JOIN documents d ON d.rowid = cand.rid
+    \\LEFT JOIN publications p ON d.publication_uri = p.uri
+    \\ORDER BY cand.score, d.uri LIMIT ?
+;
+
 // Tag browse (no FTS text): fully local — document_tags and recommends both
 // live in the replica. Ranked by recency with a recommendation lift: score is
 // months-old minus RECOMMEND_LIFT·ln(1+recommenders), so one recommend
@@ -1386,7 +1415,9 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
         // no platform filter. Unfiltered searches take the bounded candidate
         // pass (common words otherwise probe the covering index once per
         // match — corpus-proportional); author/since need the full match set.
-        var rows = if (author_val.len == 0 and since_val.len == 0)
+        var rows = if (author_val.len == 0 and since_val.len == 0 and !options.include_snippets)
+            try local.query(LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL, .{ fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
+        else if (author_val.len == 0 and since_val.len == 0)
             try local.query(LOCAL_DOCS_FTS_PREFILTER_SQL, .{ fts_query, fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
         else
             try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
@@ -1675,9 +1706,10 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
         .max_results = 200,
         .show_labeled = options.show_labeled,
         .include_undiscoverable = options.include_undiscoverable,
+        .include_snippets = false,
     };
 
-    // 1. keyword search (~10ms via local SQLite)
+    // 1. keyword search (local SQLite, snippet-free candidate pass)
     const kw_json = searchKeyword(alloc, query, tag_filter, platform_filter, since_filter, author_filter, fusion_options) catch |err| blk: {
         logfire.warn("search.hybrid: keyword failed: {}", .{err});
         break :blk try alloc.dupe(u8, "[]");
@@ -1806,21 +1838,29 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
         }
     }.lessThan);
 
-    // 6. fetch content previews for semantic-only results (they have no FTS snippet)
+    // 6. snippets were skipped during fusion (include_snippets=false), so
+    // hydrate just the page-bound rows: rowid-probed FTS snippets first (real
+    // match context, ~0.1ms per probe), content previews for the rest
+    // (semantic-only docs that don't match the FTS query, overlay docs).
     const candidate_count = @min(scored.items.len, options.max_results *| 2);
-    var sem_uris: std.ArrayList([]const u8) = .empty;
-    defer sem_uris.deinit(alloc);
+    var bare_uris: std.ArrayList([]const u8) = .empty;
+    defer bare_uris.deinit(alloc);
     for (scored.items[0..candidate_count]) |entry| {
-        const bits = source_bits.get(entry.uri) orelse 0;
-        if (bits == 0b10) { // semantic-only
-            const obj = sem_objects.get(entry.uri) orelse continue;
-            const existing_snippet = jsonStr(obj, "snippet");
-            if (existing_snippet.len == 0) {
-                try sem_uris.append(alloc, entry.uri);
-            }
+        const obj = kw_objects.get(entry.uri) orelse sem_objects.get(entry.uri) orelse continue;
+        if (jsonStr(obj, "snippet").len == 0) {
+            try bare_uris.append(alloc, entry.uri);
         }
     }
-    const hybrid_extras = fetchLocalExtras(alloc, sem_uris.items);
+    const fts_snippets = fetchFtsSnippets(alloc, query, bare_uris.items);
+    var extras_uris: std.ArrayList([]const u8) = .empty;
+    defer extras_uris.deinit(alloc);
+    for (bare_uris.items) |uri| {
+        // semantic-sourced rows may also need cover/pub-name fallbacks from
+        // the extras fetch, even when the FTS probe found their snippet
+        const bits = source_bits.get(uri) orelse 0;
+        if (!fts_snippets.contains(uri) or bits & 0b10 != 0) try extras_uris.append(alloc, uri);
+    }
+    const hybrid_extras = fetchLocalExtras(alloc, extras_uris.items);
 
     // 7. serialize top 20 with source annotation
     var output: std.Io.Writer.Allocating = .init(alloc);
@@ -1852,14 +1892,13 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
             else => "",
         };
 
-        // for semantic-only results with empty snippet, use fetched preview
+        // fusion rows carry no snippet: prefer the rowid-probed FTS snippet
+        // (match context), fall back to the content preview
         const snippet = blk: {
             const existing = jsonStr(obj, "snippet");
             if (existing.len > 0) break :blk existing;
-            if (bits == 0b10) {
-                break :blk hybrid_extras.snippets.get(entry.uri) orelse "";
-            }
-            break :blk existing;
+            if (fts_snippets.get(entry.uri)) |s| break :blk s;
+            break :blk hybrid_extras.snippets.get(entry.uri) orelse "";
         };
 
         try jw.beginObject();
@@ -2040,6 +2079,32 @@ const LocalExtras = struct {
 
 /// Fetch content previews, cover images, and publication names from local SQLite for a list of URIs.
 /// Gracefully returns empty maps if local db is unavailable.
+/// Match-context snippets for specific docs via rowid-constrained MATCH —
+/// FTS5 plans `MATCH ? AND rowid = ?` as a posting-list seek (idxStr "=M"),
+/// not a scan, so each probe is sub-millisecond. Docs absent from the FTS
+/// index (overlay-only) or not matching the query simply return no row.
+fn fetchFtsSnippets(alloc: Allocator, query: []const u8, uris: []const []const u8) std.StringHashMap([]const u8) {
+    var snippets = std.StringHashMap([]const u8).init(alloc);
+    if (uris.len == 0) return snippets;
+    const local = db.getLocalDb() orelse return snippets;
+    const fts_query = buildFtsQuery(alloc, query) catch return snippets;
+    for (uris) |uri| {
+        var rows = local.query(
+            \\SELECT snippet(documents_fts, 2, '', '', '...', 32)
+            \\FROM documents_fts WHERE documents_fts MATCH ?
+            \\AND rowid = (SELECT rowid FROM documents WHERE uri = ?)
+        , .{ fts_query, uri }) catch continue;
+        defer rows.deinit();
+        if (rows.next()) |row| {
+            const snip = row.text(0);
+            if (snip.len > 0) {
+                if (alloc.dupe(u8, snip)) |d| snippets.put(uri, d) catch {} else |_| {}
+            }
+        }
+    }
+    return snippets;
+}
+
 fn fetchLocalExtras(alloc: Allocator, uris: []const []const u8) LocalExtras {
     var snippets = std.StringHashMap([]const u8).init(alloc);
     var cover_images = std.StringHashMap([]const u8).init(alloc);
@@ -2668,6 +2733,43 @@ test "keyword doc search: candidate pass probes documents by rowid, never a scan
         try std.testing.expect(saw_rowid_probe);
     }
 
+    // the snippet-free variant (hybrid fusion) must resolve BOTH the candidate
+    // pass and the output join via rowid seeks — no second MATCH, no scans of
+    // the fat documents table
+    {
+        var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL, .{ "\"atproto\"*", @as(usize, 2000), @as(usize, 83), @as(usize, 83) });
+        defer plan.deinit();
+        var saw_inner_probe = false;
+        var saw_outer_probe = false;
+        var fts_scans: usize = 0;
+        while (plan.next()) |prow| {
+            const detail = prow.text(3);
+            if (std.mem.indexOf(u8, detail, "SEARCH d2 USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_inner_probe = true;
+            if (std.mem.indexOf(u8, detail, "SEARCH d USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_outer_probe = true;
+            if (std.mem.indexOf(u8, detail, "SCAN documents_fts") != null) fts_scans += 1;
+            try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
+        }
+        try std.testing.expect(saw_inner_probe);
+        try std.testing.expect(saw_outer_probe);
+        try std.testing.expectEqual(@as(usize, 1), fts_scans);
+    }
+
+    // the post-fusion snippet probe must use FTS5's rowid-constrained match
+    // plan (idxStr "=M"), a posting-list seek — never a full match scan
+    {
+        var plan = try ldb.query(
+            \\EXPLAIN QUERY PLAN SELECT snippet(documents_fts, 2, '', '', '...', 32)
+            \\FROM documents_fts WHERE documents_fts MATCH ?
+            \\AND rowid = (SELECT rowid FROM documents WHERE uri = ?)
+        , .{ "\"atproto\"*", "at://doc/1" });
+        defer plan.deinit();
+        var saw_rowid_match = false;
+        while (plan.next()) |prow| {
+            if (std.mem.indexOf(u8, prow.text(3), "=M") != null) saw_rowid_match = true;
+        }
+        try std.testing.expect(saw_rowid_match);
+    }
+
     // end-to-end: the matching doc comes back with its snippet — and the
     // unfiltered path (which routes through the prefilter SQL) agrees with it
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2678,6 +2780,10 @@ test "keyword doc search: candidate pass probes documents by rowid, never a scan
     // filtered path (author present) still uses the full-scan SQL and agrees
     const out_author = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, "did:plc:a", .{ .include_undiscoverable = true, .show_labeled = true });
     try std.testing.expect(std.mem.indexOf(u8, out_author, "at://doc/1") != null);
+    // snippet-free variant (hybrid fusion) agrees on the result set
+    const out_nosnip = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true, .include_snippets = false });
+    try std.testing.expect(std.mem.indexOf(u8, out_nosnip, "at://doc/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_nosnip, "at://doc/2") == null);
 }
 
 test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress" {

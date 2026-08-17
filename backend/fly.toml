@@ -8,10 +8,6 @@ primary_region = 'ewr'
   # serving merges live-overlay hits (OVERLAY_SERVE — Stage 3, flipped
   # 2026-08-13 after 4 clean compaction cycles + A/B parity + the positive
   # freshness case). ?overlay=0 remains the per-request escape hatch.
-  # Jetstream cutover (docs/jetstream-cutover.md): live ingest consumes
-  # stream.waow.tech directly; rollback = remove this line (reverts to the
-  # leaflet-search-ingester /channel path).
-  INGEST_SOURCE = 'jetstream'
   OVERLAY_WRITE = '1'
   OVERLAY_SERVE = '1'
   ENABLE_SNAPSHOT_PROMOTE = '1'
@@ -19,9 +15,6 @@ primary_region = 'ewr'
   # adopt once a day off-peak (08:00 UTC = 4am ET): every adoption cold-starts
   # the page cache, and the overlay carries freshness between adoptions
   PROMOTE_ADOPT_UTC_HOURS = '8'
-  INGESTER_HOST = 'leaflet-search-ingester.internal'
-  INGESTER_PORT = '2480'
-  INGESTER_RELAY_URL = 'https://relay.waow.tech'
 
 # app/worker split (plyr.fm's pattern): serving + ingest + labeler on `app`
 # (everything touching the /data volume), the noisy stateless tenants

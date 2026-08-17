@@ -24,8 +24,6 @@ add one as a fallback host.
 
 ## how it works (`backend/src/ingest/jetstream.zig`)
 
-- `INGEST_SOURCE=jetstream` on the `app` process group selects the consumer
-  (default `channel` = the old fly-app path, kept as rollback).
 - Subscribes `/subscribe` with `wantedCollections` for our 9 collections;
   events normalize into the same `dispatchRecord` path as /channel frames,
   so both sources index identically by construction.
@@ -42,13 +40,14 @@ add one as a fallback host.
   are quiet, a firehose-style 90s watchdog would false-trigger.
 - Env: `JETSTREAM_HOSTS` (csv override), `JETSTREAM_CURSOR_PATH`.
 
-## rollout
+## rollout (completed)
 
-1. Deploy inert (default `channel`), verify healthy.
-2. Set `INGEST_SOURCE=jetstream` in `backend/fly.toml` [env], deploy.
-3. Soak: compare `ingest.index_record` rate and `ingest.dropped` reasons in
-   logfire against the /channel baseline; spot-check fresh docs land in
-   search.
-4. Rollback at any point = revert the env var.
-5. When clean: `fly apps destroy leaflet-search-ingester`, delete
-   `ingester/`, prune the ingester deploy docs.
+1. 2026-08-16 02:59Z — cutover to a zat v1 jetstream client behind
+   `INGEST_SOURCE`. Same-night incident: unbounded PLC fetch stalled the
+   read loop (fixed: detached-thread resolve deadline).
+2. 2026-08-17 04:08Z — transport migrated to the zat.dev/jetstream SDK's
+   unified `subscribe` (seq cursors, archive sweep, gapless recovery);
+   persisted v1 time_us cursor auto-converted via `fetchAnchor`.
+3. 2026-08-17 — after ~25h of clean soak: `leaflet-search-ingester` fly app
+   + volume destroyed, `ingester/` deleted, `INGEST_SOURCE` switch removed
+   (jetstream is the only live-ingest path).

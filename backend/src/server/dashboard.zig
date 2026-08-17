@@ -229,7 +229,9 @@ pub const Data = struct {
 };
 
 fn getRelayUrl() []const u8 {
-    return if (std.c.getenv("INGESTER_RELAY_URL")) |p| std.mem.span(p) else "unknown";
+    // the event source shown on the dashboard; since the 2026-08-17 jetstream
+    // cutover this is the stream instance, not a relay we dial ourselves
+    return if (std.c.getenv("JETSTREAM_HOSTS")) |p| std.mem.span(p) else "https://stream.waow.tech";
 }
 
 // all dashboard queries batched into one request

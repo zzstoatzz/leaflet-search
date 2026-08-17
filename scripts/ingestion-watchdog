@@ -16,7 +16,10 @@ Two independent checks, both off the serving path's failure domain:
    FRESHNESS_ALERT_MINUTES. Catches the whole ingest chain being dead —
    ingester down, /channel wedged, backend worker stalled — regardless of
    which component ate it. This is the check that correctly detected the
-   2026-06-10 seven-hour stall while latency probes were green.
+   2026-06-10 seven-hour stall while latency probes were green. Deliberately
+   COARSE: lag cannot tell "nobody published" from "ingest is dead", so fast
+   detection belongs to the volume-independent "ingest consumer dead" logfire
+   alert (ingest.dropped tracks network-wide traffic and never goes quiet).
 2. SERVING (backend): /stats and a real keyword search must return 200 with
    sane bodies within 5s. Status codes alone are NOT trusted (Pages serves
    fake 200s; see docs/retro-2026-06-10-cutover-cascade.md).
@@ -56,7 +59,13 @@ from watchdog_checks import read_adoption_policy, snapshot_age_problem
 ALERT_MARKER = "pub-search ingestion looks stalled"
 BACKEND = "https://leaflet-search-backend.fly.dev"
 TURSO_URL = "https://leaf-zzstoatzz.aws-us-east-1.turso.io/v2/pipeline"
-FRESHNESS_ALERT_MINUTES = 60
+# Coarse backstop, not fast detection — see the FRESHNESS note above. 60m
+# false-paged in the overnight publication trough (78.5m of healthy lag on
+# 2026-08-17, after 46.6m on 2026-08-03 already forced 30m -> 60m); only 3-10
+# documents get published per 30min at that hour, and unchanged re-puts keep
+# indexed_at deliberately frozen. 6h clears any real trough by a wide margin
+# and still catches the 2026-06-10 seven-hour stall.
+FRESHNESS_ALERT_MINUTES = 360
 
 
 class Settings(BaseSettings):

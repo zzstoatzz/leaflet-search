@@ -4,7 +4,6 @@
 # dependencies = [
 #     "httpx",
 #     "websockets",
-#     "atproto",
 #     "pydantic-settings",
 # ]
 # ///
@@ -25,7 +24,14 @@ tap is GONE (replaced by the ingester 2026-06-09; machine stopped with
 autostart disabled). The old tap-outbox/cursor checks alerted on a zombie
 machine that fly auto-started whenever this watchdog probed it.
 
-Requires: ATPROTO_HANDLE, ATPROTO_PASSWORD, TURSO_DB_TOKEN.
+Alerts go to Discord (same channel logfire's alerts use) via a plain
+webhook — deliberately NOT bsky: an atproto outage stalls ingest AND eats
+the alert if the alert rides atproto. Repeat-alert dedup reads this
+workflow's own recent run conclusions from the GitHub API (a stall keeps
+the run failing; only the first failure in the window posts).
+
+Requires: DISCORD_WEBHOOK_URL, TURSO_DB_TOKEN. Optional: GITHUB_TOKEN +
+GITHUB_REPOSITORY (dedup; without them every stalled run posts).
 
 Usage:
     ./scripts/ingestion-watchdog                 # check; post only if stalled
@@ -39,11 +45,9 @@ import sys
 import time
 
 import httpx
-from atproto import Client, client_utils
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from watchdog_checks import snapshot_age_problem
 
-ALERT_HANDLE = "zzstoatzz.io"
 ALERT_MARKER = "pub-search ingestion looks stalled"
 BACKEND = "https://leaflet-search-backend.fly.dev"
 TURSO_URL = "https://leaf-zzstoatzz.aws-us-east-1.turso.io/v2/pipeline"
@@ -54,8 +58,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=os.environ.get("ENV_FILE", ".env"), extra="ignore"
     )
-    atproto_handle: str = ""
-    atproto_password: str = ""
+    discord_webhook_url: str = ""
     turso_db_token: str = ""
     prefect_api_url: str = ""
     prefect_api_auth_string: str = ""
@@ -193,69 +196,73 @@ def check(window_secs: int) -> tuple[bool, str]:
     return False, "healthy: ingestion fresh, serving green"
 
 
-def _post(client: Client, target_did: str, message: str):
-    tb = client_utils.TextBuilder().mention(f"@{ALERT_HANDLE}", target_did).text(f" {message}")
-    return client.send_post(tb)
+def _post(webhook_url: str, message: str) -> str:
+    """Post to Discord; returns the message id (for --test cleanup)."""
+    r = httpx.post(webhook_url, params={"wait": "true"}, json={"content": message}, timeout=15)
+    r.raise_for_status()
+    return r.json()["id"]
 
 
-def _alerted_within(client: Client, hours: int) -> bool:
-    """True if this account already posted a stall alert in the last `hours`.
+def _alerted_recently(hours: int) -> bool:
+    """True if this workflow already failed (= alerted) within `hours`.
 
-    Keeps a 15-min cron from spamming on a multi-hour stall. Errs toward posting
-    (returns False) if anything is uncertain — better a dupe than a missed alert.
+    A stall keeps the 15-min cron failing; only the first failure in the
+    window should post. Errs toward posting (False) when anything is
+    uncertain — better a dupe than a missed alert.
     """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not (token and repo):
+        return False
     try:
-        feed = client.get_author_feed(client.me.did, limit=15).feed
+        r = httpx.get(
+            f"https://api.github.com/repos/{repo}/actions/workflows/ingestion-watchdog.yml/runs",
+            params={"status": "failure", "per_page": 10},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+        this_run = os.environ.get("GITHUB_RUN_ID", "")
+        for run in r.json().get("workflow_runs", []):
+            if str(run.get("id")) == this_run:
+                continue
+            created = datetime.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+            if created > cutoff:
+                return True
     except Exception:
         return False
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
-    for item in feed:
-        rec = getattr(item.post, "record", None)
-        text = getattr(rec, "text", "") or ""
-        if ALERT_MARKER not in text:
-            continue
-        created = getattr(rec, "created_at", None)
-        if not created:
-            return True
-        try:
-            if datetime.datetime.fromisoformat(created.replace("Z", "+00:00")) > cutoff:
-                return True
-        except ValueError:
-            return True
     return False
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="pub-search ingestion watchdog")
-    ap.add_argument("--test", action="store_true", help="post a wiring-test mention, then delete it")
+    ap.add_argument("--test", action="store_true", help="post a wiring-test message, then delete it")
     ap.add_argument("--window", type=int, default=0, help="(unused, kept for CLI compat)")
     ap.add_argument("--dedup-hours", type=int, default=3, help="suppress repeat alerts within this window")
     args = ap.parse_args()
 
     settings = Settings()
-    if not (settings.atproto_handle and settings.atproto_password):
-        print("ATPROTO_HANDLE/ATPROTO_PASSWORD not set — skipping (configure to enable)")
+    webhook = settings.discord_webhook_url
+    if not webhook:
+        print("DISCORD_WEBHOOK_URL not set — skipping (configure to enable)")
         return
 
-    client = Client()
-    client.login(settings.atproto_handle, settings.atproto_password)
-    target_did = client.resolve_handle(ALERT_HANDLE).did
-
     if args.test:
-        resp = _post(client, target_did, "pub-search ingestion watchdog wiring test — ignore (auto-deleting).")
-        print(f"posted test: {resp.uri}")
-        client.delete_post(resp.uri)
-        print("deleted test post — auth + posting confirmed")
+        msg_id = _post(webhook, "pub-search ingestion watchdog wiring test — ignore (auto-deleting).")
+        print(f"posted test message {msg_id}")
+        httpx.delete(f"{webhook}/messages/{msg_id}", timeout=15).raise_for_status()
+        print("deleted test message — webhook confirmed")
         return
 
     stalled, detail = check(args.window)
     print(detail)
     if stalled:
-        if _alerted_within(client, args.dedup_hours):
+        if _alerted_recently(args.dedup_hours):
             print(f"stalled, but already alerted within {args.dedup_hours}h — not reposting")
         else:
-            resp = _post(client, target_did, f"⚠️ {ALERT_MARKER} — {detail}. check logfire + fly logs -a leaflet-search-backend")
-            print(f"ALERT posted: {resp.uri}")
+            _post(webhook, f"⚠️ {ALERT_MARKER} — {detail}. check logfire + fly logs -a leaflet-search-backend")
+            print("ALERT posted to discord")
         sys.exit(1)
 
 

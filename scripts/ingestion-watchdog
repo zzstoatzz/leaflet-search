@@ -51,7 +51,7 @@ import time
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from watchdog_checks import snapshot_age_problem
+from watchdog_checks import read_adoption_policy, snapshot_age_problem
 
 ALERT_MARKER = "pub-search ingestion looks stalled"
 BACKEND = "https://leaflet-search-backend.fly.dev"
@@ -105,20 +105,29 @@ def check(window_secs: int) -> tuple[bool, str]:
     else:
         print("TURSO_DB_TOKEN not set — skipping freshness check")
 
-    # 2. snapshot freshness: serving adopts hourly builds from R2; the
-    # /snapshot endpoint serves the live replica's manifest sidecar. A stale
-    # created_at means the builder or the promote watcher is dead even though
-    # turso ingestion looks fine.
+    # 2. snapshot adoption: the promote watcher adopts builds from R2 during the
+    # PROMOTE_ADOPT_UTC_HOURS window, and /snapshot serves the live replica's
+    # manifest sidecar. The bound comes from that same window (see
+    # watchdog_checks) — a window closing without the build advancing means the
+    # builder or the promote watcher is dead even though turso ingestion is fine.
     try:
+        policy = read_adoption_policy()
         r = httpx.get(BACKEND + "/snapshot", timeout=5)
         if r.status_code == 200:
             manifest = r.json()
             now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-            if problem := snapshot_age_problem(manifest, now):
+            if problem := snapshot_age_problem(manifest, now, policy):
                 problems.append(problem)
             else:
                 snap_age_min = (now - manifest["created_at"]) / 60
-                print(f"snapshot ok: {snap_age_min:.0f}m old ({manifest.get('build_id', '?')})")
+                window = (
+                    "unwindowed" if policy.hours is None
+                    else "adopts " + ",".join(f"{h:02d}:00Z" for h in policy.hours)
+                )
+                print(
+                    f"snapshot ok: {snap_age_min:.0f}m old "
+                    f"({manifest.get('build_id', '?')}, {window})"
+                )
         else:
             # 404 = pre-adoption replica; tolerated until the first adoption
             print(f"snapshot check: /snapshot -> {r.status_code} (pre-adoption replica?)")
@@ -147,8 +156,9 @@ def check(window_secs: int) -> tuple[bool, str]:
             problems.append(last_err)
 
     # 4. snapshot builder (heavypad prefect flow) — cause-level check so a
-    # failing flow pages within 15min instead of waiting for the 180m
-    # snapshot-age symptom. Skipped silently when the creds aren't set.
+    # failing flow pages within 15min instead of waiting for the next adoption
+    # window to close. Skipped silently when the creds aren't set — but a
+    # rejected credential is a problem, not a skip (see below).
     if settings.prefect_api_url and settings.prefect_api_auth_string:
         try:
             import base64
@@ -190,9 +200,20 @@ def check(window_secs: int) -> tuple[bool, str]:
                     print(f"builder ok: last run {last.get('name', '?')} COMPLETED")
             else:
                 problems.append("snapshot builder: no terminal flow runs found")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                # not transient and it will never heal on its own: the credential
+                # is wrong. Left as a print, this check sat blind for hours on
+                # 2026-08-17 while only the age symptom was visible.
+                problems.append(
+                    f"prefect API rejected the watchdog credential "
+                    f"({e.response.status_code}) — builder check is blind; "
+                    "refresh PREFECT_API_AUTH_STRING"
+                )
+            else:
+                print(f"builder check skipped: prefect API error ({e!r})")
         except Exception as e:
-            # the prefect API being unreachable is itself worth knowing about,
-            # but don't page for a transient blip alone — print, don't append.
+            # a transient blip reaching the API is worth printing, not paging.
             print(f"builder check skipped: prefect API unreachable ({e!r})")
 
     if problems:

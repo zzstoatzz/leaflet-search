@@ -96,7 +96,11 @@ manifest (what build is prod actually serving). the builder has a 45-minute
 process deadline; an independent 15-minute guardian stops runs over 50 minutes
 and starts a missed run when snapshot age exceeds 75 minutes. after a builder
 exits, the guardian allows 15 minutes for download and atomic adoption before
-starting another run. the watchdog alerts when age exceeds 120 minutes. see
+starting another run. the watchdog does *not* alert on raw age — adoption is
+windowed (`PROMOTE_ADOPT_UTC_HOURS`), so a snapshot is legitimately ~24h old
+just before the next window opens. it alerts when an adoption window closes
+without the serving build advancing, deriving that bound from `backend/fly.toml`
+rather than restating it (`scripts/watchdog_checks.py`). see
 [the July 15 stale-snapshot retro](retro-2026-07-15-stale-snapshot-builder-hang.md).
 
 ## what happens at arbitrary scale

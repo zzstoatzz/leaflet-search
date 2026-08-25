@@ -22,7 +22,7 @@ module.exports = {
     {
       // atlas datasets are big (atlas.json ~7MB) and rebuilt every 6h — serve
       // cached instantly, refresh in the background
-      urlPattern: /\/atlas(-mini|-avatar-cache|-theme-cache)?\.json$/,
+      urlPattern: /\/atlas(-mini|-avatar-cache|-theme-cache)?\.json(\.gz)?$/,
       handler: 'StaleWhileRevalidate',
       options: {
         cacheName: 'atlas-data',

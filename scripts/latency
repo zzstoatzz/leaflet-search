@@ -55,7 +55,7 @@ PROBE_TARGETS = [
     ("activity",       "{b}/activity"),
     ("stats",          "{b}/stats"),
     ("snapshot",       "{b}/snapshot"),
-    ("atlas.json",     SITE + "/atlas.json"),
+    ("atlas.json.gz",  SITE + "/atlas.json.gz"),
     ("homepage",       SITE + "/"),
 ]
 

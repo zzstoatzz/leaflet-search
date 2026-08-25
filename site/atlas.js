@@ -2177,10 +2177,13 @@
     // start logo prefetch in parallel — they're small (<60KB total) and we
     // want them ready by the time the user zooms in far enough for titles.
     loadPlatformLogos();
-    fetch('atlas.json')
+    // atlas.json.gz: the raw json passed cloudflare pages' 25MiB per-file
+    // limit, so the build ships it gzipped and we decompress client-side
+    fetch('atlas.json.gz')
       .then(function(r) {
-        if (!r.ok) throw new Error('failed to load atlas.json: ' + r.status);
-        return r.json();
+        if (!r.ok) throw new Error('failed to load atlas.json.gz: ' + r.status);
+        var ds = new DecompressionStream('gzip');
+        return new Response(r.body.pipeThrough(ds)).json();
       })
       .then(function(d) {
         data = d;

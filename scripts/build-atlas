@@ -20,6 +20,7 @@ Usage:
 import argparse
 import asyncio
 import gc
+import gzip
 import json
 import os
 import re
@@ -823,13 +824,18 @@ def main():
         },
     }
 
-    out_path = Path(args.output)
+    # gzipped only: the raw json outgrew cloudflare pages' 25 MiB per-file
+    # limit (83k points), so the site ships atlas.json.gz and the client
+    # decompresses via DecompressionStream. mtime=0 keeps the output
+    # byte-identical for identical content.
+    out_path = Path(str(args.output) + ".gz" if not str(args.output).endswith(".gz") else args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(output, separators=(",", ":")))
+    raw = json.dumps(output, separators=(",", ":")).encode()
+    out_path.write_bytes(gzip.compress(raw, mtime=0))
 
     size_kb = out_path.stat().st_size / 1024
     elapsed = time.monotonic() - t_start
-    log(f"\nwrote {out_path} ({size_kb:.0f} KB, {len(points)} points)")
+    log(f"\nwrote {out_path} ({size_kb:.0f} KB gz, {len(raw) / 1024:.0f} KB raw, {len(points)} points)")
     log(f"done in {elapsed:.1f}s")
 
 

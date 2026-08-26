@@ -216,6 +216,9 @@
     pubLoading[key] = true;
     pubLoadCount++;
     var img = new Image();
+    // anonymous CORS: the avatar gets wrapped onto a WebGL planet texture,
+    // and a tainted canvas would make texImage2D throw
+    img.crossOrigin = 'anonymous';
     img.onload = function() {
       pubImages[key] = img;
       delete pubLoading[key];
@@ -828,13 +831,13 @@
   // name marquee + basePath band, rotated by the same GL renderer.
   var pubPlanetTex = new Map(); // basePath -> texture entry
 
-  function getPubPlanetTexture(pub) {
+  function getPubPlanetTexture(pub, img) {
     var theme = frameDark ? 'dark' : 'light';
     resolvePubAccent(pub);
     var accent = pubAccents[pub.basePath] || null;
     var accentKey = accent ? accent.key : 'none';
     var e = pubPlanetTex.get(pub.basePath);
-    if (e && e.theme === theme && e.accentKey === accentKey) return e;
+    if (e && e.theme === theme && e.accentKey === accentKey && e.hasAvatar === !!img) return e;
     if (pubPlanetTex.size > 96) pubPlanetTex.delete(pubPlanetTex.keys().next().value);
     var platform = pub.platform || 'other';
     var c = frameColors[platform] || frameColors.other;
@@ -854,6 +857,19 @@
     } else {
       baseRGB = parseHex(c.edge);
       accentRGB = parseHex(c.mid);
+    }
+    if (img) {
+      // wrap the avatar around the sphere: square copies at an exact
+      // divisor of texW so the seam never jumps, faces rotating past
+      var tile = PLANET_TEX_H; // full pole-to-pole
+      var mA = Math.max(1, Math.floor(PLANET_TEX_W / (tile * 2)));
+      var periodA = PLANET_TEX_W / mA;
+      for (var ka = 0; ka * periodA < cv.width; ka++) {
+        g.drawImage(img, ka * periodA + (periodA - tile) / 2, 0, tile, tile);
+      }
+      var eA = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, true);
+      pubPlanetTex.set(pub.basePath, eA);
+      return eA;
     }
     g.fillStyle = hexToRgba(c.mid, 0.35);
     g.fillRect(0, 10, cv.width, 2);
@@ -891,20 +907,25 @@
         g.fillText(meta, k2 * period2, 79);
       }
     }
+    e = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, false);
+    pubPlanetTex.set(pub.basePath, e);
+    return e;
+  }
+
+  function buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, hasAvatar) {
     var seedN = 0;
     for (var si = 0; si < pub.basePath.length; si++) seedN = (seedN * 31 + pub.basePath.charCodeAt(si)) >>> 0;
-    e = {
+    return {
       canvas: cv,
       theme: theme,
       accentKey: accentKey,
+      hasAvatar: hasAvatar,
       speed: 0.14 + (seedN % 7) * 0.02,
       phase: (seedN % 31) * 0.45,
       seed: (seedN % 97) * 1.3,
       baseRGB: [baseRGB[0] / 255, baseRGB[1] / 255, baseRGB[2] / 255],
       accentRGB: [accentRGB[0] / 255, accentRGB[1] / 255, accentRGB[2] / 255],
     };
-    pubPlanetTex.set(pub.basePath, e);
-    return e;
   }
 
   var planetShadeCache = {};
@@ -1302,9 +1323,13 @@
         var pColors = frameColors[pPlatform] || frameColors.other;
 
         if (planetGL) {
-          // literal globe: the same rotating vegas-sphere as the documents,
-          // with the publication's name as the marquee
-          pubPlanetCands.push({ pub: pub, sx: psx, sy: psy, r: pr });
+          // literal globe: the same rotating vegas-sphere as the documents.
+          // budgeted pubs get their avatar wrapped onto the surface — a
+          // planet of that person; the rest carry the name marquee.
+          var wantAvatar = pr >= imgThreshold && avatarBudget > 0;
+          if (wantAvatar) { loadPubImage(pub); avatarBudget--; }
+          var pImg = wantAvatar ? pubImages[pub.basePath] : null;
+          pubPlanetCands.push({ pub: pub, sx: psx, sy: psy, r: pr, img: pImg });
         } else {
           // no-GL fallback: a static shaded sphere in the platform palette
           var sphere = getPubSphere(pPlatform, pr);
@@ -1326,19 +1351,27 @@
         var pubTexSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
         for (var pc = 0; pc < pubPlanetCands.length; pc++) {
           var pcand = pubPlanetCands[pc];
-          var pTex = getPubPlanetTexture(pcand.pub);
+          var pTex = getPubPlanetTexture(pcand.pub, pcand.img);
           var pRot = (pubTSec * pTex.speed + pTex.phase) % (Math.PI * 2);
-          // below marquee size the projected text is illegible scribble —
-          // small globes stay clean shaded spheres, the name arrives with size
-          var pCanvas = pcand.r >= 30 ? pTex.canvas : getBlankPlanetTexture();
-          planetGL.draw(pCanvas, pcand.sx, pcand.sy, pcand.r, 1, pRot, {
-            base: pTex.baseRGB,
-            accent: pTex.accentRGB,
-            seed: pTex.seed,
-            texSpan: pubTexSpan,
-            hover: false,
-            dpr: dpr,
-          });
+          // below marquee size projected TEXT is illegible scribble, so
+          // text-only globes stay clean spheres until they're landmarks —
+          // but a face reads at any size, so avatar planets always wear it
+          var pCanvas = (pTex.hasAvatar || pcand.r >= 30) ? pTex.canvas : getBlankPlanetTexture();
+          try {
+            planetGL.draw(pCanvas, pcand.sx, pcand.sy, pcand.r, 1, pRot, {
+              base: pTex.baseRGB,
+              accent: pTex.accentRGB,
+              seed: pTex.seed,
+              texSpan: pubTexSpan,
+              hover: false,
+              dpr: dpr,
+            });
+          } catch (texErr) {
+            // tainted avatar canvas — evict and never retry the image
+            pubPlanetTex.delete(pcand.pub.basePath);
+            pubFailed[pcand.pub.basePath] = true;
+            delete pubImages[pcand.pub.basePath];
+          }
         }
         ctx.drawImage(planetGL.canvas, 0, 0, W, H);
         planetsActive = true; // keep frames coming so the globes rotate

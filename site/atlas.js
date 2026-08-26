@@ -32,9 +32,14 @@
     // centroids. Ends early — once fine cluster labels are readable, the
     // region-scale flares read as extreme rather than atmospheric.
     coarse: {
-      alphaDark: 0.10, alphaLight: 0.08, // peak opacity
+      // layerAlpha bounds the WHOLE coarse layer: halos composite into an
+      // offscreen canvas first, so 50 overlapping regions can never stack
+      // toward white — the dense center tops out at layerAlpha, full stop
+      layerAlpha: { dark: 0.16, light: 0.12 },
+      spriteAlpha: 0.5,                  // per-halo alpha inside the layer
       outStart: 1.8, outRange: 1.0,      // fully gone by ~2.8
       smallShrink: 0.6,                  // small-viewport halo shrink
+      maxHaloPx: 200,                    // sprawling outlier regions otherwise wash the whole overview grey
     },
     // per-cluster hue palette ('other'-dominated lanterns + their points):
     // muted saturation — colored, but still atmospheric. [saturation, lightness]
@@ -801,6 +806,8 @@
     return cv;
   }
 
+  var coarseLayer = null; // offscreen compositing surface for the coarse nebula layer
+
   var planetShadeCache = {};
 
   function getPlanetShade(R) {
@@ -1033,18 +1040,25 @@
     var coarseHaloAlpha = fadeOut(zoom, coarseTune.outStart, coarseTune.outRange);
     if (coarseHaloAlpha > 0.01) {
       var coarse = data.clusters.coarse;
-      var coarseAlphaNow = (dark ? coarseTune.alphaDark : coarseTune.alphaLight) * coarseHaloAlpha;
+      if (!coarseLayer || coarseLayer.width !== W || coarseLayer.height !== H) {
+        coarseLayer = document.createElement('canvas');
+        coarseLayer.width = W; coarseLayer.height = H;
+      }
+      var lg = coarseLayer.getContext('2d');
+      lg.clearRect(0, 0, W, H);
+      lg.globalAlpha = coarseTune.spriteAlpha;
       for (var c = 0; c < coarse.length; c++) {
         var cl = coarse[c];
-        var r = (cl.radius || 0.05) * scale;
+        var r = Math.min(coarseTune.maxHaloPx, (cl.radius || 0.05) * scale);
         if (r < 2) continue;
         var sx = cx + cl.cx * scale, sy = cy + cl.cy * scale;
         if (sx + r < 0 || sx - r > W || sy + r < 0 || sy - r > H) continue;
         var halo = getHaloSprite(cl.dominantPlatform || 'other', r, cl.id);
         var drawSize = halo.sprite.width * (r / halo.bucket) * haloShrink;
-        ctx.globalAlpha = coarseAlphaNow;
-        ctx.drawImage(halo.sprite, sx - drawSize / 2, sy - drawSize / 2, drawSize, drawSize);
+        lg.drawImage(halo.sprite, sx - drawSize / 2, sy - drawSize / 2, drawSize, drawSize);
       }
+      ctx.globalAlpha = (dark ? coarseTune.layerAlpha.dark : coarseTune.layerAlpha.light) * coarseHaloAlpha;
+      ctx.drawImage(coarseLayer, 0, 0, W, H);
       ctx.globalAlpha = 1;
     }
 
@@ -1057,6 +1071,14 @@
     var nebAlpha = fadeIn(zoom, neb.inStart, neb.inRange) * fadeOut(zoom, neb.outStart, neb.outRange);
     if (nebAlpha > 0.01 && data.clusters.fine) {
       var fine = data.clusters.fine;
+      // composite lanterns offscreen, blit once: overlapping lanterns in a
+      // dense neighborhood can no longer stack past the layer bound
+      if (!coarseLayer || coarseLayer.width !== W || coarseLayer.height !== H) {
+        coarseLayer = document.createElement('canvas');
+        coarseLayer.width = W; coarseLayer.height = H;
+      }
+      var flg = coarseLayer.getContext('2d');
+      flg.clearRect(0, 0, W, H);
       for (var c = 0; c < fine.length; c++) {
         var cl = fine[c];
         var L = cl.lantern;
@@ -1071,9 +1093,11 @@
         var halo2 = getHaloSprite(cl.dominantPlatform || 'other', rPx, cl.id);
         var drawSize2 = halo2.sprite.width * (rPx / halo2.bucket);
         var v = neb.varBase + hash01(cl.id) * neb.varRange; // per-lantern brightness variation
-        ctx.globalAlpha = neb.alpha * v * nebAlpha;
-        ctx.drawImage(halo2.sprite, nsx - drawSize2 / 2, nsy - drawSize2 / 2, drawSize2, drawSize2);
+        flg.globalAlpha = 0.6 * v;
+        flg.drawImage(halo2.sprite, nsx - drawSize2 / 2, nsy - drawSize2 / 2, drawSize2, drawSize2);
       }
+      ctx.globalAlpha = neb.alpha * 1.6 * nebAlpha; // layer bound ≈ old single-lantern peak
+      ctx.drawImage(coarseLayer, 0, 0, W, H);
       ctx.globalAlpha = 1;
     }
 

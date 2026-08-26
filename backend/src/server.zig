@@ -1011,9 +1011,12 @@ fn handleLabel(request: *http.Server.Request, target: []const u8) !void {
         return;
     };
 
-    // a negation is the operator overruling the model — keep the classifier's
-    // book in sync so /labels reflects the retraction and the DID never re-flags.
-    if (neg and mem.eql(u8, val, labeler.LABEL_BULK_GENERATED)) classifier.markNegated(did);
+    // Keep the classifier's enforcement state in sync with manual labels.
+    // Search reads author_stats directly, so emitting a signed positive label
+    // without this update would publish the verdict but continue serving it.
+    if (mem.eql(u8, val, labeler.LABEL_BULK_GENERATED)) {
+        if (neg) classifier.markNegated(did) else classifier.markLabeled(did);
+    }
 
     const body = try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"seq\":{d},\"did\":\"{s}\",\"val\":\"{s}\",\"neg\":{}}}", .{ seq, did, val, neg });
     try request.respond(body, .{ .extra_headers = json_hdr });

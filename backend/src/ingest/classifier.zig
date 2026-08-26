@@ -31,6 +31,7 @@ const log = std.log.scoped(.classifier);
 // autonomous and there's no curation veto in the firehose path.
 const FLOOR: i64 = 50; // min docs before a DID can be judged
 const EVAL_EVERY: i64 = 25; // re-score every N docs past the floor until labeled
+const EXTREME_VOLUME_REVIEW_FLOOR: i64 = 5000;
 // Precision comes from the signal fixes (date/empty/non-ASCII titles score ~0.3),
 // not the threshold — so 0.50 catches genuine mirrors (transit feeds ~0.54)
 // while staying FP-safe. The curation veto is the backstop for prolific humans.
@@ -42,6 +43,7 @@ const THRESHOLD: f64 = 0.50;
 // v11 = rotating-slot template fix (short mostly-scaffold titles count fully
 // templated) + thin-volume promotion (eligundry mood tracker sat at 0.47).
 const SCORING_VERSION: i64 = 11;
+const AGGREGATION_VERSION: i64 = 1; // v1: count unique document URIs, not put/update events
 
 // review pipeline states. The heuristic is a cheap PRE-FILTER: it never emits
 // directly (titles can't tell a branded real blog from a registry mirror). It
@@ -77,6 +79,7 @@ const ReviewCfg = struct {
 const SAMPLE_CAP: i64 = 64; // normalized titles kept per DID for template scoring
 
 var g_conn: ?zqlite.Conn = null;
+var g_rebuilding = std.atomic.Value(bool).init(false);
 
 const STOPWORDS = [_][]const u8{
     "the", "a",   "an",   "and", "or",   "but", "of",   "to", "in",  "on", "for",  "with",
@@ -123,6 +126,7 @@ pub fn init() void {
     // display identity for authors with no replica presence (seeded bans):
     // the replica can't resolve a site for a DID it has zero docs for.
     conn.execNoArgs("ALTER TABLE author_stats ADD COLUMN site TEXT NOT NULL DEFAULT ''") catch {};
+    conn.execNoArgs("CREATE TABLE IF NOT EXISTS observed_documents (uri TEXT PRIMARY KEY)") catch {};
     g_conn = conn;
     logfire.info("classifier: author-stats ready (floor={d} threshold={d:.2})", .{ FLOOR, THRESHOLD });
 }
@@ -130,8 +134,8 @@ pub fn init() void {
 /// Feed one ingested document. Cheap upsert; scores + maybe emits when a DID
 /// crosses the floor. Called from the firehose path — must never block on
 /// anything but local sqlite.
-pub fn observe(did: []const u8, title: []const u8, content: []const u8) void {
-    observeLen(did, title, content.len);
+pub fn observe(uri: []const u8, did: []const u8, title: []const u8, content: []const u8) void {
+    observeLen(uri, did, title, content.len);
 }
 
 /// One-time backfill: feed the existing corpus through the aggregate so the
@@ -142,6 +146,7 @@ pub fn observe(did: []const u8, title: []const u8, content: []const u8) void {
 pub fn bootstrap() void {
     const conn = g_conn orelse return;
     if (getMeta(conn, "scoring_version") == SCORING_VERSION) {
+        if (getMeta(conn, "aggregation_version") != AGGREGATION_VERSION) rebuildUniqueAggregation(conn);
         // no re-score needed, but a DID newly added to banned-dids.txt still
         // needs its seeded label without waiting for a version bump.
         seedBannedRegistry(conn);
@@ -172,32 +177,102 @@ pub fn bootstrap() void {
         if (prev.items.len > 0)
             logfire.info("classifier: cleared {d} prior labels for re-scoring (v{d})", .{ prev.items.len, SCORING_VERSION });
         conn.execNoArgs("DELETE FROM author_stats") catch {};
+        conn.execNoArgs("DELETE FROM observed_documents") catch {};
     }
 
-    const Entry = struct { did: []const u8, title: []const u8, len: usize };
+    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize };
     var entries: std.ArrayList(Entry) = .empty;
 
     // materialize first so we don't hold a replica read connection across the
     // (slower) per-row upserts below.
     {
-        var rows = local.query("SELECT did, title, LENGTH(content) FROM documents", .{}) catch |err| {
+        var rows = local.query("SELECT uri, did, title, LENGTH(content) FROM documents", .{}) catch |err| {
             logfire.err("classifier: bootstrap query failed: {s}", .{@errorName(err)});
             return;
         };
         defer rows.deinit();
         while (rows.next()) |row| {
             entries.append(a, .{
-                .did = a.dupe(u8, row.text(0)) catch continue,
-                .title = a.dupe(u8, row.text(1)) catch continue,
-                .len = @intCast(@max(row.int(2), 0)),
+                .uri = a.dupe(u8, row.text(0)) catch continue,
+                .did = a.dupe(u8, row.text(1)) catch continue,
+                .title = a.dupe(u8, row.text(2)) catch continue,
+                .len = @intCast(@max(row.int(3), 0)),
             }) catch continue;
         }
     }
 
-    for (entries.items) |e| observeLen(e.did, e.title, e.len);
+    for (entries.items) |e| observeLen(e.uri, e.did, e.title, e.len);
     setMeta(conn, "scoring_version", SCORING_VERSION);
+    setMeta(conn, "aggregation_version", AGGREGATION_VERSION);
     logfire.info("classifier: bootstrap (re)scored {d} existing docs at v{d}", .{ entries.items.len, SCORING_VERSION });
     seedBannedRegistry(conn);
+}
+
+/// v1 counted every put/update as another document. Rebuild the aggregate from
+/// unique corpus URIs while retaining terminal operator/model decisions. Pending
+/// nominations are intentionally discarded and must qualify again from their
+/// real document count.
+fn rebuildUniqueAggregation(conn: zqlite.Conn) void {
+    const local = db.getLocalDbRaw() orelse return;
+    if (!local.isReady()) return;
+
+    g_rebuilding.store(true, .release);
+    defer g_rebuilding.store(false, .release);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Decision = struct {
+        did: []const u8,
+        state: i64,
+        attempts: i64,
+        reason: []const u8,
+        site: []const u8,
+    };
+    var decisions: std.ArrayList(Decision) = .empty;
+    var decided_rows = conn.rows(
+        "SELECT did, state, review_attempts, reason, site FROM author_stats WHERE state IN (?, ?, ?)",
+        .{ STATE_LABELED, STATE_REJECTED, STATE_VETOED },
+    ) catch return;
+    while (decided_rows.next()) |row| {
+        decisions.append(a, .{
+            .did = a.dupe(u8, row.text(0)) catch continue,
+            .state = row.int(1),
+            .attempts = row.int(2),
+            .reason = a.dupe(u8, row.text(3)) catch continue,
+            .site = a.dupe(u8, row.text(4)) catch continue,
+        }) catch continue;
+    }
+    decided_rows.deinit();
+
+    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize };
+    var entries: std.ArrayList(Entry) = .empty;
+    var rows = local.query("SELECT uri, did, title, LENGTH(content) FROM documents", .{}) catch return;
+    while (rows.next()) |row| {
+        entries.append(a, .{
+            .uri = a.dupe(u8, row.text(0)) catch continue,
+            .did = a.dupe(u8, row.text(1)) catch continue,
+            .title = a.dupe(u8, row.text(2)) catch continue,
+            .len = @intCast(@max(row.int(3), 0)),
+        }) catch continue;
+    }
+    rows.deinit();
+
+    conn.execNoArgs("DELETE FROM author_stats") catch return;
+    conn.execNoArgs("DELETE FROM observed_documents") catch return;
+    for (entries.items) |entry| observeLen(entry.uri, entry.did, entry.title, entry.len);
+
+    for (decisions.items) |decision| {
+        conn.exec(
+            \\INSERT INTO author_stats (did, labeled, state, review_attempts, reason, site)
+            \\VALUES (?, 1, ?, ?, ?, ?)
+            \\ON CONFLICT(did) DO UPDATE SET labeled = 1, state = excluded.state,
+            \\  review_attempts = excluded.review_attempts, reason = excluded.reason, site = excluded.site
+        , .{ decision.did, decision.state, decision.attempts, decision.reason, decision.site }) catch {};
+    }
+    setMeta(conn, "aggregation_version", AGGREGATION_VERSION);
+    logfire.info("classifier: rebuilt {d} unique documents; preserved {d} terminal decisions", .{ entries.items.len, decisions.items.len });
 }
 
 /// The hand-banned registry (banned-dids.txt / docs/exclusions.md) must be a
@@ -242,8 +317,9 @@ fn setMeta(conn: zqlite.Conn, key: []const u8, v: i64) void {
     conn.exec("INSERT OR REPLACE INTO classifier_meta (k, v) VALUES (?, ?)", .{ key, v }) catch {};
 }
 
-fn observeLen(did: []const u8, title: []const u8, content_len: usize) void {
+fn observeLen(uri: []const u8, did: []const u8, title: []const u8, content_len: usize) void {
     const conn = g_conn orelse return;
+    if (!claimDocument(conn, uri)) return;
 
     var norm_buf: [256]u8 = undefined;
     const norm = normalizeTitle(title, &norm_buf);
@@ -269,6 +345,15 @@ fn observeLen(did: []const u8, title: []const u8, content_len: usize) void {
     maybeEvaluate(conn, did);
 }
 
+fn claimDocument(conn: zqlite.Conn, uri: []const u8) bool {
+    if (conn.row("SELECT 1 FROM observed_documents WHERE uri = ?", .{uri}) catch return false) |seen| {
+        seen.deinit();
+        return false;
+    }
+    conn.exec("INSERT OR IGNORE INTO observed_documents (uri) VALUES (?)", .{uri}) catch return false;
+    return true;
+}
+
 fn maybeEvaluate(conn: zqlite.Conn, did: []const u8) void {
     const row = (conn.row(
         "SELECT doc_count, len_sum, empty_titles, digit_titles, title_sample, labeled FROM author_stats WHERE did = ?",
@@ -292,7 +377,7 @@ fn maybeEvaluate(conn: zqlite.Conn, did: []const u8) void {
         .sample = row.text(4),
     };
     const score = stats.score(arena.allocator());
-    if (score < THRESHOLD and !stats.thinPromote()) return;
+    if (!stats.shouldReview(score)) return;
 
     // curation veto: any recommends/subscriptions → never label (human signal a
     // mirror won't have). Decided; stop re-scoring.
@@ -339,10 +424,21 @@ pub fn isLabeledDid(did: []const u8) bool {
 /// Keeps state=REJECTED (terminal) so the classifier never re-flags the DID.
 pub fn markNegated(did: []const u8) void {
     const conn = g_conn orelse return;
+    setOperatorState(conn, did, STATE_REJECTED, "label negated by operator");
+}
+
+/// Keep the classifier's enforcement state in sync with a positive label
+/// emitted through the operator endpoint.
+pub fn markLabeled(did: []const u8) void {
+    const conn = g_conn orelse return;
+    setOperatorState(conn, did, STATE_LABELED, "label emitted by operator");
+}
+
+fn setOperatorState(conn: zqlite.Conn, did: []const u8, state: i64, reason: []const u8) void {
     conn.exec(
-        "UPDATE author_stats SET state = ?, reason = 'label negated by operator' WHERE did = ?",
-        .{ STATE_REJECTED, did },
-    ) catch {};
+        \\INSERT INTO author_stats (did, labeled, state, reason) VALUES (?, 1, ?, ?)
+        \\ON CONFLICT(did) DO UPDATE SET labeled = 1, state = excluded.state, reason = excluded.reason
+    , .{ did, state, reason }) catch {};
 }
 
 fn stateName(s: i64) []const u8 {
@@ -472,6 +568,18 @@ const Stats = struct {
         const dc: f64 = @floatFromInt(self.doc_count);
         const volume = clamp01((std.math.log10(@max(dc, 1.0)) - 2.0) / 2.0);
         return (1.0 - avg_len / 800.0) > 0.9 and volume > 0.3;
+    }
+
+    /// Route exceptionally prolific publishers through the model gate even
+    /// when they generate fluent, uniquely titled documents. This does not
+    /// label on volume; it only spends review tokens so feed-to-article farms
+    /// cannot remain permanently invisible to the content judge.
+    fn extremeVolumePromote(self: Stats) bool {
+        return self.doc_count >= EXTREME_VOLUME_REVIEW_FLOOR;
+    }
+
+    fn shouldReview(self: Stats, score_value: f64) bool {
+        return score_value >= THRESHOLD or self.thinPromote() or self.extremeVolumePromote();
     }
 
     /// composite 0..1 — same shape as scripts/classify-bulk-mirror.
@@ -643,6 +751,7 @@ fn resetExhaustedAttempts(conn: zqlite.Conn) void {
 }
 
 fn nextPending(allocator: Allocator, conn: zqlite.Conn) ?[]const u8 {
+    if (g_rebuilding.load(.acquire)) return null;
     const row = (conn.row(
         "SELECT did FROM author_stats WHERE state = ? AND review_attempts < ? ORDER BY review_attempts ASC LIMIT 1",
         .{ STATE_PENDING, MAX_REVIEW_ATTEMPTS },
@@ -1162,6 +1271,75 @@ test "date-titled journal is NOT flagged (precision regression: firstwaterbottle
     // the old code scored this maximally templated (1.0) → false positive.
     try std.testing.expectEqual(@as(f64, 0), journal.templateScore(a));
     try std.testing.expect(journal.score(a) < THRESHOLD);
+}
+
+test "extreme volume reaches review despite fluent unique titles (regression: trendingonweibo)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const feed_articles = Stats{
+        .doc_count = 12_424,
+        .len_sum = 47_538_291,
+        .empty_titles = 0,
+        .digit_titles = 2353,
+        .sample = "faye wong makes a rare public appearance\nhow a one yuan note became china s most shared rebuttal\nchina s hotel chain made its pillows popular\nwhy a blockbuster is dominating weibo",
+    };
+    const score_value = feed_articles.score(a);
+    try std.testing.expect(score_value < THRESHOLD);
+    try std.testing.expect(!feed_articles.thinPromote());
+    try std.testing.expect(feed_articles.extremeVolumePromote());
+    try std.testing.expect(feed_articles.shouldReview(score_value));
+
+    const prolific_human = Stats{
+        .doc_count = 1195,
+        .len_sum = 1195 * 1800,
+        .empty_titles = 0,
+        .digit_titles = 20,
+        .sample = feed_articles.sample,
+    };
+    try std.testing.expect(!prolific_human.extremeVolumePromote());
+}
+
+test "operator positive and negated labels update enforcement state" {
+    const conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+    defer conn.close();
+    try conn.execNoArgs(
+        \\CREATE TABLE author_stats (
+        \\  did TEXT PRIMARY KEY,
+        \\  labeled INTEGER NOT NULL DEFAULT 0,
+        \\  state INTEGER NOT NULL DEFAULT 0,
+        \\  reason TEXT NOT NULL DEFAULT ''
+        \\)
+    );
+
+    setOperatorState(conn, "did:new", STATE_LABELED, "label emitted by operator");
+    setOperatorState(conn, "did:existing", STATE_REJECTED, "label negated by operator");
+    setOperatorState(conn, "did:existing", STATE_LABELED, "label emitted by operator");
+
+    const labeled = (try conn.row("SELECT state, reason FROM author_stats WHERE did = 'did:new'", .{})).?;
+    defer labeled.deinit();
+    try std.testing.expectEqual(STATE_LABELED, labeled.int(0));
+    try std.testing.expectEqualStrings("label emitted by operator", labeled.text(1));
+
+    const relabeled = (try conn.row("SELECT state, reason FROM author_stats WHERE did = 'did:existing'", .{})).?;
+    defer relabeled.deinit();
+    try std.testing.expectEqual(STATE_LABELED, relabeled.int(0));
+    try std.testing.expectEqualStrings("label emitted by operator", relabeled.text(1));
+}
+
+test "repeated puts for one URI count as one document" {
+    const conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+    defer conn.close();
+    try conn.execNoArgs("CREATE TABLE observed_documents (uri TEXT PRIMARY KEY)");
+
+    try std.testing.expect(claimDocument(conn, "at://did:example/site.standard.document/one"));
+    try std.testing.expect(!claimDocument(conn, "at://did:example/site.standard.document/one"));
+    try std.testing.expect(claimDocument(conn, "at://did:example/site.standard.document/two"));
+
+    const row = (try conn.row("SELECT COUNT(*) FROM observed_documents", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 2), row.int(0));
 }
 
 test "utf8Excerpt never splits a codepoint (regression: CJK authors stuck inconclusive)" {

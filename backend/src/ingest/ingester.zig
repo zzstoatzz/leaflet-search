@@ -224,7 +224,7 @@ fn processDocument(allocator: Allocator, io: Io, uri: []const u8, did: []const u
     // feed the autonomous labeler: it keeps a rolling per-DID aggregate and
     // emits bulk-mirror on its own when an author crosses the threshold. Local
     // sqlite only — never blocks the firehose.
-    classifier.observe(did, doc.title, doc.content);
+    classifier.observe(uri, did, doc.title, doc.content);
 }
 
 /// leaflet moves the page tree out of the record and into a content.blobPages

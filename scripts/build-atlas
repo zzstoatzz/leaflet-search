@@ -36,6 +36,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from atlas_labels import excluded_dids, filter_labeled_rows
+
 
 # avatar cache: persists did → avatar URL across runs.
 # lives in site/ so it gets deployed alongside atlas.json — the deployed copy
@@ -64,6 +66,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""  # optional: enables LLM-refined cluster labels
     turso_url: str = ""  # optional: enables publication data (e.g. https://leaf-....turso.io)
     turso_token: str = ""
+    labeler_summary_url: str = "https://leaflet-search-backend.fly.dev/api/labeler"
 
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):
@@ -509,8 +512,16 @@ def main():
     log("exporting vectors from turbopuffer...")
     client = httpx.Client()
     rows = tpuf_export(client, settings)
+    labeler_response = client.get(settings.labeler_summary_url, timeout=30)
+    labeler_response.raise_for_status()
+    excluded = excluded_dids(labeler_response.json())
+    before_policy = len(rows)
+    rows = filter_labeled_rows(rows, excluded)
     client.close()
-    log(f"  got {len(rows)} documents")
+    log(
+        f"  got {len(rows)} documents after label policy "
+        f"({before_policy - len(rows)} excluded across {len(excluded)} DIDs)"
+    )
 
     if len(rows) < 10:
         print("too few documents to build atlas", file=sys.stderr)

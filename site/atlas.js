@@ -18,11 +18,11 @@
     // means peak opacity is a bounded constant — wide and translucent at
     // every zoom, never accumulating into an opaque core.
     nebula: {
-      alpha: 0.3,          // peak opacity at the lantern's center
+      alpha: 0.18,         // peak opacity at the lantern's center
       spread: 3.3,         // lantern radius as a multiple of the cluster's RMS spread
       minHaloPx: 56,       // pixel floor at growRefZoom so tiny clusters still glow
       growRefZoom: 2,      // zoom where the floor is exactly minHaloPx; grows as sqrt(zoom/this)
-      maxHaloPx: 380,      // cap so no lantern swallows the screen at high zoom
+      maxHaloPx: 300,      // cap so no lantern swallows the screen at high zoom
       smallShrink: 0.85,   // small-viewport lantern shrink
       varBase: 0.7, varRange: 0.3, // per-cluster brightness variation
       inStart: 2, inRange: 1.5,    // fade in as the coarse halos fade out
@@ -32,7 +32,7 @@
     // centroids. Ends early — once fine cluster labels are readable, the
     // region-scale flares read as extreme rather than atmospheric.
     coarse: {
-      alphaDark: 0.16, alphaLight: 0.13, // peak opacity
+      alphaDark: 0.10, alphaLight: 0.08, // peak opacity
       outStart: 1.8, outRange: 1.0,      // fully gone by ~2.8
       smallShrink: 0.6,                  // small-viewport halo shrink
     },
@@ -46,13 +46,16 @@
     // publication circle sizing: subscribers are the size signal (fetched
     // from /subscribed), doc count only a faint fallback — a pub nobody
     // follows stays a speck no matter how much it posts.
-    pubSize: { countWeight: 0.06, subWeight: 0.9, maxPx: 34 },
+    // zoomKnee: past this zoom the radius grows as sqrt, so score
+    // differences keep separating circles instead of everything with a
+    // few subscribers saturating maxPx into a uniform disc field
+    pubSize: { countWeight: 0.06, subWeight: 0.9, maxPx: 26, zoomKnee: 6 },
     // publication circles: progressive disclosure gates
     pubCircle: {
       letterMinPx: 16, // letter glyph only once the circle is a real landmark
       nameMinPx: 10,   // name-label candidacy (drawn via the label economy)
       nameCandCap: 40, // max queued name candidates per frame
-      ringAlphaBase: 0.2, ringAlphaMax: 0.4, ringAlphaPerPx: 35, // alpha = base + min(max, pr/perPx)
+      ringAlphaBase: 0.14, ringAlphaMax: 0.3, ringAlphaPerPx: 35, // alpha = base + min(max, pr/perPx)
     },
     // max on-screen labels per layer. One shared collision economy, placed in
     // priority order: cluster labels (landmarks) first, then doc titles
@@ -152,7 +155,9 @@
   }
 
   function pubRadius(pub, z) {
-    return Math.min(ATLAS_TUNE.pubSize.maxPx, pubSizeScore(pub) * z);
+    var t = ATLAS_TUNE.pubSize;
+    var zEff = z <= t.zoomKnee ? z : t.zoomKnee * Math.sqrt(z / t.zoomKnee);
+    return Math.min(t.maxPx, pubSizeScore(pub) * zEff);
   }
 
   // platform logos — drawn next to per-doc titles at high zoom for identity.
@@ -666,8 +671,9 @@
   var unfurlFor = -1, unfurlStart = 0; // hover-card unfurl animation
 
   function planetRadiusFor(z) {
-    var rmax = W < 600 ? 56 : 84;
-    return Math.max(4, Math.min(rmax, 7 + (z - CARD_START) * 0.3));
+    var rmax = W < 600 ? 50 : 76;
+    // base stays 7 — the sprite→planet handoff at CARD_START depends on it
+    return Math.max(4, Math.min(rmax, 7 + (z - CARD_START) * 0.27));
   }
 
   // --- planet surface textures ---
@@ -1148,21 +1154,30 @@
 
         var img = wantAvatar ? pubImages[pub.basePath] : null;
         if (img) {
-          // clipped circle with cover image
+          // clipped circle with cover image, shaded into a globe (same
+          // upper-left light + limb treatment as the document planets)
           ctx.save();
           ctx.globalAlpha = 0.9;
           ctx.beginPath();
           ctx.arc(psx, psy, pr, 0, Math.PI * 2);
           ctx.clip();
           ctx.drawImage(img, psx - pr, psy - pr, pr * 2, pr * 2);
+          ctx.drawImage(getPlanetShade(pr), psx - pr, psy - pr, pr * 2, pr * 2);
           ctx.restore();
         } else {
-          // fallback: filled circle with first letter
-          ctx.globalAlpha = 0.7;
+          // fallback: filled circle with first letter, globe-shaded
+          ctx.globalAlpha = 0.45;
           ctx.beginPath();
           ctx.arc(psx, psy, pr, 0, Math.PI * 2);
           ctx.fillStyle = pColors.edge;
           ctx.fill();
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(psx, psy, pr, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.globalAlpha = 0.8;
+          ctx.drawImage(getPlanetShade(pr), psx - pr, psy - pr, pr * 2, pr * 2);
+          ctx.restore();
           // letter only once the circle is a real landmark — smaller pubs
           // stay quiet rings so dense regions read as dots, not glyphs
           if (pr >= ATLAS_TUNE.pubCircle.letterMinPx) {
@@ -1172,7 +1187,7 @@
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillStyle = pColors.core;
-            ctx.globalAlpha = 0.9;
+            ctx.globalAlpha = 0.75;
             ctx.fillText(letter, psx, psy);
           }
         }

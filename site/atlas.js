@@ -419,29 +419,40 @@
     cv.width = size; cv.height = size;
     var c = cv.getContext('2d');
     var half = size / 2;
-    // sphere body — ephemeral at distance
+    // sphere body — ephemeral at distance. Light model matches the WebGL
+    // planets (upper-left key light, limb darkening, specular kiss) so the
+    // sprite→planet handoff is a continuity of the same object, not a swap.
     var sphereAlpha = alpha * (1 - starness * 0.55);
     if (sphereAlpha > 0.02) {
       c.globalAlpha = sphereAlpha;
-      var grad = c.createRadialGradient(half - r * 0.35, half - r * 0.38, r * 0.1, half, half, r);
+      var grad = c.createRadialGradient(half - r * 0.3, half - r * 0.36, r * 0.08, half, half, r);
       grad.addColorStop(0, colors.core);
-      grad.addColorStop(0.55, colors.mid);
+      grad.addColorStop(0.5, colors.mid);
       grad.addColorStop(1, colors.edge);
       c.fillStyle = grad;
       c.beginPath();
       c.arc(half, half, r, 0, Math.PI * 2);
       c.fill();
-      var rim = c.createRadialGradient(half, half, r * 0.6, half, half, r);
+      var rim = c.createRadialGradient(half, half, r * 0.55, half, half, r);
       rim.addColorStop(0, 'rgba(0,0,0,0)');
-      rim.addColorStop(0.85, 'rgba(0,0,0,0.25)');
-      rim.addColorStop(1, 'rgba(0,0,0,0.55)');
+      rim.addColorStop(0.8, 'rgba(0,0,0,0.32)');
+      rim.addColorStop(1, 'rgba(0,0,0,0.68)');
       c.fillStyle = rim;
       c.beginPath();
       c.arc(half, half, r, 0, Math.PI * 2);
       c.fill();
+      // specular kiss — the small hot spot that sells the sphere at a glance
+      var spec = c.createRadialGradient(half - r * 0.38, half - r * 0.42, 0, half - r * 0.38, half - r * 0.42, r * 0.5);
+      spec.addColorStop(0, 'rgba(255,255,255,' + (0.5 * (1 - starness)).toFixed(2) + ')');
+      spec.addColorStop(0.35, 'rgba(255,255,255,' + (0.12 * (1 - starness)).toFixed(2) + ')');
+      spec.addColorStop(1, 'rgba(255,255,255,0)');
+      c.fillStyle = spec;
+      c.beginPath();
+      c.arc(half, half, r, 0, Math.PI * 2);
+      c.fill();
       // atmosphere ring — the "ball outline" reads stodgy at star distance
-      c.strokeStyle = hexToRgba(colors.core, (emphasized ? 0.8 : 0.35) * (1 - starness));
-      c.lineWidth = Math.max(1, r * 0.06);
+      c.strokeStyle = hexToRgba(colors.core, (emphasized ? 0.8 : 0.3) * (1 - starness));
+      c.lineWidth = Math.max(1, r * 0.05);
       c.beginPath();
       c.arc(half, half, r - c.lineWidth / 2, 0, Math.PI * 2);
       c.stroke();
@@ -773,6 +784,23 @@
   }
 
   // shading overlay (highlight upper-left, darkened limb) per radius bucket
+  // publication globes: a real shaded sphere per (platform, size bucket,
+  // theme) — same light model as the doc sprites/planets. Cached because
+  // hundreds can be on screen.
+  var pubSphereCache = {};
+
+  function getPubSphere(platform, R) {
+    var bucket = Math.max(4, Math.round(R / 3) * 3);
+    var theme = frameDark ? 'd' : 'l';
+    var key = platform + '_' + bucket + '_' + theme;
+    if (pubSphereCache[key]) return pubSphereCache[key];
+    var colors = frameColors[platform] || frameColors.other;
+    var size = Math.ceil(bucket * 2.2);
+    var cv = makeSprite(size, bucket, colors, 1, false, 0);
+    pubSphereCache[key] = cv;
+    return cv;
+  }
+
   var planetShadeCache = {};
 
   function getPlanetShade(R) {
@@ -1154,10 +1182,10 @@
 
         var img = wantAvatar ? pubImages[pub.basePath] : null;
         if (img) {
-          // clipped circle with cover image, shaded into a globe (same
-          // upper-left light + limb treatment as the document planets)
+          // avatar wrapped onto a globe: clipped image under the planet
+          // shade (upper-left key light + limb darkening)
           ctx.save();
-          ctx.globalAlpha = 0.9;
+          ctx.globalAlpha = 0.95;
           ctx.beginPath();
           ctx.arc(psx, psy, pr, 0, Math.PI * 2);
           ctx.clip();
@@ -1165,41 +1193,27 @@
           ctx.drawImage(getPlanetShade(pr), psx - pr, psy - pr, pr * 2, pr * 2);
           ctx.restore();
         } else {
-          // fallback: filled circle with first letter, globe-shaded
-          ctx.globalAlpha = 0.45;
-          ctx.beginPath();
-          ctx.arc(psx, psy, pr, 0, Math.PI * 2);
-          ctx.fillStyle = pColors.edge;
-          ctx.fill();
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(psx, psy, pr, 0, Math.PI * 2);
-          ctx.clip();
-          ctx.globalAlpha = 0.8;
-          ctx.drawImage(getPlanetShade(pr), psx - pr, psy - pr, pr * 2, pr * 2);
-          ctx.restore();
-          // letter only once the circle is a real landmark — smaller pubs
-          // stay quiet rings so dense regions read as dots, not glyphs
+          // no avatar: a literal shaded sphere in the platform palette,
+          // same light model as the document planets
+          var sphere = getPubSphere(pPlatform, pr);
+          ctx.globalAlpha = 0.85;
+          ctx.drawImage(sphere, psx - pr * 1.1, psy - pr * 1.1, pr * 2.2, pr * 2.2);
+          // letter only once the globe is a real landmark — engraved, not
+          // stamped: dark offset under a light glyph so it sits on the surface
           if (pr >= ATLAS_TUNE.pubCircle.letterMinPx) {
             var letter = (pub.name || '?').charAt(0).toUpperCase();
-            var letterSize = Math.max(8, pr * 0.9);
+            var letterSize = Math.max(8, pr * 0.75);
             ctx.font = 'bold ' + Math.round(letterSize) + 'px monospace';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillStyle = pColors.core;
-            ctx.globalAlpha = 0.75;
+            ctx.globalAlpha = 0.35;
+            ctx.fillStyle = '#000000';
+            ctx.fillText(letter, psx + 1, psy + 1);
+            ctx.globalAlpha = 0.8;
+            ctx.fillStyle = mixHex(pColors.core, '#ffffff', 0.55);
             ctx.fillText(letter, psx, psy);
           }
         }
-
-        // border ring — quiet on small circles, assertive only as they grow
-        ctx.globalAlpha = ATLAS_TUNE.pubCircle.ringAlphaBase +
-          Math.min(ATLAS_TUNE.pubCircle.ringAlphaMax, pr / ATLAS_TUNE.pubCircle.ringAlphaPerPx);
-        ctx.beginPath();
-        ctx.arc(psx, psy, pr, 0, Math.PI * 2);
-        ctx.strokeStyle = pColors.mid;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
 
         // name labels no longer draw here \u2014 they queue for the shared label
         // economy below, where cluster labels and doc titles place first
@@ -1219,8 +1233,10 @@
       // midrange, reaching 7px right where the planets take over (the
       // planet radius starts at 7 at CARD_START, so the handoff is smooth)
       var pointR = Math.min(7, 1.0 + zoom * 0.135);
-      // starness: pure starlight below zoom ~8, fully a sphere by ~22
-      var starness = fadeOut(zoom, 8, 14);
+      // starness: pure starlight below zoom ~7, fully a sphere by ~15 —
+      // the 3D reading arrives early so the planet handoff is one object
+      // growing, not a species change
+      var starness = fadeOut(zoom, 7, 8);
       buildSprites(pointR, starness);
     } else {
       buildDotSprites();

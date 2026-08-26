@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Spike: columnar/dictionary-encoded atlas format ("v2").
+
+Reads an existing site/atlas.json (v1, array-of-objects points), converts to a
+columnar layout with dictionary-encoded strings, and reports raw + gzipped
+sizes for both. No site code consumes this yet — it exists to measure whether
+the format is worth adopting on top of gzip.
+
+v2 layout (draft):
+  version: 2
+  platforms/dids/collections/basePaths: string tables
+  points: parallel arrays; uri decomposed into (did, collection, rkey);
+          path stored as null when it equals "/" + rkey (the common case)
+  clusters/publications/meta: unchanged from v1
+
+Usage: ./scripts/spike-columnar-atlas [path/to/atlas.json]
+"""
+
+import gzip
+import json
+import sys
+from pathlib import Path
+
+
+def dumps(o):
+    return json.dumps(o, separators=(",", ":"))
+
+
+def main():
+    src = Path(sys.argv[1] if len(sys.argv) > 1 else "site/atlas.json")
+    v1 = json.loads(src.read_text())
+    pts = v1["points"]
+
+    def table(values):
+        order = sorted(set(values))
+        idx = {v: i for i, v in enumerate(order)}
+        return order, idx
+
+    platforms, plat_i = table(p["platform"] for p in pts)
+    base_paths, bp_i = table(p["basePath"] for p in pts)
+
+    dids, colls, rkeys = [], [], []
+    for p in pts:
+        did, coll, rkey = p["uri"][5:].split("/", 2)
+        dids.append(did)
+        colls.append(coll)
+        rkeys.append(rkey)
+    did_tab, did_i = table(dids)
+    coll_tab, coll_i = table(colls)
+
+    derivable_path = sum(1 for p, rk in zip(pts, rkeys) if p["path"] == "/" + rk)
+
+    v2 = {
+        "version": 2,
+        "platforms": platforms,
+        "dids": did_tab,
+        "collections": coll_tab,
+        "basePaths": base_paths,
+        "points": {
+            "x": [p["x"] for p in pts],
+            "y": [p["y"] for p in pts],
+            "title": [p["title"] for p in pts],
+            "did": [did_i[d] for d in dids],
+            "collection": [coll_i[c] for c in colls],
+            "rkey": rkeys,
+            "basePath": [bp_i[p["basePath"]] for p in pts],
+            "path": [None if p["path"] == "/" + rk else p["path"] for p, rk in zip(pts, rkeys)],
+            "clusterCoarse": [p["clusterCoarse"] for p in pts],
+            "clusterFine": [p["clusterFine"] for p in pts],
+        },
+        "clusters": v1["clusters"],
+        "publications": v1["publications"],
+        "meta": v1["meta"],
+    }
+
+    # round-trip check: reconstruct v1 points exactly
+    for i, p in enumerate(pts):
+        uri = f"at://{did_tab[v2['points']['did'][i]]}/{coll_tab[v2['points']['collection'][i]]}/{v2['points']['rkey'][i]}"
+        path = v2["points"]["path"][i]
+        if path is None:
+            path = "/" + v2["points"]["rkey"][i]
+        assert uri == p["uri"] and path == p["path"] and base_paths[v2["points"]["basePath"][i]] == p["basePath"]
+
+    raw1, raw2 = dumps(v1).encode(), dumps(v2).encode()
+    gz = lambda b: len(gzip.compress(b, mtime=0))
+    gz1, gz2 = gz(raw1), gz(raw2)
+
+    n = len(pts)
+    print(f"points: {n}   path derivable from rkey: {derivable_path} ({derivable_path / n:.0%})")
+    print(f"string tables: {len(platforms)} platforms, {len(did_tab)} dids, {len(coll_tab)} collections, {len(base_paths)} basePaths")
+    print(f"v1  raw {len(raw1) / 2**20:7.2f} MiB   gz {gz1 / 2**20:6.2f} MiB")
+    print(f"v2  raw {len(raw2) / 2**20:7.2f} MiB   gz {gz2 / 2**20:6.2f} MiB")
+    print(f"v2/v1: raw {len(raw2) / len(raw1):.2f}x   gz {gz2 / gz1:.2f}x")
+    print(f"pages headroom at current growth unit: v1 gz {25 * gz1 / len(raw1):.1f}?  -> "
+          f"points at 25MiB raw v1 limit was the old wall; new wall is 25MiB *gz* file:")
+    per_point_gz1 = gz1 / n
+    per_point_gz2 = gz2 / n
+    print(f"  ~{int(25 * 2**20 / per_point_gz1):,} points (v1+gz)   ~{int(25 * 2**20 / per_point_gz2):,} points (v2+gz)")
+
+
+if __name__ == "__main__":
+    main()

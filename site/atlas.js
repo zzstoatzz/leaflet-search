@@ -865,13 +865,17 @@
       accentRGB = parseHex(c.mid);
     }
     if (img) {
-      // wrap the avatar around the sphere: square copies at an exact
-      // divisor of texW so the seam never jumps, faces rotating past
-      var tile = PLANET_TEX_H; // full pole-to-pole
-      var mA = Math.max(1, Math.floor(PLANET_TEX_W / (tile * 2)));
-      var periodA = PLANET_TEX_W / mA;
+      // wrap the avatar around the sphere with square ON-SPHERE aspect:
+      // the texture band spans 180 deg of latitude over its full height, so a
+      // face must cover equal ARC both ways — ~90 deg of longitude (texW/4)
+      // by ~90 deg of latitude (half the band height). a naive square tile
+      // renders as a squished pole-to-pole sliver.
+      var wA = PLANET_TEX_W / 4;                 // 90 deg of longitude
+      var hA = Math.round(PLANET_TEX_H / 2);     // 90 deg of latitude
+      var yA = Math.round((PLANET_TEX_H - hA) / 2);
+      var periodA = PLANET_TEX_W / 2;            // two faces per revolution
       for (var ka = 0; ka * periodA < cv.width; ka++) {
-        g.drawImage(img, ka * periodA + (periodA - tile) / 2, 0, tile, tile);
+        g.drawImage(img, ka * periodA + (periodA - wA) / 2, yA, wA, hA);
       }
       var eA = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, true);
       pubPlanetTex.set(pub.basePath, eA);

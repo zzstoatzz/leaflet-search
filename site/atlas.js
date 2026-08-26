@@ -890,13 +890,13 @@
   // name marquee + basePath band, rotated by the same GL renderer.
   var pubPlanetTex = new Map(); // basePath -> texture entry
 
-  function getPubPlanetTexture(pub, img) {
+  function getPubPlanetTexture(pub, img, withText) {
     var theme = frameDark ? 'dark' : 'light';
     resolvePubAccent(pub);
     var accent = pubAccents[pub.basePath] || null;
     var accentKey = accent ? accent.key : 'none';
     var e = pubPlanetTex.get(pub.basePath);
-    if (e && e.theme === theme && e.accentKey === accentKey && e.hasAvatar === !!img) return e;
+    if (e && e.theme === theme && e.accentKey === accentKey && e.hasAvatar === !!img && e.withText === !!withText) return e;
     if (pubPlanetTex.size > 96) pubPlanetTex.delete(pubPlanetTex.keys().next().value);
     var platform = pub.platform || 'other';
     var c = frameColors[platform] || frameColors.other;
@@ -931,7 +931,28 @@
       for (var ka = 0; ka * periodA < cv.width; ka++) {
         g.drawImage(patch, ka * periodA + (periodA - patch.width) / 2, (PLANET_TEX_H - patch.height) / 2);
       }
+      if (withText) {
+        // the name hangs in the low atmosphere: same projected marquee as
+        // the text planets, in the southern band, stroked so it reads over
+        // whatever the avatar puts underneath it
+        var nameA = pub.name || pub.basePath || '?';
+        if (nameA.length > 41) nameA = nameA.slice(0, 40) + '…';
+        g.font = 'bold 26px monospace';
+        g.textBaseline = 'middle';
+        g.textAlign = 'left';
+        var twA = g.measureText(nameA).width;
+        var mT = Math.max(1, Math.floor(PLANET_TEX_W / (twA + 100)));
+        var periodT = PLANET_TEX_W / mT;
+        g.lineWidth = 5;
+        g.strokeStyle = 'rgba(0,0,0,0.75)';
+        g.fillStyle = 'rgba(255,255,255,0.95)';
+        for (var kt = 0; kt * periodT < cv.width; kt++) {
+          g.strokeText(nameA, kt * periodT, 88);
+          g.fillText(nameA, kt * periodT, 88);
+        }
+      }
       var eA = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, true);
+      eA.withText = !!withText;
       pubPlanetTex.set(pub.basePath, eA);
       return eA;
     }
@@ -972,6 +993,7 @@
       }
     }
     e = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, false);
+    e.withText = !!withText;
     pubPlanetTex.set(pub.basePath, e);
     return e;
   }
@@ -1415,7 +1437,7 @@
         var pubTexSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
         for (var pc = 0; pc < pubPlanetCands.length; pc++) {
           var pcand = pubPlanetCands[pc];
-          var pTex = getPubPlanetTexture(pcand.pub, pcand.img);
+          var pTex = getPubPlanetTexture(pcand.pub, pcand.img, pcand.r >= 30);
           var pRot = (pubTSec * pTex.speed + pTex.phase) % (Math.PI * 2);
           // below marquee size projected TEXT is illegible scribble, so
           // text-only globes stay clean spheres until they're landmarks —

@@ -22,7 +22,7 @@
    > **why 10D and not the 2D coords** — clustering in the display projection turns UMAP's own artifacts (tearing, crowding) into cluster boundaries. Scored against PCA-50 cosine space, which neither projection was fit in, the old 2D clustering gave silhouette **+0.004 coarse / −0.067 fine** — the fine tier was structured *worse than chance*. The 10D space gives **+0.033 / +0.017**. `cluster_selection_method="leaf"` and a corpus-scaled `min_cluster_size` were tested at the same time and both made it worse at our thresholds; neither was adopted.
 6. **labels** — c-TF-IDF over document titles per cluster → 3-term keyword seed, then refined into 2-4 word topic names by `claude-haiku-4-5`. **evidence is core members only** — the ~40% of points HDBSCAN calls noise are snapped to a cluster for *display*, but including their titles blurs the vocabulary the label is drawn from (median 36% coarse / 42% fine of each cluster's titles). core-only evidence changes 61% of coarse and 70% of fine labels. a cluster whose core members all have empty titles falls back to full membership (`llm_refine_labels`, batched + async, both tiers). Requires `ANTHROPIC_API_KEY`; without it the c-TF-IDF keywords ship as-is, and any cluster the LLM fails to name falls back to its keyword label.
 7. **publication centroids** — documents grouped by `basePath` (2+ docs), enriched from turso with name/coverImage, plus author avatars and leaflet theme colors. Both use on-disk caches in `site/` (`atlas-avatar-cache.json`, `atlas-theme-cache.json`) that deploy alongside `atlas.json` — the prefect flow clones fresh each run, so the deployed copy is what it reads on cold start.
-8. **outputs** `site/atlas.json` (~15MB at ~53k docs, gitignored)
+8. **outputs** `site/atlas.json.gz` (gzipped since 2026-08-25; the raw json crossed cloudflare pages' 25 MiB per-file limit at ~83k docs. `atlas.js` decompresses via `DecompressionStream`)
 
 dependencies: `umap-learn`, `hdbscan`, `scikit-learn`, `httpx`, `numpy`, `pydantic-settings`, `anthropic`. Pinned to `numpy<2.2` and python `>=3.12,<3.14` — umap's transitive numba/llvmlite have no wheels outside that window.
 
@@ -63,7 +63,7 @@ prefect deployment run 'leaflet-atlas/leaflet-atlas' --watch
 `deploy.sh` ships whatever `site/atlas.json` is on disk, and that file is gitignored — so pull the live one down first or you'll overwrite good data with a stale local build:
 
 ```bash
-curl -sfo site/atlas.json https://pub-search.waow.tech/atlas.json
+curl -sfo site/atlas.json.gz https://pub-search.waow.tech/atlas.json.gz
 cd site && ./deploy.sh
 ```
 
@@ -73,3 +73,40 @@ cd site && ./deploy.sh
 - **exemplar-seeded labels**: feed the LLM the N documents nearest each centroid instead of c-TF-IDF keywords (sembleverse does this) — untested here
 - **hierarchical clustering**: replace the two-strata (coarse/fine) approach with a proper hierarchy (Ward linkage on HDBSCAN centroids + `cut_tree` at multiple levels) for smooth fractal zoom
 - **event-driven rebuild**: trigger off significant index changes instead of the fixed 6h cron
+
+## payload scaling (measured 2026-08-25, 83,584 points)
+
+the corpus has two counts: turso (`/api/api/dashboard` → `documents`, 102,513)
+and the turbopuffer vector index (what the atlas exports, 83,584). the atlas
+renders the vector index. the ~19k gap is unexplained — `embeddings` claims
+102,513 and `bridgyfedDocuments` is 0 — and deserves its own investigation.
+
+three formats, measured with `scripts/spike-columnar-atlas` on the live data:
+
+| format | raw | gz | wall (25 MiB) hit at |
+|---|---|---|---|
+| v1 array-of-objects (current) | 25.3 MiB | 7.3 MiB | ~290k pts |
+| v2 columnar + dictionaries | 12.6 MiB | 5.1 MiB | ~410k pts |
+| v3 geometry only, binary quantized | 0.72 MiB (9 B/pt) | 0.46 MiB | ~2.9M pts |
+
+design target is **10x the turso corpus (~1M points)**. v2 dies there
+(~60 MiB gz), so v2 is not worth the migration. the architecture that
+survives 10x splits the payload:
+
+- **geometry.bin** — per point: x,y quantized to uint16 over [-1,1],
+  platform u8, coarse+fine cluster u16. typed-array views, zero parse.
+  8.6 MiB raw at 1M points; fits the per-file limit with ~3x to spare.
+- **metadata** (title, uri parts, path) — never shipped up front. sharded by
+  fine cluster or spatial tile, fetched on zoom/hover; search already goes
+  through the API. 14.2 MiB raw today, ~140 MiB at 10x — fine when no single
+  shard exceeds the limit and the initial load never includes it.
+- clusters/publications stay as one small json (labels, centroids, pubs).
+
+initial page load becomes ~constant in corpus size (geometry + labels),
+which also fixes the client cost: today the browser parses 25 MiB of JSON
+into 83k objects before first paint of the map.
+
+at 1M points the *build* breaks before the payload does — UMAP on 1M×1024
+and the single-pod export already OOM'd once at a tenth of that
+(`prefect-rebuild-atlas-oom-2026-06-05.md`, `scaling-plan.md`). payload v3
+and the builder move are separable; do not couple them.

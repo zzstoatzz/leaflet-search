@@ -943,6 +943,10 @@
         var twA = g.measureText(nameA).width;
         var mT = Math.max(1, Math.floor(PLANET_TEX_W / (twA + 100)));
         var periodT = PLANET_TEX_W / mT;
+        // darken the band first: the texture is sampled emissively, so
+        // white text over a bright avatar region has no contrast without it
+        g.fillStyle = 'rgba(0,0,0,0.55)';
+        g.fillRect(0, 64, cv.width, 30);
         g.lineWidth = 5;
         g.strokeStyle = 'rgba(0,0,0,0.75)';
         g.fillStyle = 'rgba(255,255,255,0.95)';

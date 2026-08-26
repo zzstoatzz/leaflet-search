@@ -829,7 +829,7 @@
     var hit = avatarPatchCache.get(key);
     if (hit && hit._src === img) return hit;
     if (avatarPatchCache.size > 64) avatarPatchCache.delete(avatarPatchCache.keys().next().value);
-    var THETA_MAX = Math.PI * 0.32;              // ~58 deg angular radius
+    var THETA_MAX = Math.PI * 0.46;              // ~83 deg — the face IS the hemisphere
     var pw = Math.round(PLANET_TEX_W * (THETA_MAX / Math.PI)); // lon span (half-width) in texels
     var ph = Math.round(PLANET_TEX_H * (THETA_MAX / Math.PI)); // lat span (half-height)
     var W2 = pw * 2, H2 = ph * 2;

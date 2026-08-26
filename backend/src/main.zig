@@ -184,7 +184,7 @@ fn initServices(allocator: std.mem.Allocator, io: Io, role: Role) void {
         // one-time: feed the existing corpus through the classifier so it evaluates
         // every already-indexed author, not just ones publishing after deploy.
         // Background thread — the replica is open, this just reads it.
-        if (Thread.spawn(.{}, labeler_classifier.bootstrap, .{})) |t| t.detach() else |_| {}
+        if (Thread.spawn(.{}, labeler_classifier.bootstrap, .{io})) |t| t.detach() else |_| {}
 
         // model-pass gate: background worker that confirms flagged authors are
         // bulk-generated (reads content, asks an LLM) before the labeler emits.

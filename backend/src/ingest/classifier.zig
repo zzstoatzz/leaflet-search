@@ -143,8 +143,14 @@ pub fn observe(uri: []const u8, did: []const u8, title: []const u8, content: []c
 /// publish after deploy). Reads the local replica (frozen, no turso); pulls only
 /// did/title/LENGTH(content), never the content blobs. Idempotent via a marker.
 /// Runs once, in a background thread.
-pub fn bootstrap() void {
+pub fn bootstrap(io: Io) void {
     const conn = g_conn orelse return;
+    while (true) {
+        if (db.getLocalDbRaw()) |local| {
+            if (local.isReady()) break;
+        }
+        io.sleep(Io.Duration.fromSeconds(1), .awake) catch return;
+    }
     if (getMeta(conn, "scoring_version") == SCORING_VERSION) {
         if (getMeta(conn, "aggregation_version") != AGGREGATION_VERSION) rebuildUniqueAggregation(conn);
         // no re-score needed, but a DID newly added to banned-dids.txt still

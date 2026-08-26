@@ -162,7 +162,11 @@
   function pubRadius(pub, z) {
     var t = ATLAS_TUNE.pubSize;
     var zEff = z <= t.zoomKnee ? z : t.zoomKnee * Math.sqrt(z / t.zoomKnee);
-    return Math.min(t.maxPx, pubSizeScore(pub) * zEff);
+    var r = Math.min(t.maxPx, pubSizeScore(pub) * zEff);
+    // past card zoom pubs grow like the documents do, so their globes reach
+    // marquee-readable size in the planet regime
+    if (r > 4) r += fadeIn(z, CARD_START, CARD_RANGE) * 34;
+    return r;
   }
 
   // platform logos — drawn next to per-doc titles at high zoom for identity.
@@ -808,6 +812,101 @@
 
   var coarseLayer = null; // offscreen compositing surface for the coarse nebula layer
 
+  // shared featureless texture for small pub globes (body still shaded by
+  // baseRGB/accentRGB in the GL path — this only omits the text)
+  var blankPlanetTexCanvas = null;
+  function getBlankPlanetTexture() {
+    if (!blankPlanetTexCanvas) {
+      blankPlanetTexCanvas = document.createElement('canvas');
+      blankPlanetTexCanvas.width = PLANET_TEX_W + PLANET_TEX_BLEED;
+      blankPlanetTexCanvas.height = PLANET_TEX_H;
+    }
+    return blankPlanetTexCanvas;
+  }
+
+  // publication planet textures — same vegas-sphere treatment as documents:
+  // name marquee + basePath band, rotated by the same GL renderer.
+  var pubPlanetTex = new Map(); // basePath -> texture entry
+
+  function getPubPlanetTexture(pub) {
+    var theme = frameDark ? 'dark' : 'light';
+    resolvePubAccent(pub);
+    var accent = pubAccents[pub.basePath] || null;
+    var accentKey = accent ? accent.key : 'none';
+    var e = pubPlanetTex.get(pub.basePath);
+    if (e && e.theme === theme && e.accentKey === accentKey) return e;
+    if (pubPlanetTex.size > 96) pubPlanetTex.delete(pubPlanetTex.keys().next().value);
+    var platform = pub.platform || 'other';
+    var c = frameColors[platform] || frameColors.other;
+    var cv = document.createElement('canvas');
+    cv.width = PLANET_TEX_W + PLANET_TEX_BLEED;
+    cv.height = PLANET_TEX_H;
+    var g = cv.getContext('2d');
+    var baseRGB, accentRGB;
+    if (accent && accent.rgb) {
+      baseRGB = accent.bgRgb
+        ? [Math.round(accent.bgRgb[0] * 255), Math.round(accent.bgRgb[1] * 255), Math.round(accent.bgRgb[2] * 255)]
+        : hslToRgb(accent.h, accent.s, frameDark ? 0.30 : 0.62);
+      accentRGB = [Math.round(accent.rgb[0] * 255), Math.round(accent.rgb[1] * 255), Math.round(accent.rgb[2] * 255)];
+    } else if (accent) {
+      baseRGB = hslToRgb(accent.h, accent.s, frameDark ? 0.30 : 0.62);
+      accentRGB = hslToRgb(accent.h, accent.s, frameDark ? 0.55 : 0.45);
+    } else {
+      baseRGB = parseHex(c.edge);
+      accentRGB = parseHex(c.mid);
+    }
+    g.fillStyle = hexToRgba(c.mid, 0.35);
+    g.fillRect(0, 10, cv.width, 2);
+    g.fillRect(0, PLANET_TEX_H - 12, cv.width, 2);
+    g.textBaseline = 'middle';
+    g.textAlign = 'left';
+    var title = pub.name || pub.basePath || '?';
+    if (title.length > 41) title = title.slice(0, 40) + '…';
+    g.font = 'bold 40px monospace';
+    var tw = g.measureText(title).width;
+    var m = Math.max(1, Math.floor(PLANET_TEX_W / (tw + 100)));
+    var period = PLANET_TEX_W / m;
+    g.fillStyle = frameDark ? 'rgba(255,255,255,0.95)' : 'rgba(0,0,0,0.85)';
+    for (var k = 0; k * period < cv.width; k++) {
+      g.fillText(title, k * period, 46);
+      if (period - tw > 40) {
+        g.save();
+        g.fillStyle = c.core;
+        g.beginPath();
+        g.arc(k * period + tw + (period - tw) / 2, 46, 7, 0, Math.PI * 2);
+        g.fill();
+        g.restore();
+      }
+    }
+    var meta = pub.count ? pub.count + ' documents' : (pub.basePath || '');
+    if (meta) {
+      if (meta.length > 46) meta = meta.slice(0, 45) + '…';
+      g.font = '21px monospace';
+      if (accent) g.fillStyle = accentCss(accent, frameDark ? 0.70 : 0.30);
+      else g.fillStyle = frameDark ? hexToRgba(c.core, 0.9) : 'rgba(0,0,0,0.6)';
+      var mw = g.measureText(meta).width;
+      var m2 = Math.max(1, Math.floor(PLANET_TEX_W / (mw + 80)));
+      var period2 = PLANET_TEX_W / m2;
+      for (var k2 = 0; k2 * period2 < cv.width; k2++) {
+        g.fillText(meta, k2 * period2, 79);
+      }
+    }
+    var seedN = 0;
+    for (var si = 0; si < pub.basePath.length; si++) seedN = (seedN * 31 + pub.basePath.charCodeAt(si)) >>> 0;
+    e = {
+      canvas: cv,
+      theme: theme,
+      accentKey: accentKey,
+      speed: 0.14 + (seedN % 7) * 0.02,
+      phase: (seedN % 31) * 0.45,
+      seed: (seedN % 97) * 1.3,
+      baseRGB: [baseRGB[0] / 255, baseRGB[1] / 255, baseRGB[2] / 255],
+      accentRGB: [accentRGB[0] / 255, accentRGB[1] / 255, accentRGB[2] / 255],
+    };
+    pubPlanetTex.set(pub.basePath, e);
+    return e;
+  }
+
   var planetShadeCache = {};
 
   function getPlanetShade(R) {
@@ -1179,6 +1278,8 @@
     // Most pubs have no subscribers and stay culled specks until deep zoom;
     // the followed few read as real landmarks — accents, not confetti.
     var pubLabelCands = []; // deferred to the label economy below
+    var pubPlanetCands = []; // pubs rendered as rotating GL planets
+    planetsActive = false; // recomputed each frame (pub globes below, doc planets later)
     if (pubData && pubData.length > 0) {
       var pubLabelZoom = 3;
       var pubRendered = 0;
@@ -1200,43 +1301,15 @@
         var pPlatform = pub.platform || 'other';
         var pColors = frameColors[pPlatform] || frameColors.other;
 
-        // only the budgeted, large-enough publications get avatar imagery
-        var wantAvatar = pr >= imgThreshold && avatarBudget > 0;
-        if (wantAvatar) { loadPubImage(pub); avatarBudget--; }
-
-        var img = wantAvatar ? pubImages[pub.basePath] : null;
-        if (img) {
-          // avatar wrapped onto a globe: clipped image under the planet
-          // shade (upper-left key light + limb darkening)
-          ctx.save();
-          ctx.globalAlpha = 0.95;
-          ctx.beginPath();
-          ctx.arc(psx, psy, pr, 0, Math.PI * 2);
-          ctx.clip();
-          ctx.drawImage(img, psx - pr, psy - pr, pr * 2, pr * 2);
-          ctx.drawImage(getPlanetShade(pr), psx - pr, psy - pr, pr * 2, pr * 2);
-          ctx.restore();
+        if (planetGL) {
+          // literal globe: the same rotating vegas-sphere as the documents,
+          // with the publication's name as the marquee
+          pubPlanetCands.push({ pub: pub, sx: psx, sy: psy, r: pr });
         } else {
-          // no avatar: a literal shaded sphere in the platform palette,
-          // same light model as the document planets
+          // no-GL fallback: a static shaded sphere in the platform palette
           var sphere = getPubSphere(pPlatform, pr);
           ctx.globalAlpha = 0.85;
           ctx.drawImage(sphere, psx - pr * 1.1, psy - pr * 1.1, pr * 2.2, pr * 2.2);
-          // letter only once the globe is a real landmark — engraved, not
-          // stamped: dark offset under a light glyph so it sits on the surface
-          if (pr >= ATLAS_TUNE.pubCircle.letterMinPx) {
-            var letter = (pub.name || '?').charAt(0).toUpperCase();
-            var letterSize = Math.max(8, pr * 0.75);
-            ctx.font = 'bold ' + Math.round(letterSize) + 'px monospace';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.globalAlpha = 0.35;
-            ctx.fillStyle = '#000000';
-            ctx.fillText(letter, psx + 1, psy + 1);
-            ctx.globalAlpha = 0.8;
-            ctx.fillStyle = mixHex(pColors.core, '#ffffff', 0.55);
-            ctx.fillText(letter, psx, psy);
-          }
         }
 
         // name labels no longer draw here \u2014 they queue for the shared label
@@ -1247,6 +1320,29 @@
         }
       }
       ctx.globalAlpha = 1;
+      if (pubPlanetCands.length > 0) {
+        var pubTSec = performance.now() / 1000;
+        planetGL.begin(W, H, dpr, dark);
+        var pubTexSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
+        for (var pc = 0; pc < pubPlanetCands.length; pc++) {
+          var pcand = pubPlanetCands[pc];
+          var pTex = getPubPlanetTexture(pcand.pub);
+          var pRot = (pubTSec * pTex.speed + pTex.phase) % (Math.PI * 2);
+          // below marquee size the projected text is illegible scribble —
+          // small globes stay clean shaded spheres, the name arrives with size
+          var pCanvas = pcand.r >= 30 ? pTex.canvas : getBlankPlanetTexture();
+          planetGL.draw(pCanvas, pcand.sx, pcand.sy, pcand.r, 1, pRot, {
+            base: pTex.baseRGB,
+            accent: pTex.accentRGB,
+            seed: pTex.seed,
+            texSpan: pubTexSpan,
+            hover: false,
+            dpr: dpr,
+          });
+        }
+        ctx.drawImage(planetGL.canvas, 0, 0, W, H);
+        planetsActive = true; // keep frames coming so the globes rotate
+      }
     }
 
     // --- points: sprite-stamped ---
@@ -1390,7 +1486,9 @@
     var cardAlpha = planetAlpha;
 
     // --- document planets: info projected onto rotating orbs ---
-    planetsActive = false;
+    // (don't clobber the pub-planet rotation flag set above)
+    var pubPlanetsSpinning = planetsActive;
+    planetsActive = pubPlanetsSpinning;
     var planetR = 0;
     if (planetAlpha > 0.01) {
       planetR = planetRadiusFor(zoom);
@@ -1448,7 +1546,7 @@
           drawPlanet(cands[c].i, cands[c].sx, cands[c].sy, cands[c].r, planetAlpha, tSec);
         }
       }
-      planetsActive = cands.length > 0;
+      planetsActive = cands.length > 0 || pubPlanetsSpinning;
     }
 
     // --- hover/selection card: unfurled flat view of one document ---

@@ -821,6 +821,59 @@
 
   var coarseLayer = null; // offscreen compositing surface for the coarse nebula layer
 
+  // avatar patch cache: the sphere-wrapped (inverse-orthographic) version
+  // of each pub's avatar, rebuilt only when the image changes
+  var avatarPatchCache = new Map(); // basePath -> canvas
+
+  function getAvatarPatch(img, key) {
+    var hit = avatarPatchCache.get(key);
+    if (hit && hit._src === img) return hit;
+    if (avatarPatchCache.size > 64) avatarPatchCache.delete(avatarPatchCache.keys().next().value);
+    var THETA_MAX = Math.PI * 0.32;              // ~58 deg angular radius
+    var pw = Math.round(PLANET_TEX_W * (THETA_MAX / Math.PI)); // lon span (half-width) in texels
+    var ph = Math.round(PLANET_TEX_H * (THETA_MAX / Math.PI)); // lat span (half-height)
+    var W2 = pw * 2, H2 = ph * 2;
+    // read the source at a modest fixed size
+    var S = 128;
+    var sc = document.createElement('canvas');
+    sc.width = S; sc.height = S;
+    var sg = sc.getContext('2d');
+    sg.drawImage(img, 0, 0, S, S);
+    var src = sg.getImageData(0, 0, S, S).data;
+    var out = document.createElement('canvas');
+    out.width = W2; out.height = H2;
+    var og = out.getContext('2d');
+    var dst = og.createImageData(W2, H2);
+    var d = dst.data;
+    var sinMax = Math.sin(THETA_MAX);
+    for (var y = 0; y < H2; y++) {
+      var dPhi = ((y / H2) - 0.5) * 2 * THETA_MAX;       // latitude offset
+      for (var x = 0; x < W2; x++) {
+        var dLam = ((x / W2) - 0.5) * 2 * THETA_MAX;     // longitude offset
+        // angular distance from the tangent point (center on the equator)
+        var cosT = Math.cos(dPhi) * Math.cos(dLam);
+        var theta = Math.acos(Math.min(1, Math.max(-1, cosT)));
+        if (theta > THETA_MAX) continue;                 // outside the wrap
+        // bearing from center
+        var bx = Math.cos(dPhi) * Math.sin(dLam), by = Math.sin(dPhi);
+        var bLen = Math.sqrt(bx * bx + by * by) || 1;
+        // orthographic wrap: image radius proportional to sin(theta)
+        var r = Math.sin(theta) / sinMax;                // 0..1
+        var sx = Math.round((0.5 + 0.5 * r * (bx / bLen)) * (S - 1));
+        var sy = Math.round((0.5 + 0.5 * r * (by / bLen)) * (S - 1));
+        var si = (sy * S + sx) * 4, di = (y * W2 + x) * 4;
+        d[di] = src[si]; d[di + 1] = src[si + 1]; d[di + 2] = src[si + 2];
+        // feathered circular edge
+        var fade = Math.min(1, (THETA_MAX - theta) / (THETA_MAX * 0.12));
+        d[di + 3] = Math.round(src[si + 3] * fade);
+      }
+    }
+    og.putImageData(dst, 0, 0);
+    out._src = img;
+    avatarPatchCache.set(key, out);
+    return out;
+  }
+
   // shared featureless texture for small pub globes (body still shaded by
   // baseRGB/accentRGB in the GL path — this only omits the text)
   var blankPlanetTexCanvas = null;
@@ -865,17 +918,18 @@
       accentRGB = parseHex(c.mid);
     }
     if (img) {
-      // wrap the avatar around the sphere with square ON-SPHERE aspect:
-      // the texture band spans 180 deg of latitude over its full height, so a
-      // face must cover equal ARC both ways — ~90 deg of longitude (texW/4)
-      // by ~90 deg of latitude (half the band height). a naive square tile
-      // renders as a squished pole-to-pole sliver.
-      var wA = PLANET_TEX_W / 4;                 // 90 deg of longitude
-      var hA = Math.round(PLANET_TEX_H / 2);     // 90 deg of latitude
-      var yA = Math.round((PLANET_TEX_H - hA) / 2);
-      var periodA = PLANET_TEX_W / 2;            // two faces per revolution
+      // shrink-wrap the avatar onto the sphere. The texture is equirect
+      // (u = longitude, v = latitude), so a linear blit is an arc-length
+      // decal — it reads as a flat sticker. Instead, inverse-orthographic
+      // azimuthal projection about the patch center: for each texel at
+      // angular distance theta / bearing alpha from the tangent point,
+      // sample the source at radius sin(theta)/sin(thetaMax) — what a flat
+      // image physically does when wrapped over a ball — with a feathered
+      // circular edge.
+      var patch = getAvatarPatch(img, pub.basePath);
+      var periodA = PLANET_TEX_W / 2; // two faces per revolution
       for (var ka = 0; ka * periodA < cv.width; ka++) {
-        g.drawImage(img, ka * periodA + (periodA - wA) / 2, yA, wA, hA);
+        g.drawImage(patch, ka * periodA + (periodA - patch.width) / 2, (PLANET_TEX_H - patch.height) / 2);
       }
       var eA = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, true);
       pubPlanetTex.set(pub.basePath, eA);

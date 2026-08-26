@@ -216,9 +216,15 @@
     pubLoading[key] = true;
     pubLoadCount++;
     var img = new Image();
-    // anonymous CORS: the avatar gets wrapped onto a WebGL planet texture,
-    // and a tainted canvas would make texImage2D throw
-    img.crossOrigin = 'anonymous';
+    // the avatar gets wrapped onto a WebGL planet texture, so it must not
+    // taint the canvas: bsky CDN sends no CORS headers — go through the
+    // same-origin /img-proxy (same treatment as the accent sampler); other
+    // hosts get a direct anonymous-CORS attempt
+    if (url.indexOf('https://cdn.bsky.app/') === 0) {
+      url = '/img-proxy?u=' + encodeURIComponent(url);
+    } else {
+      img.crossOrigin = 'anonymous';
+    }
     img.onload = function() {
       pubImages[key] = img;
       delete pubLoading[key];

@@ -933,7 +933,7 @@
       }
       if (withText) {
         // the name hangs in the low atmosphere: same projected marquee as
-        // the text planets, in the southern band, stroked so it reads over
+        // the text planets, in the southern band, at the doc planets' meta latitude (the shader draws polar caps past |sin lat| ~0.78, which swallows anything lower). stroked so it reads over
         // whatever the avatar puts underneath it
         var nameA = pub.name || pub.basePath || '?';
         if (nameA.length > 41) nameA = nameA.slice(0, 40) + '…';
@@ -947,8 +947,8 @@
         g.strokeStyle = 'rgba(0,0,0,0.75)';
         g.fillStyle = 'rgba(255,255,255,0.95)';
         for (var kt = 0; kt * periodT < cv.width; kt++) {
-          g.strokeText(nameA, kt * periodT, 88);
-          g.fillText(nameA, kt * periodT, 88);
+          g.strokeText(nameA, kt * periodT, 79);
+          g.fillText(nameA, kt * periodT, 79);
         }
       }
       var eA = buildTexEntry(pub, cv, theme, accentKey, baseRGB, accentRGB, true);

@@ -364,14 +364,19 @@
   var animStart = 0;
   var ANIM_DURATION = 600; // ms
 
-  // --- canvas ---
+  // --- canvases: three stacked layers ---
+  // bg (2D): background fill + nebulae. gl: points, lines, planets. top
+  // (2D, takes events): labels, cards, tooltips, search marker.
   var canvas = document.getElementById('canvas');
   var ctx = canvas.getContext('2d');
+  var bgCanvas = document.getElementById('bg-canvas');
+  var bgCtx = bgCanvas.getContext('2d');
   var dpr = window.devicePixelRatio || 1;
   var W, H;
 
-  // WebGL planet renderer (planet-gl.js) — null falls back to 2D strips
-  var planetGL = window.PlanetGL ? window.PlanetGL.create() : null;
+  // WebGL scene renderer (atlas-gl.js) — null falls back to the 2D
+  // sprite/strip path for everything
+  var atlasGL = window.AtlasGL ? window.AtlasGL.create(document.getElementById('gl-canvas')) : null;
 
   // --- sprite cache ---
   var sprites = null;
@@ -631,6 +636,12 @@
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    bgCanvas.width = W * dpr;
+    bgCanvas.height = H * dpr;
+    bgCanvas.style.width = W + 'px';
+    bgCanvas.style.height = H + 'px';
+    bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (atlasGL) atlasGL.resize(W, H, dpr);
     sprites = null;
     dotSprites = null;
     haloSprites = null;
@@ -1214,6 +1225,99 @@
     }
   }
 
+  // --- GL scene support ---
+  // palette layout: [0..PLATFORMS) platform colors, then HUE_STEPS cluster
+  // hues. Per-point color index (platform or PLATFORMS.length + hueStep)
+  // is uploaded once; only the palette re-syncs on theme change.
+  var glPaletteTheme = null;
+
+  function hexTriple(c) {
+    var core = parseHex(c.core), mid = parseHex(c.mid), edge = parseHex(c.edge);
+    return {
+      core: [core[0] / 255, core[1] / 255, core[2] / 255],
+      mid: [mid[0] / 255, mid[1] / 255, mid[2] / 255],
+      edge: [edge[0] / 255, edge[1] / 255, edge[2] / 255],
+    };
+  }
+
+  function syncGlPalette() {
+    if (!atlasGL) return;
+    var theme = frameDark ? 'dark' : 'light';
+    if (glPaletteTheme === theme) return;
+    glPaletteTheme = theme;
+    var entries = [];
+    for (var p = 0; p < PLATFORMS.length; p++) entries.push(hexTriple(frameColors[PLATFORMS[p]]));
+    for (var h = 0; h < HUE_STEPS; h++) entries.push(hexTriple(hueColorsFor(h)));
+    atlasGL.setPalette(entries);
+  }
+
+  // point dim/highlight state, rebuilt only when search or filter changes
+  function rebuildPointState() {
+    if (!atlasGL || !platformIdx) return;
+    var n = platformIdx.length;
+    var searching = searchMatches && searchMatches.size > 0;
+    if (!searching && activePlatforms === null) {
+      atlasGL.setPointState(null);
+      return;
+    }
+    var st = new Uint8Array(n);
+    for (var i = 0; i < n; i++) {
+      var dim = false;
+      if (activePlatforms !== null && !activePlatforms.has(PLATFORMS[platformIdx[i]])) dim = true;
+      if (searching && !searchMatches.has(i)) dim = true;
+      st[i] = dim ? 1 : 0;
+    }
+    if (searching) searchMatches.forEach(function(i) { st[i] = 2; });
+    atlasGL.setPointState(st);
+  }
+
+  // connection lines: the pairs never change, only the transform does — so
+  // find them ONCE at load (grid neighbor search, same-cluster, capped per
+  // point) and keep them in a GPU buffer for the rest of the session.
+  var CONN_RADIUS = 0.025;
+  var CONN_MAX_PER_POINT = 4;
+  var CONN_MAX_LINES = 120000;
+
+  function buildConnectionLines() {
+    if (!atlasGL || !gridIndex || !clusterFineArr) return;
+    var n = platformIdx.length;
+    var cs = gridIndex.cellSize;
+    var verts = new Float32Array(CONN_MAX_LINES * 8); // 2 verts × [x,y,color,bucket]
+    var count = 0; // vertex count
+    var r2 = CONN_RADIUS * CONN_RADIUS;
+    for (var i = 0; i < n && count / 2 < CONN_MAX_LINES; i++) {
+      var px = pointsX[i], py = pointsY[i];
+      var ci = clusterFineArr[i];
+      var colorIdx = pointHueArr[i] !== 255 ? PLATFORMS.length + pointHueArr[i] : platformIdx[i];
+      var gxMin = Math.floor((px - CONN_RADIUS) / cs), gxMax = Math.floor((px + CONN_RADIUS) / cs);
+      var gyMin = Math.floor((py - CONN_RADIUS) / cs), gyMax = Math.floor((py + CONN_RADIUS) / cs);
+      var found = 0;
+      for (var gx = gxMin; gx <= gxMax && found < CONN_MAX_PER_POINT; gx++) {
+        for (var gy = gyMin; gy <= gyMax && found < CONN_MAX_PER_POINT; gy++) {
+          var cell = gridIndex.cells[gx + ',' + gy];
+          if (!cell) continue;
+          for (var k = 0; k < cell.length && found < CONN_MAX_PER_POINT; k++) {
+            var j = cell[k];
+            if (j <= i || clusterFineArr[j] !== ci) continue;
+            var dx = pointsX[j] - px, dy = pointsY[j] - py;
+            var d2 = dx * dx + dy * dy;
+            if (d2 > r2 || d2 < 0.0001) continue;
+            if (count / 2 >= CONN_MAX_LINES) break;
+            var t = Math.sqrt(d2) / CONN_RADIUS;
+            var bucket = t < 0.33 ? 0 : t < 0.66 ? 1 : 2;
+            var o = count * 4;
+            verts[o] = px; verts[o + 1] = py; verts[o + 2] = colorIdx; verts[o + 3] = bucket;
+            verts[o + 4] = pointsX[j]; verts[o + 5] = pointsY[j]; verts[o + 6] = colorIdx; verts[o + 7] = bucket;
+            count += 2;
+            found++;
+          }
+        }
+      }
+    }
+    atlasGL.uploadLines(count * 4 === verts.length ? verts : verts.slice(0, count * 4), count);
+    markDirty();
+  }
+
   // --- rendering ---
   function render() {
     if (!data || !view.dirty) return;
@@ -1226,11 +1330,14 @@
     var n = data.points.length;
 
     cacheTransform();
+    syncGlPalette();
 
-    // background
+    // background — bottom canvas; the top canvas holds only the 2D overlay
+    bgCtx.globalAlpha = 1;
+    bgCtx.fillStyle = dark ? '#050505' : '#f5f5f0';
+    bgCtx.fillRect(0, 0, W, H);
+    ctx.clearRect(0, 0, W, H);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = dark ? '#050505' : '#f5f5f0';
-    ctx.fillRect(0, 0, W, H);
 
     // visible bounds in data space
     var tl = screenToData(0, 0);
@@ -1267,9 +1374,9 @@
         var drawSize = halo.sprite.width * (r / halo.bucket) * haloShrink;
         lg.drawImage(halo.sprite, sx - drawSize / 2, sy - drawSize / 2, drawSize, drawSize);
       }
-      ctx.globalAlpha = (dark ? coarseTune.layerAlpha.dark : coarseTune.layerAlpha.light) * coarseHaloAlpha;
-      ctx.drawImage(coarseLayer, 0, 0, W, H);
-      ctx.globalAlpha = 1;
+      bgCtx.globalAlpha = (dark ? coarseTune.layerAlpha.dark : coarseTune.layerAlpha.light) * coarseHaloAlpha;
+      bgCtx.drawImage(coarseLayer, 0, 0, W, H);
+      bgCtx.globalAlpha = 1;
     }
 
     // --- fine cluster nebulae: lanterns (the zoomed-IN view) ---
@@ -1306,15 +1413,25 @@
         flg.globalAlpha = 0.6 * v;
         flg.drawImage(halo2.sprite, nsx - drawSize2 / 2, nsy - drawSize2 / 2, drawSize2, drawSize2);
       }
-      ctx.globalAlpha = neb.alpha * 1.6 * nebAlpha; // layer bound ≈ old single-lantern peak
-      ctx.drawImage(coarseLayer, 0, 0, W, H);
-      ctx.globalAlpha = 1;
+      bgCtx.globalAlpha = neb.alpha * 1.6 * nebAlpha; // layer bound ≈ old single-lantern peak
+      bgCtx.drawImage(coarseLayer, 0, 0, W, H);
+      bgCtx.globalAlpha = 1;
+    }
+
+    // while a search is active the GL points dim via per-point state; the
+    // nebulae dim here so the whole field recedes behind the matches
+    if (atlasGL && searchMatches && searchMatches.size > 0) {
+      bgCtx.globalAlpha = dark ? 0.6 : 0.5;
+      bgCtx.fillStyle = dark ? '#050505' : '#f5f5f0';
+      bgCtx.fillRect(0, 0, W, H);
+      bgCtx.globalAlpha = 1;
     }
 
     // --- connection lines (intra-cluster, colored by platform) ---
-    // smooth fade-in over zoom 2.5–3.5
+    // smooth fade-in over zoom 2.5–3.5. GL path: static pair buffer drawn
+    // in atlasGL.frame() below; this per-frame search is the 2D fallback.
     var connAlphaFactor = fadeIn(zoom, 2.5, 1.0);
-    if (connAlphaFactor > 0 && gridIndex && clusterFineArr) {
+    if (!atlasGL && connAlphaFactor > 0 && gridIndex && clusterFineArr) {
       if (!connBufs) initConnBuffers();
       resetConnBuffers();
 
@@ -1412,10 +1529,12 @@
         var pPlatform = pub.platform || 'other';
         var pColors = frameColors[pPlatform] || frameColors.other;
 
-        if (planetGL) {
+        if (atlasGL) {
           // literal globe: the same rotating vegas-sphere as the documents.
           // budgeted pubs get their avatar wrapped onto the surface — a
           // planet of that person; the rest carry the name marquee.
+          // NOTE: drawn AFTER the point pass below, so publisher faces sit
+          // cleanly above the document confetti instead of under it.
           var wantAvatar = pr >= imgThreshold && avatarBudget > 0;
           if (wantAvatar) { loadPubImage(pub); avatarBudget--; }
           var pImg = wantAvatar ? pubImages[pub.basePath] : null;
@@ -1435,85 +1554,103 @@
         }
       }
       ctx.globalAlpha = 1;
-      if (pubPlanetCands.length > 0) {
-        var pubTSec = performance.now() / 1000;
-        planetGL.begin(W, H, dpr, dark);
-        var pubTexSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
-        for (var pc = 0; pc < pubPlanetCands.length; pc++) {
-          var pcand = pubPlanetCands[pc];
-          var pTex = getPubPlanetTexture(pcand.pub, pcand.img, pcand.r >= 30);
-          var pRot = (pubTSec * pTex.speed + pTex.phase) % (Math.PI * 2);
-          // below marquee size projected TEXT is illegible scribble, so
-          // text-only globes stay clean spheres until they're landmarks —
-          // but a face reads at any size, so avatar planets always wear it
-          var pCanvas = (pTex.hasAvatar || pcand.r >= 30) ? pTex.canvas : getBlankPlanetTexture();
-          try {
-            planetGL.draw(pCanvas, pcand.sx, pcand.sy, pcand.r, 1, pRot, {
-              base: pTex.baseRGB,
-              accent: pTex.accentRGB,
-              seed: pTex.seed,
-              texSpan: pubTexSpan,
-              hover: false,
-              dpr: dpr,
-            });
-          } catch (texErr) {
-            // tainted avatar canvas — evict and never retry the image
-            pubPlanetTex.delete(pcand.pub.basePath);
-            pubFailed[pcand.pub.basePath] = true;
-            delete pubImages[pcand.pub.basePath];
+    }
+
+    // --- points ---
+    // continuous size/starness curves: starlight points stay small through
+    // the midrange, reaching 7px right where the planets take over (planet
+    // radius starts at 7 at CARD_START, so the handoff is smooth); pure
+    // starlight below zoom ~7, fully a sphere by ~15.
+    // one continuous curve, pinned to radius 7 at CARD_START so the
+    // sprite→planet handoff stays a single object growing
+    var pointR = Math.max(1.2, Math.min(7, 1.25 + zoom * 0.1278));
+    var starness = zoom >= 2 ? fadeOut(zoom, 7, 8) : 1;
+    var filtering = activePlatforms !== null;
+    if (atlasGL) {
+      // one GPU pass: static lines, then all 83k points in a single draw.
+      // Dim/highlight (filter + search) ride a per-point state buffer that
+      // only changes when the filter or search changes — see
+      // rebuildPointState(). Pan/zoom is pure uniform updates.
+      var searching = searchMatches && searchMatches.size > 0;
+      var connAlphas = dark ? [0.18, 0.10, 0.05] : [0.14, 0.08, 0.03];
+      atlasGL.frame({
+        W: W, H: H, dpr: dpr, dark: dark,
+        scale: scale, cx: cx, cy: cy,
+        radius: pointR,
+        starness: starness,
+        alpha: zoom >= 2 ? 0.95 : 0.55 + 0.4 * fadeIn(zoom, 1.5, 0.5),
+        dim: searching ? 0.35 : 0.12,
+        lineFade: connAlphaFactor,
+        lineAlphas: connAlphas,
+        hoverIdx: hoveredIndex,
+      });
+    } else {
+      // --- 2D fallback: sprite-stamped points ---
+      ctx.globalAlpha = 1;
+      var useGlow = zoom >= 2;
+      if (useGlow) buildSprites(pointR, starness);
+      else buildDotSprites();
+      // draw dimmed points first, then active points on top
+      for (var pass = 0; pass < (filtering ? 2 : 1); pass++) {
+        if (filtering && pass === 0) ctx.globalAlpha = 0.12;
+        else ctx.globalAlpha = 1;
+        for (var i = 0; i < n; i++) {
+          var px = pointsX[i], py = pointsY[i];
+          if (px < xMin || px > xMax || py < yMin || py > yMax) continue;
+          var pi = platformIdx[i];
+          var isActive = !filtering || activePlatforms.has(PLATFORMS[pi]);
+          // pass 0 = dimmed (inactive), pass 1 = bright (active)
+          if (filtering && ((pass === 0 && isActive) || (pass === 1 && !isActive))) continue;
+          if (!filtering && pass === 1) continue;
+          var sx = cx + px * scale, sy = cy + py * scale;
+          var hue = pointHueArr ? pointHueArr[i] : 255;
+          if (useGlow) {
+            var set = hue !== 255 ? getHueSprite(hue) : sprites[pi];
+            var spr = i === hoveredIndex ? set.hover : set.normal;
+            ctx.drawImage(spr, sx - spr.width / (2 * dpr), sy - spr.height / (2 * dpr), spr.width / dpr, spr.height / dpr);
+          } else {
+            var dot = hue !== 255 ? getHueDotSprite(hue) : dotSprites[pi];
+            ctx.drawImage(dot, sx - dot.width / (2 * dpr), sy - dot.height / (2 * dpr), dot.width / dpr, dot.height / dpr);
           }
         }
-        ctx.drawImage(planetGL.canvas, 0, 0, W, H);
-        planetsActive = true; // keep frames coming so the globes rotate
       }
+      ctx.globalAlpha = 1;
     }
 
-    // --- points: sprite-stamped ---
-    ctx.globalAlpha = 1;
-    var useGlow = zoom >= 2;
-    if (useGlow) {
-      // gentle size curve: starlight points stay small through the
-      // midrange, reaching 7px right where the planets take over (the
-      // planet radius starts at 7 at CARD_START, so the handoff is smooth)
-      var pointR = Math.min(7, 1.0 + zoom * 0.135);
-      // starness: pure starlight below zoom ~7, fully a sphere by ~15 —
-      // the 3D reading arrives early so the planet handoff is one object
-      // growing, not a species change
-      var starness = fadeOut(zoom, 7, 8);
-      buildSprites(pointR, starness);
-    } else {
-      buildDotSprites();
-    }
-
-    var filtering = activePlatforms !== null;
-    // draw dimmed points first, then active points on top
-    for (var pass = 0; pass < (filtering ? 2 : 1); pass++) {
-      if (filtering && pass === 0) ctx.globalAlpha = 0.12;
-      else ctx.globalAlpha = 1;
-      for (var i = 0; i < n; i++) {
-        var px = pointsX[i], py = pointsY[i];
-        if (px < xMin || px > xMax || py < yMin || py > yMax) continue;
-        var pi = platformIdx[i];
-        var isActive = !filtering || activePlatforms.has(PLATFORMS[pi]);
-        // pass 0 = dimmed (inactive), pass 1 = bright (active)
-        if (filtering && ((pass === 0 && isActive) || (pass === 1 && !isActive))) continue;
-        if (!filtering && pass === 1) continue;
-        var sx = cx + px * scale, sy = cy + py * scale;
-        var hue = pointHueArr ? pointHueArr[i] : 255;
-        if (useGlow) {
-          var set = hue !== 255 ? getHueSprite(hue) : sprites[pi];
-          var spr = i === hoveredIndex ? set.hover : set.normal;
-          ctx.drawImage(spr, sx - spr.width / (2 * dpr), sy - spr.height / (2 * dpr), spr.width / dpr, spr.height / dpr);
-        } else {
-          var dot = hue !== 255 ? getHueDotSprite(hue) : dotSprites[pi];
-          ctx.drawImage(dot, sx - dot.width / (2 * dpr), sy - dot.height / (2 * dpr), dot.width / dpr, dot.height / dpr);
+    // --- publication planets: drawn ABOVE the point field ---
+    if (atlasGL && pubPlanetCands.length > 0) {
+      var pubTSec = performance.now() / 1000;
+      atlasGL.beginPlanets(W, H, dpr, dark);
+      var pubTexSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
+      for (var pc = 0; pc < pubPlanetCands.length; pc++) {
+        var pcand = pubPlanetCands[pc];
+        var pTex = getPubPlanetTexture(pcand.pub, pcand.img, pcand.r >= 30);
+        var pRot = (pubTSec * pTex.speed + pTex.phase) % (Math.PI * 2);
+        // below marquee size projected TEXT is illegible scribble, so
+        // text-only globes stay clean spheres until they're landmarks —
+        // but a face reads at any size, so avatar planets always wear it
+        var pCanvas = (pTex.hasAvatar || pcand.r >= 30) ? pTex.canvas : getBlankPlanetTexture();
+        try {
+          atlasGL.drawPlanet(pCanvas, pcand.sx, pcand.sy, pcand.r, 1, pRot, {
+            base: pTex.baseRGB,
+            accent: pTex.accentRGB,
+            seed: pTex.seed,
+            texSpan: pubTexSpan,
+            hover: false,
+            dpr: dpr,
+          });
+        } catch (texErr) {
+          // tainted avatar canvas — evict and never retry the image
+          pubPlanetTex.delete(pcand.pub.basePath);
+          pubFailed[pcand.pub.basePath] = true;
+          delete pubImages[pcand.pub.basePath];
         }
       }
+      planetsActive = true; // keep frames coming so the globes rotate
     }
-    ctx.globalAlpha = 1;
 
-    // --- search highlights ---
-    if (searchMatches && searchMatches.size > 0) {
+    // --- search highlights (2D fallback; GL handles this via point state) ---
+    if (!atlasGL && searchMatches && searchMatches.size > 0) {
       // dim non-matching points by drawing a semi-transparent overlay
       ctx.globalAlpha = dark ? 0.6 : 0.5;
       ctx.fillStyle = dark ? '#050505' : '#f5f5f0';
@@ -1535,9 +1672,11 @@
           ctx.drawImage(dot, sx - dot.width / (2 * dpr), sy - dot.height / (2 * dpr), dot.width / dpr, dot.height / dpr);
         }
       });
+    }
 
-      // draw search centroid marker — not at planet zoom, where the matches
-      // themselves are unmistakable
+    // search centroid marker — both paths; not at planet zoom, where the
+    // matches themselves are unmistakable
+    if (searchMatches && searchMatches.size > 0) {
       if (searchCenter && fadeIn(zoom, CARD_START, CARD_RANGE) < 0.5) {
         var mx = cx + searchCenter.x * scale, my = cy + searchCenter.y * scale;
         var accent = dark ? 'rgba(250,200,80,' : 'rgba(200,120,0,';
@@ -1647,14 +1786,14 @@
         cands[c].r = best === Infinity ? planetR
           : Math.max(rMin, Math.min(planetR, Math.sqrt(best) * 0.52));
       }
-      if (planetGL) {
-        planetGL.begin(W, H, dpr, dark);
+      if (atlasGL) {
+        atlasGL.beginPlanets(W, H, dpr, dark);
         var texSpan = PLANET_TEX_W / (PLANET_TEX_W + PLANET_TEX_BLEED);
         for (var c = 0; c < cands.length; c++) {
           var pcI = cands[c].i;
           var pcT = getPlanetTexture(pcI);
           var pcRot = (tSec * pcT.speed + pcT.phase) % (Math.PI * 2);
-          planetGL.draw(pcT.canvas, cands[c].sx, cands[c].sy, cands[c].r, planetAlpha, pcRot, {
+          atlasGL.drawPlanet(pcT.canvas, cands[c].sx, cands[c].sy, cands[c].r, planetAlpha, pcRot, {
             base: pcT.baseRGB,
             accent: pcT.accentRGB,
             seed: (pcI % 97) * 1.3,
@@ -1663,7 +1802,6 @@
             dpr: dpr,
           });
         }
-        if (cands.length > 0) ctx.drawImage(planetGL.canvas, 0, 0, W, H);
       } else {
         for (var c = 0; c < cands.length; c++) {
           drawPlanet(cands[c].i, cands[c].sx, cands[c].sy, cands[c].r, planetAlpha, tSec);
@@ -2389,6 +2527,7 @@
       if (activePlatforms.size === PLATFORMS.length) activePlatforms = null;
     }
     renderLegend();
+    rebuildPointState();
     markDirty();
   }
 
@@ -2604,6 +2743,17 @@
         fetchSubscriberCounts();
 
         buildSpatialIndex();
+        if (atlasGL) {
+          // one-time GPU upload: positions + palette index per point
+          var colorIdx = new Uint8Array(n);
+          for (var i = 0; i < n; i++) {
+            colorIdx[i] = pointHueArr[i] !== 255 ? PLATFORMS.length + pointHueArr[i] : platformIdx[i];
+          }
+          atlasGL.uploadPoints(n, pointsX, pointsY, colorIdx);
+          // connection-pair search is a load-time cost now, not a per-frame
+          // one — defer it so the first paint isn't blocked
+          setTimeout(buildConnectionLines, 0);
+        }
         renderLegend();
         var statsText = n.toLocaleString() + ' documents \u00B7 ' +
           d.clusters.coarse.length + ' regions \u00B7 ' +
@@ -2713,6 +2863,7 @@
     searchMatches = null;
     searchCenter = null;
     searchQuery = '';
+    rebuildPointState();
     setSearchStatus('');
     var url = new URL(window.location);
     if (url.searchParams.has('q')) {
@@ -2729,6 +2880,7 @@
       setSearchStatus('no results');
       searchMatches = null;
       searchCenter = null;
+      rebuildPointState();
       markDirty();
       return;
     }
@@ -2752,12 +2904,14 @@
       setSearchStatus(results.length + ' results, 0 on map');
       searchMatches = null;
       searchCenter = null;
+      rebuildPointState();
       markDirty();
       return;
     }
 
     searchMatches = matches;
     searchCenter = { x: weightedX / totalWeight, y: weightedY / totalWeight };
+    rebuildPointState();
     setSearchStatus(matches.size + ' of ' + results.length + ' on map');
 
     var maxDist = 0;
@@ -2866,6 +3020,7 @@
       sprites = null;
       dotSprites = null;
       haloSprites = null;
+      glPaletteTheme = null; // re-sync the GL palette on theme change
       renderLegend();
       markDirty();
     },

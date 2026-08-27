@@ -43,6 +43,17 @@ canvas {
   cursor: grab;
 }
 
+/* the three stacked render layers; only the top one takes events */
+#bg-canvas, #gl-canvas, #canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+}
+#bg-canvas, #gl-canvas {
+  pointer-events: none;
+  cursor: default;
+}
+
 canvas:active {
   cursor: grabbing;
 }

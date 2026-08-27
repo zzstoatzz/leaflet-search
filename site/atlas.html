@@ -38,6 +38,10 @@
     <div class="spinner">loading atlas...</div>
   </div>
 
+  <!-- layered rendering: background+nebulae (2D) under the GL scene
+       (points/lines/planets) under the top canvas (labels/cards, events) -->
+  <canvas id="bg-canvas"></canvas>
+  <canvas id="gl-canvas"></canvas>
   <canvas id="canvas"></canvas>
 
   <div class="header">
@@ -73,7 +77,7 @@
   <script src="platforms.js"></script>
   <script src="clients.js"></script>
   <script src="ui.js"></script>
-  <script src="planet-gl.js"></script>
+  <script src="atlas-gl.js"></script>
   <script src="atlas.js"></script>
   <script>
     document.getElementById('settings-btn').addEventListener('click', function() {

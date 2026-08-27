@@ -389,6 +389,14 @@ pub const migrations = [_]zug.Migration{
         // but hidden from search results unless the caller asks (hidden=show).
         .sql = "ALTER TABLE publications ADD COLUMN show_in_discover INTEGER NOT NULL DEFAULT 1",
     },
+    .{
+        .id = "022_documents_did_path_index",
+        .name = "point lookup for the (did, path) republish-identity check at ingest",
+        // Some publishing tools mint a fresh rkey for every document on every
+        // site republish; the indexer resolves that by (did, path) identity
+        // (newest rkey wins). This is the index that lookup seeks on.
+        .sql = "CREATE INDEX IF NOT EXISTS idx_documents_did_path ON documents(did, path) WHERE path IS NOT NULL AND path != ''",
+    },
 };
 
 // --- tests ---

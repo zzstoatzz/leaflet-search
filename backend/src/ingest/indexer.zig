@@ -4,6 +4,7 @@ const logfire = @import("logfire");
 const policy = @import("../policy.zig");
 const db = @import("../db.zig");
 const pubkey = @import("../server/pubkey.zig");
+const tpuf = @import("../tpuf.zig");
 
 fn isHttpUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "https://") or std.mem.startsWith(u8, s, "http://");
@@ -88,12 +89,17 @@ pub fn insertDocument(
     else
         "%";
 
+    const doc_path = path orelse "";
     var reads = try c.queryBatch(&.{
         .{ .sql = "SELECT uri FROM documents WHERE did = ? AND rkey = ?", .args = &.{ did, rkey } },
         .{ .sql = "SELECT uri, COALESCE(source_collection, '') FROM documents WHERE did = ? AND content_hash = ?", .args = &.{ did, &content_hash } },
         .{ .sql = "SELECT base_path, platform FROM publications WHERE uri = ?", .args = &.{pub_uri} },
         .{ .sql = "SELECT base_path FROM publications WHERE did = ? AND base_path LIKE ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{ did, platform_pattern } },
         .{ .sql = "SELECT base_path FROM publications WHERE did = ? ORDER BY LENGTH(base_path) DESC LIMIT 1", .args = &.{did} },
+        // republish identity: the newest same-(did, path, collection) row under
+        // a DIFFERENT rkey (self excluded so unchanged re-puts stay upserts).
+        // Returns nothing when the incoming doc has no path.
+        .{ .sql = "SELECT uri, rkey, COALESCE(base_path, '') FROM documents WHERE did = ? AND path = ? AND path != '' AND rkey != ? AND COALESCE(source_collection, '') = ? ORDER BY rkey DESC LIMIT 1", .args = &.{ did, doc_path, rkey, source_collection } },
     });
     defer reads.deinit();
 
@@ -223,6 +229,38 @@ pub fn insertDocument(
         return;
     }
 
+    // republish identity: some publishing tools mint a fresh rkey for EVERY
+    // document on EVERY site republish and never delete the old ones (jcrt.org
+    // accumulated 26 live byte-identical copies per article). A document's
+    // identity is (did, base_path, path) within its collection; the higher
+    // rkey (TID = newer) wins. Keeping the NEWER record is what makes this
+    // safe against the rename data-loss mode that killed the old unscoped
+    // content-hash dedup: a rename's trailing delete targets the OLD rkey,
+    // which we've already removed — an idempotent no-op — while the document
+    // lives on under the new rkey. Replayed old rkeys (backfills, reconciler
+    // creates) fall on the drop side of the same comparison.
+    var supersede_buf: [512]u8 = undefined;
+    var supersede_uri: []const u8 = "";
+    if (reads.getFirst(5)) |row| {
+        const other_base = row.text(2);
+        if (std.mem.eql(u8, other_base, base_path)) {
+            const other_uri = row.text(0);
+            const other_rkey = row.text(1);
+            switch (republishVerdict(other_rkey, rkey)) {
+                .drop_incoming => {
+                    logfire.span("ingest.dropped", .{ .reason = "republish_stale", .uri = uri, .existing_uri = other_uri }).end();
+                    return;
+                },
+                .supersede_existing => {
+                    if (other_uri.len <= supersede_buf.len) {
+                        @memcpy(supersede_buf[0..other_uri.len], other_uri);
+                        supersede_uri = supersede_buf[0..other_uri.len];
+                    }
+                },
+            }
+        }
+    }
+
     // detect platform from basePath if platform is unknown/other
     // this handles site.standard.* documents where collection doesn't indicate platform
     var actual_platform = platform;
@@ -297,6 +335,18 @@ pub fn insertDocument(
     var writes = try c.queryBatch(write_stmts);
     writes.deinit();
 
+    // superseded republish copy: removed AFTER the new row committed, so a
+    // write failure can't leave the document represented by neither record.
+    // deleteDocument covers turso + FTS + tags + overlay tombstone; the
+    // vector delete matches the firehose delete path (ingester.zig).
+    if (supersede_uri.len > 0) {
+        deleteDocument(supersede_uri);
+        const hashed = tpuf.hashId(supersede_uri);
+        if (tpuf.isEnabled()) tpuf.delete(c.allocator, &.{&hashed}) catch {};
+        logfire.counter("ingest.republish_superseded", 1);
+        logfire.info("indexer: republish supersedes {s} -> {s}", .{ supersede_uri, uri });
+    }
+
     // overlay projection AFTER the turso commit: at-least-once + idempotent.
     // Failure never fails ingest — the next snapshot heals a missed write.
     if (db.getOverlay()) |o| {
@@ -364,6 +414,24 @@ pub const HashVerdict = enum {
     /// same body, same collection, different rkey: a rename, and it must index
     rename,
 };
+
+/// Republish-identity outcome for two same-(did, base_path, path) records in
+/// the same collection under different rkeys. TIDs are base32-sortable, so
+/// lexicographic rkey order is chronological.
+pub const RepublishVerdict = enum {
+    /// incoming rkey is older than the indexed one — a replayed stale copy
+    /// (backfill, reconciler create); never displaces the newer record
+    drop_incoming,
+    /// incoming rkey is newer — it becomes the document; the old row goes
+    supersede_existing,
+};
+
+pub fn republishVerdict(existing_rkey: []const u8, incoming_rkey: []const u8) RepublishVerdict {
+    return if (std.mem.order(u8, incoming_rkey, existing_rkey) == .lt)
+        .drop_incoming
+    else
+        .supersede_existing;
+}
 
 pub fn contentHashVerdict(
     existing_uri: []const u8,
@@ -946,4 +1014,21 @@ test "content-hash match: a same-collection rename must index, not drop" {
         "at://did:plc:x/site.standard.document/b",
         doc,
     ));
+}
+
+test "republishVerdict: newer rkey supersedes, replayed older rkey drops" {
+    const t = std.testing;
+
+    // republish flood / rename create: incoming TID is newer → it becomes
+    // the document. The rename's trailing delete then targets the OLD rkey,
+    // which supersede already removed — an idempotent no-op, so the rename
+    // data-loss mode (old kept, new dropped, delete kills old) cannot recur.
+    try t.expectEqual(RepublishVerdict.supersede_existing, republishVerdict("3mpkuqxkcj62s", "3mtzx2k43jm2p"));
+
+    // out-of-order replay (backfill, reconciler create of a still-live old
+    // copy): incoming TID is older → never displaces the newer record
+    try t.expectEqual(RepublishVerdict.drop_incoming, republishVerdict("3mtzx2k43jm2p", "3mpkuqxkcj62s"));
+
+    // non-TID rkeys still get a deterministic order
+    try t.expectEqual(RepublishVerdict.drop_incoming, republishVerdict("zzz", "aaa"));
 }

@@ -1,0 +1,138 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx", "pydantic-settings"]
+# ///
+"""One-time purge of accumulated republish duplicates.
+
+Companion to the ingest-time (did, base_path, path) identity rule (migration
+022 / indexer supersede-newest): for each listed DID, keep the highest-rkey
+row per (base_path, path, source_collection) and delete the rest from turso
+(documents + documents_fts + document_tags) and turbopuffer (by hashed id).
+
+No tombstones are written — the superseded records are still live at source;
+tombstone semantics mean "deleted upstream". Re-ingests of the old rkeys are
+dropped by the indexer's republish_stale rule. The serving snapshot and atlas
+inherit the cleanup on their next scheduled builds.
+
+Paced and canaried per the turso incident discipline: batched deletes with a
+SELECT 1 canary between batches; any canary failure aborts.
+"""
+
+import argparse
+import hashlib
+import os
+import sys
+import time
+
+import httpx
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DIDS = [
+    "did:plc:e24okfpxr7ctcbmruijop5gp",  # jcrt.org
+    "did:plc:tuj4ihtuielwdb7dfu7t3btk",  # blog.localstack.cloud
+]
+BATCH = 100
+TPUF_BATCH = 500
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=os.environ.get("ENV_FILE", ".env"), extra="ignore"
+    )
+    turso_url: str
+    turso_token: str
+    turbopuffer_api_key: str
+    turbopuffer_namespace: str = "leaflet-search"
+
+    @property
+    def turso_host(self) -> str:
+        url = self.turso_url
+        if url.startswith("libsql://"):
+            url = url[len("libsql://") :]
+        return url
+
+
+def turso(settings: Settings, stmts: list[dict]) -> list:
+    r = httpx.post(
+        f"https://{settings.turso_host}/v2/pipeline",
+        headers={"Authorization": f"Bearer {settings.turso_token}"},
+        json={"requests": [{"type": "execute", "stmt": s} for s in stmts] + [{"type": "close"}]},
+        timeout=60,
+    )
+    r.raise_for_status()
+    results = r.json()["results"][: len(stmts)]
+    for res in results:
+        if res["response"].get("type") == "error" or res.get("type") == "error":
+            raise RuntimeError(res)
+    return results
+
+
+def stmt(sql: str, args: list[str]) -> dict:
+    return {"sql": sql, "args": [{"type": "text", "value": a} for a in args]}
+
+
+def canary(settings: Settings) -> None:
+    rows = turso(settings, [stmt("SELECT 1", [])])[0]["response"]["result"]["rows"]
+    assert rows[0][0]["value"] == "1"
+
+
+def hash_id(uri: str) -> str:
+    """Match tpuf.zig hashId: first 32 hex chars of SHA256."""
+    return hashlib.sha256(uri.encode()).hexdigest()[:32]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true", help="actually delete (default: report only)")
+    parser.add_argument("--did", action="append", help="override the built-in DID list")
+    args = parser.parse_args()
+    settings = Settings()  # type: ignore[call-arg]
+
+    for did in args.did or DIDS:
+        canary(settings)
+        rows = turso(settings, [stmt(
+            "SELECT uri, rkey, COALESCE(base_path,''), COALESCE(path,''), COALESCE(source_collection,'') "
+            "FROM documents WHERE did = ? AND path IS NOT NULL AND path != ''", [did])]
+        )[0]["response"]["result"]["rows"]
+        docs = [tuple(c["value"] for c in r) for r in rows]
+        keep: dict[tuple, tuple] = {}
+        for uri, rkey, base_path, path, coll in docs:
+            key = (base_path, path, coll)
+            if key not in keep or rkey > keep[key][1]:
+                keep[key] = (uri, rkey)
+        keepers = {v[0] for v in keep.values()}
+        victims = [d[0] for d in docs if d[0] not in keepers]
+        print(f"{did}: {len(docs)} rows, {len(keep)} identities, {len(victims)} duplicates to purge")
+        if not args.apply or not victims:
+            continue
+
+        for i in range(0, len(victims), BATCH):
+            chunk = victims[i : i + BATCH]
+            ph = ",".join("?" * len(chunk))
+            turso(settings, [
+                stmt(f"DELETE FROM documents_fts WHERE rowid IN (SELECT rowid FROM documents WHERE uri IN ({ph}))", chunk),
+                stmt(f"DELETE FROM document_tags WHERE document_uri IN ({ph})", chunk),
+                stmt(f"DELETE FROM documents WHERE uri IN ({ph})", chunk),
+            ])
+            canary(settings)
+            if (i // BATCH) % 10 == 0:
+                print(f"  turso: {min(i + BATCH, len(victims))}/{len(victims)}")
+            time.sleep(0.3)
+        print(f"  turso: {len(victims)}/{len(victims)} done")
+
+        ids = [hash_id(u) for u in victims]
+        for i in range(0, len(ids), TPUF_BATCH):
+            r = httpx.post(
+                f"https://api.turbopuffer.com/v2/namespaces/{settings.turbopuffer_namespace}",
+                headers={"Authorization": f"Bearer {settings.turbopuffer_api_key}"},
+                json={"deletes": ids[i : i + TPUF_BATCH]},
+                timeout=60,
+            )
+            r.raise_for_status()
+            time.sleep(0.3)
+        print(f"  tpuf: {len(ids)} ids deleted")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

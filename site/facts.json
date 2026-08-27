@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-02T04:26:40+00:00",
+  "generated_at": "2026-08-26T00:09:28+00:00",
   "facts": [
     {
       "text": "the first document this index watched arrive live off the firehose was “do we not token predict?” by @enflux.bsky.social, January 1, 2026",
@@ -7,23 +7,28 @@
       "url": "https://enflux.leaflet.pub/3mbd77x5xp22u"
     },
     {
-      "text": "the first pckt document this index watched arrive was “Untitled” by @brookie.cryptoanarchy.network, January 2, 2026",
+      "text": "the first pckt document this index watched arrive was “This is a test!” by @songbirder.social, January 4, 2026",
       "detail": "firsts are by verified arrival — self-reported dates reach back further, but can't be checked",
-      "url": "https://crypto.pckt.blog/untitled-9yks7zd"
+      "url": "https://songbirder.pckt.blog/this-is-a-test-e2y48cs"
     },
     {
-      "text": "the first greengale document this index watched arrive was “Breaking Free From Walled Platforms” by @sera.is.youronly.one, January 15, 2026",
+      "text": "the first greengale document this index watched arrive was “Email, perhaps? 🥺👉👈” by @goose.art, January 23, 2026",
       "detail": "firsts are by verified arrival — self-reported dates reach back further, but can't be checked",
-      "url": "https://greengale.app/sera.is.youronly.one/3mcht3dcqdu2k"
+      "url": "https://greengale.app/goose.art/3md3644pt2d2w"
     },
     {
-      "text": "the first offprint document this index watched arrive was “Publishing on the ATmosphere” by @tynanpurdy.com, January 20, 2026",
+      "text": "the first offprint document this index watched arrive was “2026-02-11” by @same.supply, February 11, 2026",
       "detail": "firsts are by verified arrival — self-reported dates reach back further, but can't be checked",
-      "url": "https://tynanistyping.offprint.app/a/3mcsvjjceei23-publishing-on-the-atmosphere"
+      "url": "https://sameoldnotes.offprint.app/a/3melamcro7t23-2026-02-11"
     },
     {
       "text": "the first whitewind document this index watched arrive was “The Goldilocks Zone: Finding My Optimal Constraint Topology” by @penny.hailey.at, February 8, 2026",
       "detail": "firsts are by verified arrival — self-reported dates reach back further, but can't be checked"
+    },
+    {
+      "text": "the first lemma document this index watched arrive was “trangkimnha” by @garudadidada.bsky.social, July 12, 2026",
+      "detail": "firsts are by verified arrival — self-reported dates reach back further, but can't be checked",
+      "url": "https://lemma.pub/did:plc:wx73f5ia23ksmi5ag2go64bz/pub/3mqgitlzyc24q/3mqgj2g4lpsls"
     },
     {
       "text": "the deepest import: “Direct Examination Of Ron Shipp Afternoon Part 1” is dated february 1995, but its record was written 30.9 years later — a blog carrying its history onto the network",
@@ -34,57 +39,57 @@
       "text": "the longest document in the index is “Grok’s answers about more possible ways to sanction Ruzzia if they were really behind the assassination of Charlie Kirk” by @zendayafan.bsky.social — 18,719 words"
     },
     {
-      "text": "the most-used tag is “atproto” — 541 documents carry it"
+      "text": "the most-used tag is “theoryPosts” — 5,318 documents carry it"
     },
     {
-      "text": "420 documents are tagged “ai”"
+      "text": "2,470 documents are tagged “entertainment”"
     },
     {
-      "text": "402 documents are tagged “Allgemein”"
+      "text": "2,342 documents are tagged “news_politics”"
     },
     {
-      "text": "395 documents are tagged “photography”"
+      "text": "1,666 documents are tagged “religion”"
     },
     {
-      "text": "360 documents are tagged “politics”"
+      "text": "1,663 documents are tagged “tech”"
     },
     {
-      "text": "351 documents are tagged “music”"
+      "text": "1,518 documents are tagged “theology”"
     },
     {
-      "text": "10,959 tags have been used exactly once, ever"
+      "text": "18,976 tags have been used exactly once, ever"
     },
     {
-      "text": "the most prolific author is @coryd.dev — 942 documents",
-      "did": "did:plc:sttgf52vkk46f6yuknvqxvgh"
+      "text": "the most prolific author is @jcrt.org — 23,514 documents",
+      "did": "did:plc:e24okfpxr7ctcbmruijop5gp"
     },
     {
-      "text": "1,314 of 3,154 authors have published exactly one document — the long tail is 42% of the network"
+      "text": "1,765 of 4,257 authors have published exactly one document — the long tail is 41% of the network"
     },
     {
-      "text": "13% of all 37,263 documents were written in the last 30 days"
+      "text": "8% of all 104,854 documents were written in the last 30 days"
     },
     {
-      "text": "the busiest day this index has seen was February 10, 2026 — 2,290 documents arrived"
+      "text": "the busiest day this index has seen was August 22, 2026 — 9,641 documents arrived"
     },
     {
-      "text": "the largest publication is “Cory Dransfeldt” — 939 documents",
-      "url": "https://www.coryd.dev"
+      "text": "the largest publication is “The Journal for Cultural and Religious Theory” — 23,514 documents",
+      "url": "https://jcrt.org"
     },
     {
-      "text": "7,020 publications are indexed across the network"
+      "text": "9,542 publications are indexed across the network"
     },
     {
-      "text": "26% of documents ship with cover art"
+      "text": "21% of documents ship with cover art"
     },
     {
-      "text": "the index holds 142 million characters of writing — roughly 283 novels' worth"
+      "text": "the index holds 370 million characters of writing — roughly 740 novels' worth"
     },
     {
-      "text": "856 authors published their first document in the last 30 days"
+      "text": "707 authors published their first document in the last 30 days"
     },
     {
-      "text": "23,522 documents come from outside the known platforms — self-hosted sites publishing straight to the protocol"
+      "text": "85,665 documents come from outside the known platforms — self-hosted sites publishing straight to the protocol"
     }
   ]
 }

@@ -3,7 +3,7 @@
 ## deployment
 - **backend**: push to `main` touching `backend/**` → auto-deploys via GitHub Actions
 - **frontend**: manual deploy via `site/deploy.sh` — regenerates the workbox service worker (precache manifest embeds content hashes) then runs wrangler with `--branch=main`. Don't call wrangler directly or returning visitors get stale precached assets.
-  - ⚠️ `deploy.sh` ships whatever `site/atlas.json` is on disk (gitignored, likely stale) — **always pull the live one first**: `curl -sfo site/atlas.json https://pub-search.waow.tech/atlas.json`. Otherwise you regress prod atlas data until the next 6h `leaflet-atlas` prefect rebuild.
+  - ⚠️ `deploy.sh` ships whatever atlas datasets are on disk (likely stale) — **always pull the live ones first**: `for f in atlas.json.gz atlas-mini.json atlas-avatar-cache.json atlas-theme-cache.json; do curl -sfo site/$f https://pub-search.waow.tech/$f; done`. Otherwise you regress prod atlas data until the next 6h `leaflet-atlas` prefect rebuild. (`/atlas.json` no longer exists on prod — the SPA serves a fake-200 HTML page for it; the dataset is `atlas.json.gz`.)
 - `--app` does NOT protect against deploying from the wrong directory — it only renames the target; the config (ports, env, mounts) still comes from that directory's `fly.toml`. Always `cd` into the app dir first. (2026-06-10: a root-dir deploy was stopped only by a volume-name mismatch.)
 
 ## remotes

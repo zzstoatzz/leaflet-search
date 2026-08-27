@@ -1,0 +1,172 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx", "pydantic-settings"]
+# ///
+"""Delete index ghosts left behind by republishing publishers.
+
+Some standard.site tools mint a fresh rkey for every document on every site
+republish (jcrt.org, blog.localstack.cloud). The old rkeys get deleted from
+the PDS, but the index was observed retaining vectors for them (turbopuffer
+held 14-15 copies per article while the PDS held ~5).
+
+Per DID: list the authoritative live rkeys from the PDS, compare with what
+turso and turbopuffer hold, and report. With --apply, each ghost rkey goes
+through the backend's /admin/reconcile-document delete path — the backend
+re-fetches the record and only deletes on a definitive source 404, cleaning
+turso + vector + overlay together. This script never deletes directly.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+import httpx
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+COLLECTION = "site.standard.document"
+BACKEND = "https://leaflet-search-backend.fly.dev"
+DIDS = [
+    "did:plc:e24okfpxr7ctcbmruijop5gp",  # jcrt.org
+    "did:plc:tuj4ihtuielwdb7dfu7t3btk",  # blog.localstack.cloud
+]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=os.environ.get("ENV_FILE", ".env"), extra="ignore"
+    )
+    turso_url: str
+    turso_token: str
+    turbopuffer_api_key: str
+    turbopuffer_namespace: str = "leaflet-search"
+    backfill_token: str
+
+    @property
+    def turso_host(self) -> str:
+        url = self.turso_url
+        if url.startswith("libsql://"):
+            url = url[len("libsql://") :]
+        return url
+
+
+def turso_uris(settings: Settings, did: str) -> set[str]:
+    response = httpx.post(
+        f"https://{settings.turso_host}/v2/pipeline",
+        headers={"Authorization": f"Bearer {settings.turso_token}"},
+        json={
+            "requests": [
+                {
+                    "type": "execute",
+                    "stmt": {
+                        "sql": "SELECT uri FROM documents WHERE did = ?",
+                        "args": [{"type": "text", "value": did}],
+                    },
+                },
+                {"type": "close"},
+            ],
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    result = response.json()["results"][0]["response"]["result"]
+    return {row[0]["value"] for row in result["rows"]}
+
+
+def tpuf_uris(settings: Settings, did: str) -> set[str]:
+    url = f"https://api.turbopuffer.com/v2/namespaces/{settings.turbopuffer_namespace}/query"
+    headers = {"Authorization": f"Bearer {settings.turbopuffer_api_key}"}
+    uris: set[str] = set()
+    last_id = None
+    while True:
+        filters: list = ["did", "Eq", did]
+        if last_id is not None:
+            filters = ["And", [filters, ["id", "Gt", last_id]]]
+        body = {
+            "rank_by": ["id", "asc"],
+            "limit": 5000,
+            "include_attributes": ["uri"],
+            "filters": filters,
+        }
+        rows = httpx.post(url, headers=headers, json=body, timeout=60).raise_for_status().json().get("rows", [])
+        if not rows:
+            break
+        uris.update(r["uri"] for r in rows)
+        last_id = rows[-1]["id"]
+        if len(rows) < 5000:
+            break
+    return uris
+
+
+def resolve_pds(client: httpx.Client, did: str) -> str:
+    doc = client.get(f"https://plc.directory/{did}", timeout=15).raise_for_status().json()
+    return next(s["serviceEndpoint"] for s in doc["service"] if s["id"] == "#atproto_pds")
+
+
+def pds_live_rkeys(client: httpx.Client, pds: str, did: str) -> set[str]:
+    decoder = json.JSONDecoder(strict=False)  # doc bodies can carry raw control chars
+    rkeys: set[str] = set()
+    cursor = None
+    while True:
+        params = {"repo": did, "collection": COLLECTION, "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        r = client.get(f"{pds}/xrpc/com.atproto.repo.listRecords", params=params, timeout=30)
+        r.raise_for_status()
+        data = decoder.decode(r.text)
+        for rec in data["records"]:
+            rkeys.add(rec["uri"].rsplit("/", 1)[1])
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return rkeys
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true", help="delete ghosts via the backend's verified reconcile path")
+    parser.add_argument("--rate", type=float, default=2.0, help="max reconcile requests per second")
+    args = parser.parse_args()
+    settings = Settings()  # type: ignore[call-arg]
+
+    with httpx.Client() as client:
+        for did in DIDS:
+            pds = resolve_pds(client, did)
+            live = pds_live_rkeys(client, pds, did)
+            in_turso = turso_uris(settings, did)
+            in_tpuf = tpuf_uris(settings, did)
+            indexed_rkeys = {u.rsplit("/", 1)[1] for u in in_turso | in_tpuf if f"/{COLLECTION}/" in u}
+            ghosts = sorted(indexed_rkeys - live)
+            turso_ghosts = sum(1 for u in in_turso if u.rsplit("/", 1)[1] not in live)
+            tpuf_ghosts = sum(1 for u in in_tpuf if u.rsplit("/", 1)[1] not in live)
+            print(f"{did}")
+            print(f"  pds live: {len(live)}  turso: {len(in_turso)} ({turso_ghosts} ghosts)  tpuf: {len(in_tpuf)} ({tpuf_ghosts} ghosts)")
+            print(f"  distinct ghost rkeys to reconcile: {len(ghosts)}")
+            if not args.apply or not ghosts:
+                continue
+            outcomes: dict[str, int] = {}
+            for i, rkey in enumerate(ghosts):
+                resp = client.post(
+                    f"{BACKEND}/admin/reconcile-document",
+                    params={
+                        "token": settings.backfill_token,
+                        "did": did,
+                        "collection": COLLECTION,
+                        "rkey": rkey,
+                        "pds": pds,
+                        "action": "delete",
+                    },
+                    timeout=30,
+                )
+                outcome = resp.json().get("outcome", f"http_{resp.status_code}") if resp.headers.get("content-type", "").startswith("application/json") else f"http_{resp.status_code}"
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                if (i + 1) % 100 == 0:
+                    print(f"  ...{i + 1}/{len(ghosts)} {outcomes}")
+                time.sleep(1.0 / args.rate)
+            print(f"  apply outcomes: {outcomes}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

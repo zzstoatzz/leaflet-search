@@ -115,6 +115,32 @@ def tpuf_export(client: httpx.Client, settings: Settings) -> list[dict]:
     return all_rows
 
 
+def dedup_republished_rows(rows: list[dict]) -> list[dict]:
+    """Collapse republished duplicates: one point per (did, path).
+
+    Some standard.site publishing tools mint a fresh rkey for every document
+    on every site republish (jcrt.org carries ~5 live copies of each article;
+    it peaked at 14-15 in past exports). The duplicate vectors are identical,
+    so their UMAP neighbor lists are just their own clones — the clumps
+    disconnect from the manifold and spray an even "asteroid belt" around
+    the map's periphery. The document's identity is (did, path); keep the
+    newest rkey (TIDs sort lexicographically = chronologically). Rows
+    without a path keep their uri as identity and never collapse.
+    """
+    best: dict[tuple[str, str], dict] = {}
+    kept_no_path = []
+    for row in rows:
+        did, path = row.get("did", ""), row.get("path", "")
+        if not did or not path:
+            kept_no_path.append(row)
+            continue
+        key = (did, path)
+        prev = best.get(key)
+        if prev is None or row.get("uri", "") > prev.get("uri", ""):
+            best[key] = row
+    return kept_no_path + list(best.values())
+
+
 def turso_query_publications(settings: Settings) -> dict[str, dict]:
     """Fetch publication metadata from Turso. Returns basePath → {name, did, coverImage}."""
     if not settings.turso_url or not settings.turso_token:
@@ -522,6 +548,9 @@ def main():
         f"  got {len(rows)} documents after label policy "
         f"({before_policy - len(rows)} excluded across {len(excluded)} DIDs)"
     )
+    before_dedup = len(rows)
+    rows = dedup_republished_rows(rows)
+    log(f"  {len(rows)} after republish dedup ({before_dedup - len(rows)} duplicate (did, path) records dropped)")
 
     if len(rows) < 10:
         print("too few documents to build atlas", file=sys.stderr)

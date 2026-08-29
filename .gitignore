@@ -22,3 +22,4 @@ site/atlas-theme-cache.json
 /backend/kept-dids.txt
 /ingester/banned-dids.txt
 /.labeler-key
+.pi/

@@ -39,8 +39,8 @@
 
 ### HTTP API — for code-mode agents, scripts, pipelines
 
-- base URL: `https://leaflet-search-backend.fly.dev` (no auth, GET only)
-- `curl -s 'https://leaflet-search-backend.fly.dev/search?q=relay&mode=hybrid&format=v2&limit=5' | jq`
+- base URL: `https://api.pub-search.waow.tech` (no auth, GET only)
+- `curl -s 'https://api.pub-search.waow.tech/search?q=relay&mode=hybrid&format=v2&limit=5' | jq`
 - search returns snippets; `/document?uri=<at-uri>[,...]` returns the FULL
   extracted article text (up to 25 uris per request) — use it to read what
   search found instead of re-fetching records from each author's PDS.
@@ -79,9 +79,11 @@
 - MCP if the consumer is a tool-calling agent and you want it productive with
   no code of yours. HTTP if your agent writes code anyway or needs pagination /
   raw response shapes the tools don't expose.
-- hit the `fly.dev` backend directly for API calls. `pub-search.waow.tech` has
-  no API proxy — unknown paths return the SPA's HTML with a 200, so trusting
-  status codes there will "succeed" against a page of HTML. inspect bodies.
+- use `api.pub-search.waow.tech` for API calls. the site domain
+  `pub-search.waow.tech` only proxies the API under `/api/*` (edge-cached,
+  rate-limited 30 req/10s per IP → 429); every other unknown path there returns
+  the SPA's HTML with a 200, so trusting status codes will "succeed" against a
+  page of HTML. inspect bodies.
 - at least one of `q`, `tag`, or `author` is required; an empty query is
   rejected by design.
 - filters vary by mode: `tag`/`since` apply to keyword only; `platform`/`author`

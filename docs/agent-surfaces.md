@@ -99,11 +99,11 @@ already one author per call.
 
 ### HTTP API — for code-mode agents, scripts, and pipelines
 
-base URL: `https://leaflet-search-backend.fly.dev` — full reference in
+base URL: `https://api.pub-search.waow.tech` — full reference in
 [api.md](api.md). no auth, no key, just GET.
 
 ```bash
-curl -s 'https://leaflet-search-backend.fly.dev/search?q=relay&mode=hybrid&format=v2&limit=5' | jq
+curl -s 'https://api.pub-search.waow.tech/search?q=relay&mode=hybrid&format=v2&limit=5' | jq
 ```
 
 the API surface is small (search, similar, tags, popular, stats, dashboard),
@@ -159,9 +159,10 @@ project is yet.
 
 ## sharp edges (learned the hard way)
 
-- **hit the fly.dev backend directly for API calls.** the custom domain
-  `pub-search.waow.tech` has no API proxy — unknown paths return the SPA's
-  HTML with a 200. if you probe through the public domain and trust status
+- **use `api.pub-search.waow.tech` for API calls.** the site domain
+  `pub-search.waow.tech` proxies the API only under `/api/*` (edge-cached,
+  rate-limited 30 req/10s per IP → 429); every other unknown path there returns
+  the SPA's HTML with a 200. if you probe the site domain and trust status
   codes, you will "succeed" against a page of HTML.
 - **at least one of `q`, `tag`, or `author` is required.** an empty query is
   rejected by design; the MCP `search` tool returns `[]` rather than erroring.

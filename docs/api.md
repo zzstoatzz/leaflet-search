@@ -1,6 +1,6 @@
 # API reference
 
-base URL: `https://leaflet-search-backend.fly.dev`
+base URL: `https://api.pub-search.waow.tech`
 
 ## endpoints
 

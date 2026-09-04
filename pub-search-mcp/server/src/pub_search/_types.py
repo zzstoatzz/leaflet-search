@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class SearchResult(BaseModel):
@@ -12,8 +12,14 @@ class SearchResult(BaseModel):
     uri: str
     did: str
     title: str
-    # snippet is populated by /search and /similar (v2); /recommended doesn't return one.
+    # /search and /similar return a match window; /recommended and a browse
+    # (no query) return nothing here, and the server back-fills the opening
+    # of the stored text so every tool's results can be triaged in place.
     snippet: str = ""
+    # length of the indexed text in characters when known, 0 when not. a
+    # linkblog stub indexes as a pull-quote of a few hundred characters; this
+    # lets a caller skip those when hunting for primary writing.
+    contentLength: int = 0
     createdAt: str = ""
     rkey: str
     basePath: str = ""
@@ -25,6 +31,11 @@ class SearchResult(BaseModel):
     # populated by /recommended (windowed count and all-time count); 0 elsewhere.
     recommendCount: int = 0
     totalCount: int = 0
+
+    @field_validator("snippet", mode="before")
+    @classmethod
+    def _none_snippet_is_empty(cls, value: object) -> object:
+        return "" if value is None else value
 
 
 class ClusterContext(BaseModel):

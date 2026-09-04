@@ -39,7 +39,7 @@ search long-form writing on ATProto: leaflet, pckt, offprint, greengale, whitewi
 
 ## tools
 
-- `search(query, tag, platform, since, author)` - hybrid by default; narrow with filters rather than paging
+- `search(query, tag, platform, since, author)` - hybrid by default; narrow with filters rather than paging. every result carries `source` (keyword | semantic | keyword+semantic), a `snippet`, and `contentLength`
 - `get_document(uri)` - the LIVE record from the author's PDS, flattened to text
 - `author_profile(author)` - what one author writes, where, and over what period
 - `find_similar(uri)` - documents near this one
@@ -71,7 +71,17 @@ can't get from any single platform's UI.
 
 `hybrid` is the default and is usually right. `keyword` for exact or heavily
 filtered lookups (tag/since apply there); `semantic` for purely conceptual
-questions. Results carry a `source` field showing how each was found.
+questions. Results carry a `source` field showing how each was found:
+`keyword` (an FTS match), `semantic` (an embedding neighbour), or
+`keyword+semantic` (both — the strongest signal in hybrid).
+
+## snippets
+
+every tool's results carry a `snippet`: the window around the match for a
+search, otherwise the document's opening. `contentLength` is the indexed
+text's length when known; a few hundred characters is a linkblog stub
+(a pull-quote indexed as the whole document), not primary writing. triage
+from the snippet; call `get_document` only for the ones you will read.
 
 There is no `offset`: semantic ranking is approximate-nearest-neighbour and
 does not repeat exactly, so page 2 is not a stable continuation of page 1.
@@ -131,6 +141,44 @@ def _extract_results(data: Any) -> list[dict[str, Any]]:
 
 Mode = Literal["keyword", "semantic", "hybrid"]
 
+SNIPPET_CHARS = 200
+DOCUMENT_BATCH = 25
+
+
+def _lead(text: str, chars: int = SNIPPET_CHARS) -> str:
+    """the opening of a document as a one-line snippet."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= chars else flat[:chars].rstrip() + "…"
+
+
+async def _fill_snippets(results: list[SearchResult]) -> list[SearchResult]:
+    """back-fill empty snippets from the index's stored text.
+
+    /search and /similar return a window around the match; /recommended and a
+    browse without a query return no snippet at all, which forced a
+    get_document round trip per result just to triage. One batched /document
+    call fills the opening of each such document instead, and records the
+    stored text's length so stubs can be told from primary writing.
+    """
+    wanted = [r for r in results if not r.snippet]
+    if not wanted:
+        return results
+    by_uri: dict[str, str] = {}
+    async with get_http_client() as client:
+        for start in range(0, len(wanted), DOCUMENT_BATCH):
+            uris = ",".join(r.uri for r in wanted[start : start + DOCUMENT_BATCH])
+            response = await client.get("/document", params={"uri": uris})
+            if response.status_code != 200:
+                continue
+            for doc in (response.json() or {}).get("documents") or []:
+                by_uri[doc.get("uri", "")] = doc.get("content") or ""
+    for r in wanted:
+        content = by_uri.get(r.uri)
+        if content:
+            r.snippet = _lead(content)
+            r.contentLength = len(content)
+    return results
+
 
 @mcp.tool
 async def search(
@@ -167,7 +215,13 @@ async def search(
             identity per request, never the whole corpus.
 
     returns:
-        list of results with uri, title, snippet, platform, and web url
+        list of results with uri, title, snippet, platform, and web url.
+        `source` says how each was found: "keyword" (FTS match), "semantic"
+        (embedding neighbour), or "keyword+semantic" (both, the strongest
+        signal in hybrid). `snippet` is the window around the match, or the
+        document's opening for a browse; `contentLength` is the indexed text's
+        length when known — a few hundred characters is a linkblog stub, not
+        primary writing.
     """
     if not query and not tag and not author:
         return []
@@ -211,7 +265,7 @@ async def search(
         return []
 
     results = _extract_results(data)
-    return [SearchResult(**r) for r in results[:limit]]
+    return await _fill_snippets([SearchResult(**r) for r in results[:limit]])
 
 
 async def _resolve_pds(did: str) -> str:
@@ -365,12 +419,16 @@ async def find_similar(uri: str, limit: int = 5) -> list[SearchResult]:
     publications that set preferences.showInDiscover=false are excluded, same
     as search — otherwise they would be one hop away from any neighbour.
 
+    a `pub.leaflet.document` uri is accepted; results name the same documents
+    by their canonical `site.standard.document` uri, so do not expect the
+    input uri to appear verbatim.
+
     args:
         uri: the AT-URI of the document to find similar content for
         limit: max similar documents to return (default 5)
 
     returns:
-        list of similar documents with uri, title, and metadata
+        list of similar documents with uri, title, snippet, and metadata
     """
     async with get_http_client() as client:
         response = await client.get("/similar", params={"uri": uri, "format": "v2"})
@@ -378,7 +436,7 @@ async def find_similar(uri: str, limit: int = 5) -> list[SearchResult]:
         data = response.json()
 
     results = _extract_results(data)
-    return [SearchResult(**r) for r in results[:limit]]
+    return await _fill_snippets([SearchResult(**r) for r in results[:limit]])
 
 
 Window = Literal["day", "week", "month", "year", "all"]
@@ -406,7 +464,8 @@ async def discover_focal_post(
         limit: max items (default 3 — keep small; this is for focal items, not browse)
 
     returns:
-        list of SearchResult with recommendCount (windowed) and totalCount (all-time) populated
+        list of SearchResult with recommendCount (windowed) and totalCount
+        (all-time) populated, and `snippet` holding each document's opening
     """
     async with get_http_client() as client:
         response = await client.get(
@@ -417,7 +476,7 @@ async def discover_focal_post(
         data = response.json()
 
     results = _extract_results(data)
-    return [SearchResult(**r) for r in results[:limit]]
+    return await _fill_snippets([SearchResult(**r) for r in results[:limit]])
 
 
 # common short / structural words to strip from cluster title overlap.
@@ -469,7 +528,8 @@ async def recommended_by_top_authors(
         limit: max results (default 10)
 
     returns:
-        list of SearchResult sorted by endorsement count (desc), then recency
+        list of SearchResult sorted by endorsement count (desc), then recency,
+        each with `snippet` holding the document's opening
     """
     async with get_http_client() as client:
         response = await client.get(
@@ -480,7 +540,7 @@ async def recommended_by_top_authors(
         data = response.json()
 
     results = _extract_results(data)
-    return [SearchResult(**r) for r in results[:limit]]
+    return await _fill_snippets([SearchResult(**r) for r in results[:limit]])
 
 
 @mcp.tool
@@ -509,7 +569,7 @@ async def describe_cluster(uri: str, k: int = 5) -> ClusterContext:
         response.raise_for_status()
         data = response.json()
 
-    neighbors = [SearchResult(**r) for r in _extract_results(data)[:k]]
+    neighbors = await _fill_snippets([SearchResult(**r) for r in _extract_results(data)[:k]])
     platforms = sorted({n.platform for n in neighbors})
     authors = {n.did for n in neighbors}
     term_counts: Counter[str] = Counter()
@@ -564,6 +624,7 @@ async def author_profile(
 
     rows = [SearchResult(**r) for r in _extract_results(data)]
     docs = [r for r in rows if r.type != "publication"]
+    await _fill_snippets(docs[:5])
 
     dates = sorted(d.createdAt for d in docs if d.createdAt)
     terms = Counter(w for d in docs for w in _title_terms(d.title))

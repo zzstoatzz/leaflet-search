@@ -345,3 +345,113 @@ class TestOptInIsScoped:
 
         with pytest.raises(ValueError, match="requires an author"):
             await server.search(query="anything", include_undiscoverable=True)
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """records every request and answers /document from a uri → content map."""
+
+    def __init__(self, contents: dict[str, str], status_code: int = 200):
+        self.contents = contents
+        self.status_code = status_code
+        self.requests: list[tuple[str, dict]] = []
+
+    async def get(self, path, params=None):
+        self.requests.append((path, dict(params or {})))
+        if path == "/document":
+            uris = params["uri"].split(",")
+            docs = [{"uri": u, "content": self.contents[u]} for u in uris if u in self.contents]
+            return _FakeResponse(self.status_code, {"documents": docs, "missing": [u for u in uris if u not in self.contents]})
+        return _FakeResponse(200, {"results": []})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _result(uri: str, snippet: str = "") -> SearchResult:
+    return SearchResult(type="article", uri=uri, did="did:plc:x", title="t", rkey="r", snippet=snippet)
+
+
+class TestSnippetBackfill:
+    """/recommended and a browse return no snippet, which forced a get_document
+    round trip per result just to triage. One batched /document call fills
+    the opening instead."""
+
+    def test_snippet_none_from_the_api_reads_as_empty(self):
+        r = SearchResult(type="article", uri="at://x", did="did:plc:x", title="t", rkey="r", snippet=None)
+        assert r.snippet == ""
+
+    def test_lead_flattens_and_truncates(self):
+        from pub_search.server import _lead
+
+        assert _lead("  two\n\nlines   here ") == "two lines here"
+        long = "word " * 100
+        out = _lead(long, chars=20)
+        assert out.endswith("…") and len(out) <= 22
+
+    async def test_fills_only_empty_snippets_in_one_batch(self, monkeypatch):
+        from pub_search import server
+
+        fake = _FakeClient({"at://a": "alpha opening text", "at://b": "beta"})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        results = [_result("at://a"), _result("at://kept", "already here"), _result("at://b")]
+        out = await server._fill_snippets(results)
+        assert [r.snippet for r in out] == ["alpha opening text", "already here", "beta"]
+        assert out[0].contentLength == len("alpha opening text")
+        assert out[1].contentLength == 0
+        assert len(fake.requests) == 1
+        assert fake.requests[0][1]["uri"] == "at://a,at://b"
+
+    async def test_no_request_when_every_snippet_is_present(self, monkeypatch):
+        from pub_search import server
+
+        fake = _FakeClient({})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        await server._fill_snippets([_result("at://a", "s")])
+        assert fake.requests == []
+
+    async def test_batches_of_twenty_five(self, monkeypatch):
+        from pub_search import server
+
+        uris = [f"at://{i}" for i in range(30)]
+        fake = _FakeClient({u: f"text {u}" for u in uris})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server._fill_snippets([_result(u) for u in uris])
+        assert len(fake.requests) == 2
+        assert all(r.snippet for r in out)
+
+    async def test_missing_and_failed_documents_leave_snippet_empty(self, monkeypatch):
+        from pub_search import server
+
+        fake = _FakeClient({}, status_code=503)
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server._fill_snippets([_result("at://gone")])
+        assert out[0].snippet == "" and out[0].contentLength == 0
+
+    async def test_discover_focal_post_returns_snippets(self, monkeypatch):
+        from pub_search import server
+
+        class _Client(_FakeClient):
+            async def get(self, path, params=None):
+                if path == "/recommended":
+                    return _FakeResponse(200, [{"type": "article", "uri": "at://a", "did": "did:plc:x", "title": "t", "rkey": "r", "recommendCount": 3, "totalCount": 9}])
+                return await super().get(path, params)
+
+        fake = _Client({"at://a": "the opening"})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server.discover_focal_post(limit=1)
+        assert out[0].snippet == "the opening" and out[0].recommendCount == 3

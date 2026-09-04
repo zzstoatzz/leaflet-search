@@ -53,6 +53,14 @@ with three things the raw API doesn't have:
    multi-call assembly an agent would otherwise fumble through — the
    network-position framing is done server-side.
 
+   every tool returns the same result shape, and every result carries a
+   `snippet`: the match window for a search, otherwise the document's
+   opening back-filled from the index in one batched `/document` call, so
+   recommendations and browses can be triaged without a `get_document` per
+   result. `contentLength` (the indexed text's length, 0 when unknown) tells
+   a linkblog stub from primary writing. search results also carry `source`:
+   `keyword`, `semantic`, or `keyword+semantic`.
+
    the surface is deliberately small. tags, popular queries and index stats
    are **resources** (`pub-search://tags`, `pub-search://popular`,
    `pub-search://stats`), not tools: they are lookups an agent reads, not

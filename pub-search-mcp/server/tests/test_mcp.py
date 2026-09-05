@@ -455,3 +455,81 @@ class TestSnippetBackfill:
         monkeypatch.setattr(server, "get_http_client", lambda: fake)
         out = await server.discover_focal_post(limit=1)
         assert out[0].snippet == "the opening" and out[0].recommendCount == 3
+
+
+class TestSearchFiltersBind:
+    """the index applies `tag` to hybrid's keyword side only; a caller who
+    passed a filter must never get back a result that does not carry it."""
+
+    def _client(self, results, contents):
+        class _Client(_FakeClient):
+            async def get(self, path, params=None):
+                self.requests.append((path, dict(params or {})))
+                if path == "/search":
+                    return _FakeResponse(200, {"results": results})
+                if path == "/document":
+                    uris = params["uri"].split(",")
+                    docs = [{"uri": u, **contents[u]} for u in uris if u in contents]
+                    return _FakeResponse(200, {"documents": docs, "missing": []})
+                return _FakeResponse(200, {"results": []})
+        return _Client({})
+
+    @staticmethod
+    def _row(uri, source, snippet="a match window"):
+        return {"type": "article", "uri": uri, "did": "did:plc:x", "title": "t", "rkey": "r", "snippet": snippet, "source": source}
+
+    async def test_hybrid_tag_drops_untagged_semantic_neighbours(self, monkeypatch):
+        from pub_search import server
+
+        fake = self._client(
+            [self._row("at://k", "keyword"), self._row("at://s", "semantic"), self._row("at://both", "keyword+semantic")],
+            {
+                "at://k": {"content": "x" * 900, "tags": ["moderation"]},
+                "at://s": {"content": "y" * 300, "tags": ["cooking"]},
+                "at://both": {"content": "z" * 5000, "tags": ["Moderation", "labeler"]},
+            },
+        )
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server.search(query="takedowns", tag="moderation")
+        assert [r.uri for r in out] == ["at://k", "at://both"]
+        assert [r.contentLength for r in out] == [900, 5000]
+        assert sum(1 for p, _ in fake.requests if p == "/document") == 1
+
+    async def test_search_results_carry_length_and_keyword_source(self, monkeypatch):
+        from pub_search import server
+
+        fake = self._client([self._row("at://k", "")], {"at://k": {"content": "body text", "tags": []}})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server.search(query="body", mode="keyword")
+        assert out[0].contentLength == len("body text")
+        assert out[0].source == "keyword"
+        assert out[0].snippet == "a match window"
+
+    async def test_unknown_document_is_kept_not_dropped(self, monkeypatch):
+        """a uri the index cannot return (adoption window, policy) stays in
+        the results: dropping it would hide a real hit behind a batch hiccup."""
+        from pub_search import server
+
+        fake = self._client([self._row("at://k", "keyword")], {})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server.search(query="q", tag="moderation")
+        assert [r.uri for r in out] == ["at://k"] and out[0].contentLength == 0
+
+    async def test_semantic_neighbour_the_index_cannot_resolve_is_dropped(self, monkeypatch):
+        from pub_search import server
+
+        fake = self._client([self._row("at://unknown", "semantic")], {})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        assert await server.search(query="q", tag="moderation") == []
+
+    async def test_leaflet_uris_are_looked_up_by_their_canonical_form(self, monkeypatch):
+        from pub_search import server
+
+        leaflet = "at://did:plc:x/pub.leaflet.document/abc"
+        canonical = "at://did:plc:x/site.standard.document/abc"
+        fake = self._client([self._row(leaflet, "semantic")], {canonical: {"content": "t" * 50, "tags": ["moderation"]}})
+        monkeypatch.setattr(server, "get_http_client", lambda: fake)
+        out = await server.search(query="q", tag="moderation")
+        assert [r.uri for r in out] == [leaflet] and out[0].contentLength == 50
+        sent = [p["uri"] for path, p in fake.requests if path == "/document"]
+        assert sent == [canonical]

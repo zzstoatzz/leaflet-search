@@ -57,9 +57,11 @@ with three things the raw API doesn't have:
    `snippet`: the match window for a search, otherwise the document's
    opening back-filled from the index in one batched `/document` call, so
    recommendations and browses can be triaged without a `get_document` per
-   result. `contentLength` (the indexed text's length, 0 when unknown) tells
-   a linkblog stub from primary writing. search results also carry `source`:
-   `keyword`, `semantic`, or `keyword+semantic`.
+   result. `contentLength` (the indexed text's length) tells a linkblog
+   stub from primary writing. search results also carry `source`: `keyword`,
+   `semantic`, or `keyword+semantic`. every search filter binds in every
+   mode: the index ignores `tag` on hybrid's semantic side, so the server
+   drops semantic neighbours that do not carry it.
 
    the surface is deliberately small. tags, popular queries and index stats
    are **resources** (`pub-search://tags`, `pub-search://popular`,

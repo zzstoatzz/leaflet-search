@@ -69,9 +69,9 @@ can't get from any single platform's UI.
 
 ## search modes
 
-`hybrid` is the default and is usually right. `keyword` for exact or heavily
-filtered lookups (tag/since apply there); `semantic` for purely conceptual
-questions. Results carry a `source` field showing how each was found:
+`hybrid` is the default and is usually right. `keyword` for exact lookups;
+`semantic` for purely conceptual questions. every filter binds in every
+mode. Results carry a `source` field showing how each was found:
 `keyword` (an FTS match), `semantic` (an embedding neighbour), or
 `keyword+semantic` (both — the strongest signal in hybrid).
 
@@ -79,8 +79,8 @@ questions. Results carry a `source` field showing how each was found:
 
 every tool's results carry a `snippet`: the window around the match for a
 search, otherwise the document's opening. `contentLength` is the indexed
-text's length when known; a few hundred characters is a linkblog stub
-(a pull-quote indexed as the whole document), not primary writing. triage
+text's length; a few hundred characters is a linkblog stub (a pull-quote
+indexed as the whole document), not primary writing. triage
 from the snippet; call `get_document` only for the ones you will read.
 
 There is no `offset`: semantic ranking is approximate-nearest-neighbour and
@@ -151,6 +151,49 @@ def _lead(text: str, chars: int = SNIPPET_CHARS) -> str:
     return flat if len(flat) <= chars else flat[:chars].rstrip() + "…"
 
 
+def _canonical(uri: str) -> str:
+    """the index knows a leaflet document by its site.standard uri; a semantic
+    hit can still carry the older pub.leaflet form, which /document reports
+    as missing."""
+    return uri.replace("/pub.leaflet.document/", "/site.standard.document/", 1)
+
+
+async def _documents(uris: list[str]) -> dict[str, dict[str, Any]]:
+    """the index's stored documents, keyed by the uri as the caller had it,
+    batched 25 per request.
+
+    A failed or partial batch just yields fewer entries; callers treat an
+    absent uri as unknown rather than failing the tool.
+    """
+    by_uri: dict[str, dict[str, Any]] = {}
+    if not uris:
+        return by_uri
+    originals: dict[str, list[str]] = {}
+    for uri in uris:
+        originals.setdefault(_canonical(uri), []).append(uri)
+    wanted = list(originals)
+    async with get_http_client() as client:
+        for start in range(0, len(wanted), DOCUMENT_BATCH):
+            batch = ",".join(wanted[start : start + DOCUMENT_BATCH])
+            response = await client.get("/document", params={"uri": batch})
+            if response.status_code != 200:
+                continue
+            for doc in (response.json() or {}).get("documents") or []:
+                for original in originals.get(doc.get("uri", ""), []):
+                    by_uri[original] = doc
+    return by_uri
+
+
+def _enrich(result: SearchResult, doc: dict[str, Any] | None) -> None:
+    """record the stored text's length, and its opening when there is no snippet."""
+    content = (doc or {}).get("content") or ""
+    if not content:
+        return
+    result.contentLength = len(content)
+    if not result.snippet:
+        result.snippet = _lead(content)
+
+
 async def _fill_snippets(results: list[SearchResult]) -> list[SearchResult]:
     """back-fill empty snippets from the index's stored text.
 
@@ -163,20 +206,9 @@ async def _fill_snippets(results: list[SearchResult]) -> list[SearchResult]:
     wanted = [r for r in results if not r.snippet]
     if not wanted:
         return results
-    by_uri: dict[str, str] = {}
-    async with get_http_client() as client:
-        for start in range(0, len(wanted), DOCUMENT_BATCH):
-            uris = ",".join(r.uri for r in wanted[start : start + DOCUMENT_BATCH])
-            response = await client.get("/document", params={"uri": uris})
-            if response.status_code != 200:
-                continue
-            for doc in (response.json() or {}).get("documents") or []:
-                by_uri[doc.get("uri", "")] = doc.get("content") or ""
+    docs = await _documents([r.uri for r in wanted])
     for r in wanted:
-        content = by_uri.get(r.uri)
-        if content:
-            r.snippet = _lead(content)
-            r.contentLength = len(content)
+        _enrich(r, docs.get(r.uri))
     return results
 
 
@@ -199,11 +231,16 @@ async def search(
     semantic ranking is an approximate-nearest-neighbour search that does not
     repeat exactly, so page 2 is not a stable continuation of page 1.
 
+    every filter binds in every mode. `since`, `platform` and `author` are
+    applied by the index in all three modes; `tag` is applied by the index on
+    the keyword side and enforced here on hybrid's semantic side, so a result
+    you get back always carries the tag you asked for.
+
     args:
         query: what you are looking for. natural language works well.
-        tag: filter by tag (exact-match modes only)
+        tag: only documents carrying this tag
         platform: leaflet, pckt, offprint, greengale, whitewind, other
-        since: ISO date — documents created after it (exact-match modes only)
+        since: ISO date — only documents created on or after it
         author: handle ("nate.bsky.social") or DID ("did:plc:xyz")
         mode: hybrid (default), keyword for exact/filtered lookups, semantic
             for purely conceptual ones
@@ -220,8 +257,9 @@ async def search(
         (embedding neighbour), or "keyword+semantic" (both, the strongest
         signal in hybrid). `snippet` is the window around the match, or the
         document's opening for a browse; `contentLength` is the indexed text's
-        length when known — a few hundred characters is a linkblog stub, not
-        primary writing.
+        length — a few hundred characters is a linkblog stub, not primary
+        writing. fewer than `limit` results can come back when the tag filter
+        drops semantic neighbours that do not carry it.
     """
     if not query and not tag and not author:
         return []
@@ -264,8 +302,22 @@ async def search(
     if isinstance(data, dict) and "error" in data:
         return []
 
-    results = _extract_results(data)
-    return await _fill_snippets([SearchResult(**r) for r in results[:limit]])
+    results = [SearchResult(**r) for r in _extract_results(data)[:limit]]
+    docs = await _documents([r.uri for r in results])
+    kept: list[SearchResult] = []
+    for r in results:
+        doc = docs.get(r.uri)
+        if not r.source and effective_mode == "keyword":
+            r.source = "keyword"
+        _enrich(r, doc)
+        # the index applies `tag` to the keyword side only; a neighbour the
+        # semantic side alone produced is dropped unless the index shows it
+        # carrying the tag, so a filter never hands back what it did not bind
+        if tag and r.source == "semantic":
+            if tag.lower() not in {t.lower() for t in (doc or {}).get("tags") or []}:
+                continue
+        kept.append(r)
+    return kept
 
 
 async def _resolve_pds(did: str) -> str:

@@ -29,7 +29,8 @@
 ## search ranking
 - hybrid BM25 + recency: `ORDER BY rank + (days_old / 30)`
 - unfiltered keyword queries take a bounded candidate pass: bm25 top-`CANDIDATE_PREFILTER_K` (2000) inside the FTS index first, covering-index probes only for that set (common words were corpus-proportional — "what" = 24.6k matches = 7-14s before). Author/since/platform-filtered queries keep the exhaustive shape
-- OR between terms for recall, prefix on last word
+- OR between terms for recall, prefix on the last word when it has 3+ letters
+- **one MATCH per keyword statement.** snippets come from the document text in Zig (`snippetFromContent`), never from FTS5's `snippet()` in an outer query: `MATCH ? AND rowid IN (...)` is a second full scan (docs/retro-2026-09-05-keyword-second-match-scan.md)
 - unicode61 tokenizer (non-alphanumeric = separator)
 - tag queries: served from the local replica. Browse (empty query + tag) ranks by `months_old - RECOMMEND_LIFT·ln(1+recommenders)`; text within a tag ranks by the standard BM25 + recency
 

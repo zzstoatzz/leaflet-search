@@ -908,47 +908,39 @@ fn withLocalDocRecencyOrder(comptime sql: []const u8) []const u8 {
 }
 
 // Two-phase keyword search over document content. The inner pass ranks every
-// FTS match (rank + recency + policy flags) and keeps the top candidate_limit
-// rowids; the outer pass re-runs the MATCH but computes snippet() and reads
-// full document rows only for rows in that set. One-phase sorted the full
-// SELECT (snippet included) for every match, which tokenizes each matching
-// document's whole body — 14s for 'atproto' on the prod replica (2026-08-11).
-//
-// All joins are on rowid: documents_fts is external-content over documents
-// (schema v5) so fts rowids ARE documents rowids, and reading f.uri from an
-// external-content table is itself a content-table probe per match. The v5
-// documents table stores `content` LAST, so the inner pass's rowid probes for
-// created_at/policy flags never read past a document body — that column-order
-// guarantee replaced the covering index (pre-v5 snapshots wrote fts rows keyed
-// to documents.rowid too, so these joins stay correct during the upgrade
-// window; they're just slower until the first v5 snapshot adopts).
+// FTS match (rank + recency + policy flags) inside the FTS index and keeps
+// the top candidate_limit rowids; the outer pass reads full document rows for
+// that set only, by rowid seek. There is exactly ONE MATCH: the snippet is
+// built in Zig from the document's text (snippetFromContent) for the rows
+// that are emitted. The previous shape re-ran the MATCH in the outer query
+// so FTS5's snippet() had a cursor — `documents_fts MATCH ? AND rowid IN
+// (...)` — and FTS5 cannot take an IN-list as a rowid constraint, so that
+// was a second full scan of the query's posting union: 17s for "the*", 42
+// minutes for "a*" (docs/retro-2026-09-05-keyword-second-match-scan.md).
 fn localDocsFtsSql(comptime inner_extra_cond: []const u8) []const u8 {
     return
     \\SELECT d.uri, d.did, d.title,
-    \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
+    \\  substr(d.content, 1, 8000) as snippet,
     \\  d.created_at, d.rkey, d.base_path, d.has_publication,
     \\  d.platform, COALESCE(d.path, '') as path,
     \\  COALESCE(d.cover_image, '') as cover_image,
     \\  COALESCE(p.name, '') as publication_name,
-    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
-    \\FROM documents_fts f
-    \\JOIN documents d ON d.rowid = f.rowid
-    \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\WHERE documents_fts MATCH ? AND f.rowid IN (
-    \\  SELECT rid FROM (
-    \\    SELECT f2.rowid AS rid,
-    \\      f2.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
-    \\    FROM documents_fts f2
-    \\    JOIN documents d2 ON d2.rowid = f2.rowid
-    \\    WHERE f2.documents_fts MATCH ?
+    \\  cand.score AS merge_score
+    \\FROM (
+    \\  SELECT f2.rowid AS rid,
+    \\    f2.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
+    \\  FROM documents_fts f2
+    \\  JOIN documents d2 ON d2.rowid = f2.rowid
+    \\  WHERE f2.documents_fts MATCH ?
     ++ inner_extra_cond ++ "\n" ++
-        \\    AND (? = '' OR d2.did = ?)
-        \\    AND (? = '' OR d2.created_at >= ?)
-        \\    AND (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
-        \\    ORDER BY score, f2.rowid LIMIT ?
-        \\  )
-        \\)
-        \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
+        \\  AND (? = '' OR d2.did = ?)
+        \\  AND (? = '' OR d2.created_at >= ?)
+        \\  AND (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
+        \\  ORDER BY score, f2.rowid LIMIT ?
+        \\) cand
+        \\JOIN documents d ON d.rowid = cand.rid
+        \\LEFT JOIN publications p ON d.publication_uri = p.uri
+        \\ORDER BY cand.score, d.uri LIMIT ?
     ;
 }
 
@@ -968,54 +960,35 @@ const LOCAL_DOCS_FTS_PLATFORM_SQL = localDocsFtsSql("\n    AND d2.platform = ?")
 /// (filters must see the full match set; filtered queries keep the old shape).
 const CANDIDATE_PREFILTER_K: usize = 2000;
 
-const LOCAL_DOCS_FTS_PREFILTER_SQL =
+fn localDocsPrefilterSql(comptime snippet_col: []const u8) []const u8 {
+    return
     \\SELECT d.uri, d.did, d.title,
-    \\  snippet(documents_fts, 2, '', '', '...', 32) as snippet,
-    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
-    \\  d.platform, COALESCE(d.path, '') as path,
-    \\  COALESCE(d.cover_image, '') as cover_image,
-    \\  COALESCE(p.name, '') as publication_name,
-    \\  rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0) AS merge_score
-    \\FROM documents_fts f
-    \\JOIN documents d ON d.rowid = f.rowid
-    \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\WHERE documents_fts MATCH ? AND f.rowid IN (
-    \\  SELECT rid FROM (
-    \\    SELECT c.rid AS rid,
-    \\      c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
-    \\    FROM (SELECT rowid AS rid, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
-    \\    JOIN documents d2 ON d2.rowid = c.rid
-    \\    WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
-    \\    ORDER BY score, c.rid LIMIT ?
-    \\  )
-    \\)
-    \\ORDER BY rank + COALESCE((julianday('now') - julianday(NULLIF(d.created_at, ''))) / 30.0, 120.0), d.uri LIMIT ?
-;
+    ++ "  " ++ snippet_col ++ " as snippet,\n" ++
+        \\  d.created_at, d.rkey, d.base_path, d.has_publication,
+        \\  d.platform, COALESCE(d.path, '') as path,
+        \\  COALESCE(d.cover_image, '') as cover_image,
+        \\  COALESCE(p.name, '') as publication_name,
+        \\  cand.score AS merge_score
+        \\FROM (
+        \\  SELECT c.rid AS rid,
+        \\    c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
+        \\  FROM (SELECT rowid AS rid, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
+        \\  JOIN documents d2 ON d2.rowid = c.rid
+        \\  WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
+        \\  ORDER BY score, c.rid LIMIT ?
+        \\) cand
+        \\JOIN documents d ON d.rowid = cand.rid
+        \\LEFT JOIN publications p ON d.publication_uri = p.uri
+        \\ORDER BY cand.score, d.uri LIMIT ?
+    ;
+}
 
-// Snippet-free prefilter: the outer MATCH in LOCAL_DOCS_FTS_PREFILTER_SQL
-// exists only to give snippet() an FTS cursor, and FTS5 executes it as a
-// second full scan of the posting union. When the caller doesn't need
-// snippets (hybrid fusion), resolve the candidate set by rowid alone.
 // Args: (fts_query, prefilter_k, candidate_limit, candidate_limit).
-const LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL =
-    \\SELECT d.uri, d.did, d.title, '' as snippet,
-    \\  d.created_at, d.rkey, d.base_path, d.has_publication,
-    \\  d.platform, COALESCE(d.path, '') as path,
-    \\  COALESCE(d.cover_image, '') as cover_image,
-    \\  COALESCE(p.name, '') as publication_name,
-    \\  cand.score AS merge_score
-    \\FROM (
-    \\  SELECT c.rid AS rid,
-    \\    c.rank + COALESCE((julianday('now') - julianday(NULLIF(d2.created_at, ''))) / 30.0, 120.0) AS score
-    \\  FROM (SELECT rowid AS rid, rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?) c
-    \\  JOIN documents d2 ON d2.rowid = c.rid
-    \\  WHERE (d2.is_bridgyfed IS NULL OR d2.is_bridgyfed = 0) AND (d2.url_dead IS NULL OR d2.url_dead = 0)
-    \\  ORDER BY score, c.rid LIMIT ?
-    \\) cand
-    \\JOIN documents d ON d.rowid = cand.rid
-    \\LEFT JOIN publications p ON d.publication_uri = p.uri
-    \\ORDER BY cand.score, d.uri LIMIT ?
-;
+const LOCAL_DOCS_FTS_PREFILTER_SQL = localDocsPrefilterSql("substr(d.content, 1, 8000)");
+
+// Snippet-free variant for hybrid fusion, which fills snippets after fusion
+// for the page-bound rows only.
+const LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL = localDocsPrefilterSql("''");
 
 // Tag browse (no FTS text): fully local — document_tags and recommends both
 // live in the replica. Ranked by recency with a recommendation lift: score is
@@ -1265,14 +1238,14 @@ fn searchLocalTag(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag: 
         OverlaySlice.init(alloc)
     else if (query.len == 0)
         fetchOverlaySlice(alloc, OVERLAY_TAG_BROWSE_SQL, .{
-            tag,       platform_val, platform_val, author_val,
-            author_val, since_val,   since_val,    OVERLAY_HIT_CAP,
+            tag,        platform_val, platform_val, author_val,
+            author_val, since_val,    since_val,    OVERLAY_HIT_CAP,
         })
     else blk: {
         const fts_query = try buildFtsQuery(alloc, query);
         break :blk fetchOverlaySlice(alloc, OVERLAY_TAG_FTS_SQL, .{
-            fts_query, tag,        platform_val, platform_val,
-            author_val, author_val, since_val,   since_val,
+            fts_query,       tag,        platform_val, platform_val,
+            author_val,      author_val, since_val,    since_val,
             OVERLAY_HIT_CAP,
         });
     };
@@ -1349,22 +1322,23 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
     const platform_val: []const u8 = platform_filter orelse "";
     var ov = if (overlayEnabled(options))
         fetchOverlaySlice(alloc, OVERLAY_DOCS_FTS_SQL, .{
-            fts_query, platform_val, platform_val, author_val,
-            author_val, since_val,   since_val,    OVERLAY_HIT_CAP,
+            fts_query,  platform_val, platform_val, author_val,
+            author_val, since_val,    since_val,    OVERLAY_HIT_CAP,
         })
     else
         OverlaySlice.init(alloc);
 
     // document content search
     if (platform_filter) |platform| {
-        var rows = try local.query(LOCAL_DOCS_FTS_PLATFORM_SQL, .{ fts_query, fts_query, platform, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
+        var rows = try local.query(LOCAL_DOCS_FTS_PLATFORM_SQL, .{ fts_query, platform, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
         defer rows.deinit();
 
         while (rows.next()) |row| {
             if (result_count >= options.max_results) break;
             try ov.emitUpTo(row.float(DOC_MERGE_SCORE_COL), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
             if (result_count >= options.max_results) break;
-            const doc = Doc.fromLocalRow(row);
+            var doc = Doc.fromLocalRow(row);
+            doc.snippet = snippetFromContent(alloc, doc.snippet, query);
             if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
             if (author_filter) |af| {
                 if (!std.mem.eql(u8, doc.did, af)) continue;
@@ -1398,7 +1372,8 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
 
         while (bp_rows.next()) |row| {
             if (result_count >= options.max_results) break;
-            const doc = Doc.fromLocalRow(row);
+            var doc = Doc.fromLocalRow(row);
+            doc.snippet = snippetFromContent(alloc, doc.snippet, query);
             if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
             if (author_filter) |af| {
                 if (!std.mem.eql(u8, doc.did, af)) continue;
@@ -1418,9 +1393,9 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
         var rows = if (author_val.len == 0 and since_val.len == 0 and !options.include_snippets)
             try local.query(LOCAL_DOCS_FTS_PREFILTER_NOSNIP_SQL, .{ fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
         else if (author_val.len == 0 and since_val.len == 0)
-            try local.query(LOCAL_DOCS_FTS_PREFILTER_SQL, .{ fts_query, fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
+            try local.query(LOCAL_DOCS_FTS_PREFILTER_SQL, .{ fts_query, CANDIDATE_PREFILTER_K, candidate_limit, candidate_limit })
         else
-            try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
+            try local.query(LOCAL_DOCS_FTS_SQL, .{ fts_query, author_val, author_val, since_val, since_val, candidate_limit, candidate_limit });
         defer rows.deinit();
 
         {
@@ -1431,7 +1406,8 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
                 if (result_count >= options.max_results) break;
                 try ov.emitUpTo(row.float(DOC_MERGE_SCORE_COL), alloc, &jw, &seen_uris, &seen_authors, &result_count, options);
                 if (result_count >= options.max_results) break;
-                const doc = Doc.fromLocalRow(row);
+                var doc = Doc.fromLocalRow(row);
+                doc.snippet = snippetFromContent(alloc, doc.snippet, query);
                 if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
                 if (author_filter) |af| {
                     if (!std.mem.eql(u8, doc.did, af)) continue;
@@ -1472,7 +1448,8 @@ fn searchLocal(alloc: Allocator, local: *db.LocalDb, query: []const u8, tag_filt
             var bp_count: u32 = 0;
             while (bp_rows.next()) |row| {
                 if (result_count >= options.max_results) break;
-                const doc = Doc.fromLocalRow(row);
+                var doc = Doc.fromLocalRow(row);
+                doc.snippet = snippetFromContent(alloc, doc.snippet, query);
                 if (ov.suppresses(doc.uri)) continue; // overlay shadows or tombstones
                 if (author_filter) |af| {
                     if (!std.mem.eql(u8, doc.did, af)) {
@@ -1842,9 +1819,9 @@ fn searchHybrid(alloc: Allocator, query: []const u8, tag_filter: ?[]const u8, pl
     }.lessThan);
 
     // 6. snippets were skipped during fusion (include_snippets=false), so
-    // hydrate just the page-bound rows: rowid-probed FTS snippets first (real
-    // match context, ~0.1ms per probe), content previews for the rest
-    // (semantic-only docs that don't match the FTS query, overlay docs).
+    // hydrate just the page-bound rows: the window around the first query
+    // hit in the document text for keyword-sourced rows, content previews
+    // for the rest (semantic-only docs, overlay docs).
     const candidate_count = @min(scored.items.len, options.max_results *| 2);
     var bare_uris: std.ArrayList([]const u8) = .empty;
     defer bare_uris.deinit(alloc);
@@ -2090,19 +2067,12 @@ fn fetchFtsSnippets(alloc: Allocator, query: []const u8, uris: []const []const u
     var snippets = std.StringHashMap([]const u8).init(alloc);
     if (uris.len == 0) return snippets;
     const local = db.getLocalDb() orelse return snippets;
-    const fts_query = buildFtsQuery(alloc, query) catch return snippets;
     for (uris) |uri| {
-        var rows = local.query(
-            \\SELECT snippet(documents_fts, 2, '', '', '...', 32)
-            \\FROM documents_fts WHERE documents_fts MATCH ?
-            \\AND rowid = (SELECT rowid FROM documents WHERE uri = ?)
-        , .{ fts_query, uri }) catch continue;
+        var rows = local.query("SELECT substr(content, 1, 8000) FROM documents WHERE uri = ?", .{uri}) catch continue;
         defer rows.deinit();
         if (rows.next()) |row| {
-            const snip = row.text(0);
-            if (snip.len > 0) {
-                if (alloc.dupe(u8, snip)) |d| snippets.put(uri, d) catch {} else |_| {}
-            }
+            const snip = snippetFromContent(alloc, row.text(0), query);
+            if (snip.len > 0) snippets.put(uri, snip) catch {};
         }
     }
     return snippets;
@@ -2203,6 +2173,12 @@ fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
 /// - unclosed quotes are treated as phrases with synthetic closing quote
 /// - AND binds tighter than OR in FTS5, so the bare group is parenthesized
 /// Separators match FTS5 unicode61 tokenizer: any non-alphanumeric character
+/// Shortest final word that still gets the type-ahead prefix star. `a*`
+/// expands to every term starting with a — 39,615 terms and 1.46M postings
+/// in a 85k-document corpus (2026-09-05), 33s just to rank; `an*` is 5,283
+/// terms. Three letters keeps the fan-out in the hundreds.
+const MIN_PREFIX_LEN: usize = 3;
+
 pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
     if (query.len == 0) return "";
 
@@ -2288,7 +2264,7 @@ pub fn buildFtsQuery(alloc: Allocator, query: []const u8) ![]const u8 {
             switch (token.kind) {
                 .word => {
                     try out.appendSlice(alloc, token.text);
-                    if (idx == tokens.items.len - 1) try out.append(alloc, '*');
+                    if (idx == tokens.items.len - 1 and token.text.len >= MIN_PREFIX_LEN) try out.append(alloc, '*');
                 },
                 .escaped_word => {
                     try out.append(alloc, '"');
@@ -2309,6 +2285,76 @@ fn isAlnum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
 }
 
+/// Reading length of a snippet, in bytes: about what FTS5's snippet() gave at
+/// 32 tokens. SNIPPET_LEAD is how far before the hit the window opens.
+const SNIPPET_WINDOW: usize = 240;
+const SNIPPET_LEAD: usize = 60;
+
+/// The window around the first occurrence of any query word in the document
+/// text (case-insensitive, prefix-tolerant since it is a substring search),
+/// or the document's opening when no word occurs in the fetched prefix. Cuts
+/// land on spaces, so multi-byte characters are never split; newlines become
+/// spaces; a cut edge is marked with "...". Runs only for rows that are
+/// emitted — FTS5's snippet() needed an FTS cursor, which cost a second full
+/// MATCH scan of every posting in the query (see localDocsFtsSql).
+fn snippetFromContent(alloc: Allocator, content: []const u8, query: []const u8) []const u8 {
+    if (content.len == 0) return "";
+    const hit = firstQueryHit(content, query);
+    var start: usize = if (hit) |h| h -| SNIPPET_LEAD else 0;
+    if (start > 0) {
+        // open on a word: skip forward to just past the next space, but never
+        // past the hit itself
+        while (start < hit.? and content[start] != ' ') start += 1;
+        if (start < hit.?) start += 1;
+    }
+    var end: usize = @min(content.len, start + SNIPPET_WINDOW);
+    if (end < content.len) {
+        var e = end;
+        while (e > start and content[e] != ' ') e -= 1;
+        if (e > start) end = e;
+        while (end > start and (content[end] & 0xC0) == 0x80) end -= 1;
+    }
+    const window = content[start..end];
+    const lead: usize = if (start > 0) 3 else 0;
+    const tail: usize = if (end < content.len) 3 else 0;
+    const out = alloc.alloc(u8, lead + window.len + tail) catch return "";
+    @memcpy(out[0..lead], "..."[0..lead]);
+    for (window, out[lead .. lead + window.len]) |c, *o| {
+        o.* = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
+    }
+    @memcpy(out[lead + window.len ..], "..."[0..tail]);
+    return out;
+}
+
+/// Byte offset of the earliest occurrence of any query word (alphanumeric
+/// run of at least two bytes; quoted phrases count as one word), or null.
+fn firstQueryHit(content: []const u8, query: []const u8) ?usize {
+    var best: ?usize = null;
+    var i: usize = 0;
+    while (i < query.len) {
+        var needle: []const u8 = "";
+        if (query[i] == '"') {
+            const open = i + 1;
+            var close = open;
+            while (close < query.len and query[close] != '"') close += 1;
+            needle = query[open..close];
+            i = if (close < query.len) close + 1 else close;
+        } else if (isAlnum(query[i])) {
+            const word_start = i;
+            while (i < query.len and isAlnum(query[i])) i += 1;
+            needle = query[word_start..i];
+        } else {
+            i += 1;
+            continue;
+        }
+        if (needle.len < 2) continue;
+        if (std.ascii.indexOfIgnoreCase(content, needle)) |pos| {
+            if (best == null or pos < best.?) best = pos;
+        }
+    }
+    return best;
+}
+
 // --- tests ---
 
 test "buildFtsQuery: empty string" {
@@ -2325,6 +2371,48 @@ test "buildFtsQuery: single word" {
     const result = try buildFtsQuery(std.testing.allocator, "hello");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("hello*", result);
+}
+
+test "buildFtsQuery: no prefix star on one- and two-letter words" {
+    const a = try buildFtsQuery(std.testing.allocator, "a");
+    defer std.testing.allocator.free(a);
+    try std.testing.expectEqualStrings("a", a);
+    const an = try buildFtsQuery(std.testing.allocator, "the zi");
+    defer std.testing.allocator.free(an);
+    try std.testing.expectEqualStrings("the OR zi", an);
+    const zig = try buildFtsQuery(std.testing.allocator, "the zig");
+    defer std.testing.allocator.free(zig);
+    try std.testing.expectEqualStrings("the OR zig*", zig);
+}
+
+test "snippetFromContent: window around the first hit, opening otherwise" {
+    const alloc = std.testing.allocator;
+    const body = "Intro paragraph that says nothing much of interest to anyone reading it at all. " ++
+        "Then the ATProto section begins and goes on for a while about relays and PDSes and labelers " ++
+        "until the essay ends with a summary of everything above and a farewell to the reader of it. " ++
+        "A closing paragraph follows, long enough that the window around the hit cannot reach the end of the text.";
+    const mid = snippetFromContent(alloc, body, "atproto relay");
+    defer alloc.free(mid);
+    try std.testing.expect(std.mem.startsWith(u8, mid, "..."));
+    try std.testing.expect(std.mem.endsWith(u8, mid, "..."));
+    try std.testing.expect(std.mem.indexOf(u8, mid, "ATProto section") != null);
+    try std.testing.expect(mid.len <= SNIPPET_WINDOW + 6);
+
+    const opening = snippetFromContent(alloc, body, "zig");
+    defer alloc.free(opening);
+    try std.testing.expect(std.mem.startsWith(u8, opening, "Intro paragraph"));
+    try std.testing.expect(std.mem.endsWith(u8, opening, "..."));
+
+    const short = snippetFromContent(alloc, "tiny\nbody", "body");
+    defer alloc.free(short);
+    try std.testing.expectEqualStrings("tiny body", short);
+
+    const cjk = snippetFromContent(alloc, "前置き " ++ "字" ** 300 ++ " atproto の話", "atproto");
+    defer alloc.free(cjk);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cjk));
+    try std.testing.expect(std.mem.indexOf(u8, cjk, "atproto") != null);
+
+    try std.testing.expectEqualStrings("", snippetFromContent(alloc, "", "x"));
 }
 
 test "buildFtsQuery: single word with whitespace" {
@@ -2706,34 +2794,46 @@ test "keyword doc search: candidate pass probes documents by rowid, never a scan
 
     inline for (.{ LOCAL_DOCS_FTS_SQL, LOCAL_DOCS_FTS_PLATFORM_SQL }, .{ false, true }) |sql, has_platform| {
         var plan = if (has_platform)
-            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "\"atproto\"*", "other", "", "", "", "", @as(usize, 83), @as(usize, 83) })
+            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "other", "", "", "", "", @as(usize, 83), @as(usize, 83) })
         else
-            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "\"atproto\"*", "", "", "", "", @as(usize, 83), @as(usize, 83) });
+            try ldb.query("EXPLAIN QUERY PLAN " ++ sql, .{ "\"atproto\"*", "", "", "", "", @as(usize, 83), @as(usize, 83) });
         defer plan.deinit();
         var saw_rowid_probe = false;
+        var saw_outer_probe = false;
+        var fts_scans: usize = 0;
         while (plan.next()) |prow| {
             const detail = prow.text(3);
             if (std.mem.indexOf(u8, detail, "SEARCH d2 USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_rowid_probe = true;
+            if (std.mem.indexOf(u8, detail, "SEARCH d USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_outer_probe = true;
+            if (std.mem.indexOf(u8, detail, "SCAN f2") != null or std.mem.indexOf(u8, detail, "SCAN documents_fts") != null) fts_scans += 1;
             // the fat documents probe must never drive the candidate pass
             try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
             try std.testing.expect(std.mem.indexOf(u8, detail, "SCAN d2") == null);
         }
         try std.testing.expect(saw_rowid_probe);
+        try std.testing.expect(saw_outer_probe);
+        // regression (2026-09-05): a second MATCH in the outer query — FTS5's
+        // snippet() needs a cursor, and `rowid IN (...)` is not a rowid
+        // constraint to FTS5 — scanned every posting of the query twice
+        try std.testing.expectEqual(@as(usize, 1), fts_scans);
     }
 
     // the bounded (prefilter) variant must also resolve its re-rank via rowid
     // seeks, with the bm25 phase staying inside the FTS index
     {
-        var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_DOCS_FTS_PREFILTER_SQL, .{ "\"atproto\"*", "\"atproto\"*", @as(usize, 2000), @as(usize, 83), @as(usize, 83) });
+        var plan = try ldb.query("EXPLAIN QUERY PLAN " ++ LOCAL_DOCS_FTS_PREFILTER_SQL, .{ "\"atproto\"*", @as(usize, 2000), @as(usize, 83), @as(usize, 83) });
         defer plan.deinit();
         var saw_rowid_probe = false;
+        var fts_scans: usize = 0;
         while (plan.next()) |prow| {
             const detail = prow.text(3);
             if (std.mem.indexOf(u8, detail, "SEARCH d2 USING INTEGER PRIMARY KEY (rowid=?)") != null) saw_rowid_probe = true;
+            if (std.mem.indexOf(u8, detail, "SCAN documents_fts") != null) fts_scans += 1;
             try std.testing.expect(std.mem.indexOf(u8, detail, "AUTOMATIC") == null);
             try std.testing.expect(std.mem.indexOf(u8, detail, "SCAN d2") == null);
         }
         try std.testing.expect(saw_rowid_probe);
+        try std.testing.expectEqual(@as(usize, 1), fts_scans);
     }
 
     // the snippet-free variant (hybrid fusion) must resolve BOTH the candidate
@@ -2757,28 +2857,13 @@ test "keyword doc search: candidate pass probes documents by rowid, never a scan
         try std.testing.expectEqual(@as(usize, 1), fts_scans);
     }
 
-    // the post-fusion snippet probe must use FTS5's rowid-constrained match
-    // plan (idxStr "=M"), a posting-list seek — never a full match scan
-    {
-        var plan = try ldb.query(
-            \\EXPLAIN QUERY PLAN SELECT snippet(documents_fts, 2, '', '', '...', 32)
-            \\FROM documents_fts WHERE documents_fts MATCH ?
-            \\AND rowid = (SELECT rowid FROM documents WHERE uri = ?)
-        , .{ "\"atproto\"*", "at://doc/1" });
-        defer plan.deinit();
-        var saw_rowid_match = false;
-        while (plan.next()) |prow| {
-            if (std.mem.indexOf(u8, prow.text(3), "=M") != null) saw_rowid_match = true;
-        }
-        try std.testing.expect(saw_rowid_match);
-    }
-
     // end-to-end: the matching doc comes back with its snippet — and the
     // unfiltered path (which routes through the prefilter SQL) agrees with it
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const out = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{ .include_undiscoverable = true, .show_labeled = true });
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"snippet\":\"a body about atproto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "at://doc/2") == null);
     // filtered path (author present) still uses the full-scan SQL and agrees
     const out_author = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, "did:plc:a", .{ .include_undiscoverable = true, .show_labeled = true });
@@ -2855,9 +2940,19 @@ test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress
     const mkdoc = struct {
         fn d(uri: []const u8, title: []const u8, content: []const u8, created: []const u8) db.OverlayDb.DocRow {
             return .{
-                .uri = uri, .did = "did:plc:ov", .rkey = "rk", .title = title, .content = content,
-                .created_at = created, .publication_uri = "", .platform = "other", .path = "",
-                .base_path = "", .has_publication = "0", .cover_image = "", .is_bridgyfed = "0",
+                .uri = uri,
+                .did = "did:plc:ov",
+                .rkey = "rk",
+                .title = title,
+                .content = content,
+                .created_at = created,
+                .publication_uri = "",
+                .platform = "other",
+                .path = "",
+                .base_path = "",
+                .has_publication = "0",
+                .cover_image = "",
+                .is_bridgyfed = "0",
             };
         }
     };
@@ -2873,7 +2968,9 @@ test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress
 
     // overlay ON: fresh appears, shadowed serves the overlay version, gone is suppressed
     const merged = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{
-        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+        .include_undiscoverable = true,
+        .show_labeled = true,
+        .use_overlay = true,
     });
     try std.testing.expect(std.mem.indexOf(u8, merged, "at://doc/fresh") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "at://doc/old") != null);
@@ -2885,7 +2982,9 @@ test "overlay merge: fresh docs appear, overlay wins on uri, tombstones suppress
 
     // overlay OFF: snapshot-only serving unchanged (gate works)
     const plain = try searchLocal(arena.allocator(), &ldb, "atproto", null, null, null, null, .{
-        .include_undiscoverable = true, .show_labeled = true, .use_overlay = false,
+        .include_undiscoverable = true,
+        .show_labeled = true,
+        .use_overlay = false,
     });
     try std.testing.expect(std.mem.indexOf(u8, plain, "at://doc/gone") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "at://doc/fresh") == null);
@@ -2950,10 +3049,20 @@ test "overlay merge: tag browse includes fresh tagged docs" {
     try ov.openAt(opath);
     defer ov.deinit();
     try ov.upsert(.{
-        .uri = "at://doc/freshtag", .did = "did:plc:ov", .rkey = "rk", .title = "fresh zig post",
-        .content = "new zig writing", .created_at = "2026-08-12T00:00:00", .publication_uri = "",
-        .platform = "other", .path = "", .base_path = "", .has_publication = "0",
-        .cover_image = "", .is_bridgyfed = "0", .tags = &.{"zig"},
+        .uri = "at://doc/freshtag",
+        .did = "did:plc:ov",
+        .rkey = "rk",
+        .title = "fresh zig post",
+        .content = "new zig writing",
+        .created_at = "2026-08-12T00:00:00",
+        .publication_uri = "",
+        .platform = "other",
+        .path = "",
+        .base_path = "",
+        .has_publication = "0",
+        .cover_image = "",
+        .is_bridgyfed = "0",
+        .tags = &.{"zig"},
     });
     db.setOverlayForTest(&ov);
     defer db.setOverlayForTest(null);
@@ -2963,7 +3072,9 @@ test "overlay merge: tag browse includes fresh tagged docs" {
 
     // tag browse (empty query): fresh overlay doc merges in ahead of the old one
     const browse = try searchLocal(arena.allocator(), &ldb, "", "zig", null, null, null, .{
-        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+        .include_undiscoverable = true,
+        .show_labeled = true,
+        .use_overlay = true,
     });
     try std.testing.expect(std.mem.indexOf(u8, browse, "at://doc/freshtag") != null);
     try std.testing.expect(std.mem.indexOf(u8, browse, "at://doc/snap") != null);
@@ -2971,7 +3082,9 @@ test "overlay merge: tag browse includes fresh tagged docs" {
 
     // tag + text: overlay FTS restricted to the tag
     const tagfts = try searchLocal(arena.allocator(), &ldb, "zig", "zig", null, null, null, .{
-        .include_undiscoverable = true, .show_labeled = true, .use_overlay = true,
+        .include_undiscoverable = true,
+        .show_labeled = true,
+        .use_overlay = true,
     });
     try std.testing.expect(std.mem.indexOf(u8, tagfts, "at://doc/freshtag") != null);
 }

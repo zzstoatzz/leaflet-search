@@ -32,7 +32,7 @@ buildFtsQuery(): "crypto OR casino*"
      ↓
 FTS5 MATCH query with BM25 + recency decay (on local SQLite replica)
      ↓
-results with snippet()
+candidates by rowid; snippet built in Zig from the document text
 ```
 
 key decisions (see [search-syntax.md](search-syntax.md) for the user-facing reference):
@@ -65,7 +65,7 @@ all in `backend/src/server/search.zig`:
 
 | component | FTS5-specific |
 |-----------|---------------|
-| 14 query definitions | `MATCH`, `snippet()`, `ORDER BY rank` |
+| query definitions | `MATCH`, `ORDER BY rank`; `snippet()` only in the tag path |
 | `buildFtsQuery()` | constructs FTS5 syntax |
 | schema | `documents_fts`, `publications_fts` virtual tables |
 

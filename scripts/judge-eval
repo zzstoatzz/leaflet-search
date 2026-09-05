@@ -14,6 +14,7 @@ Usage:
   scripts/judge-eval                                   # anthropic, default candidate set
   scripts/judge-eval claude-haiku-4-5 claude-sonnet-5  # anthropic, named models
   JUDGE_PROVIDER=openai scripts/judge-eval google/gemma-4-12b   # co/core (chat-completions)
+  JUDGE_PROVIDER=openai JUDGE_API_URL=https://api.openai.com/v1/chat/completions scripts/judge-eval <model>
 
 Needs .env with turso_url/turso_token, and ANTHROPIC_API_KEY (or COCORE_API_KEY
 for the openai provider) in the env or .env. ENV_FILE points at another file.
@@ -36,10 +37,11 @@ KNOWN = {
     "did:plc:sttgf52vkk46f6yuknvqxvgh": ("coryd.dev (942-doc human)", False),  # volume trap
 }
 
-PROVIDER = os.environ.get("JUDGE_PROVIDER", "anthropic")
+PROVIDER = os.environ.get("JUDGE_PROVIDER", "openai")
 DEFAULT_MODELS = {
-    "anthropic": ["claude-haiku-4-5"],  # the judge since 2026-09-05
+    "anthropic": ["claude-haiku-4-5"],  # 9/9 on 2026-09-05
     "openai": [
+        "gpt-5.6-luna",  # the judge since 2026-09-05 (9/9), with JUDGE_API_URL=https://api.openai.com/v1/chat/completions
         "mlx-community/Qwen2.5-7B-Instruct-4bit",  # the original judge (baseline)
         "mlx-community/Qwen3.5-9B-MLX-4bit",
         "google/gemma-4-12b",  # the judge 2026-07-02 → 2026-09-05
@@ -52,7 +54,7 @@ TITLES_PER_VOTE = 30
 EXCERPTS_PER_VOTE = 5
 EXCERPT_LEN = 800
 
-COCORE_URL = "https://console.cocore.dev/api/v1/chat/completions"
+OPENAI_COMPAT_URL = os.environ.get("JUDGE_API_URL", "https://console.cocore.dev/api/v1/chat/completions")
 
 PROMPT_HEAD = """A search engine indexes writing: documents COMPOSED by an author — a person or
 an AI — who chose what to say. It must EXCLUDE accounts that GENERATE
@@ -91,6 +93,7 @@ class Settings(BaseSettings):
     turso_url: str
     turso_token: str
     cocore_api_key: str = ""
+    openai_api_key: str = ""
     anthropic_api_key: str = ""
 
     @property
@@ -186,16 +189,19 @@ async def _ask(client, st, model: str, material: str) -> tuple[bool | None, str]
         )
         content = "".join(block.text for block in message.content if block.type == "text")
     else:
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+        # openai's newer models reject `max_tokens` (it is `max_completion_tokens`,
+        # and reasoning spends from it) and sampling parameters; co/core's models
+        # take the older shape and think out loud, so both get room
+        if "openai.com" in OPENAI_COMPAT_URL:
+            body["max_completion_tokens"] = 6000
+        else:
+            body["max_tokens"] = 2000
+            body["temperature"] = 0
         r = await client.post(
-            COCORE_URL,
-            headers={"Authorization": f"Bearer {st.cocore_api_key}"},
-            json={
-                "model": model,
-                # reasoning-style models think out loud before the JSON; give them room
-                "max_tokens": 2000,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            OPENAI_COMPAT_URL,
+            headers={"Authorization": f"Bearer {st.openai_api_key if 'openai.com' in OPENAI_COMPAT_URL else st.cocore_api_key}"},
+            json=body,
             timeout=timeout,
         )
         if r.status_code != 200:

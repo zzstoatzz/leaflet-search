@@ -68,14 +68,16 @@ const MAX_REVIEW_ATTEMPTS: i64 = 5; // give up after this many inconclusive revi
 // 2026-08-13 and 2026-09-04, when the catalog was renamed — and each time the
 // review queue paused in ten-minute loops with nothing judged. a labeler that
 // depends on a marketplace serving one model id is not a labeler, so the
-// default moved to a first-party model on 2026-09-05. reasoning-style + slow
-// is fine either way: the worker is a durable queue.
+// default moved to a first-party model on 2026-09-05: OpenAI's gpt-5.6-luna
+// (9/9 votes correct on scripts/judge-eval; claude-haiku-4-5 also 9/9 and one
+// REVIEW_PROVIDER=anthropic away). reasoning-style + slow is fine either way:
+// the worker is a durable queue.
 const Provider = enum { anthropic, openai };
-const DEFAULT_REVIEW_PROVIDER: Provider = .anthropic;
-const DEFAULT_REVIEW_MODEL = "claude-haiku-4-5";
-const DEFAULT_REVIEW_URL = "https://api.anthropic.com/v1/messages";
-const OPENAI_COMPAT_MODEL = "google/gemma-4-12b";
-const OPENAI_COMPAT_URL = "https://console.cocore.dev/api/v1/chat/completions";
+const DEFAULT_REVIEW_PROVIDER: Provider = .openai;
+const DEFAULT_REVIEW_MODEL = "gpt-5.6-luna";
+const DEFAULT_REVIEW_URL = "https://api.openai.com/v1/chat/completions";
+const ANTHROPIC_MODEL = "claude-haiku-4-5";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 
 const ReviewCfg = struct {
     provider: Provider,
@@ -681,8 +683,8 @@ pub fn startReview(allocator: Allocator, io: Io) void {
         std.mem.span(p)
     else if (provider == .anthropic and std.c.getenv("ANTHROPIC_API_KEY") != null)
         std.mem.span(std.c.getenv("ANTHROPIC_API_KEY").?)
-    else if (provider == .openai and std.c.getenv("COCORE_API_KEY") != null)
-        std.mem.span(std.c.getenv("COCORE_API_KEY").?)
+    else if (provider == .openai and std.c.getenv("OPENAI_API_KEY") != null)
+        std.mem.span(std.c.getenv("OPENAI_API_KEY").?)
     else {
         logfire.info("classifier: model-pass disabled (no REVIEW_API_KEY for provider {s}) — flagged authors queue unlabeled", .{@tagName(provider)});
         return;
@@ -690,12 +692,12 @@ pub fn startReview(allocator: Allocator, io: Io) void {
     const cfg = ReviewCfg{
         .provider = provider,
         .url = if (std.c.getenv("REVIEW_API_URL")) |p| std.mem.span(p) else switch (provider) {
-            .anthropic => DEFAULT_REVIEW_URL,
-            .openai => OPENAI_COMPAT_URL,
+            .openai => DEFAULT_REVIEW_URL,
+            .anthropic => ANTHROPIC_URL,
         },
         .model = if (std.c.getenv("REVIEW_MODEL")) |p| std.mem.span(p) else switch (provider) {
-            .anthropic => DEFAULT_REVIEW_MODEL,
-            .openai => OPENAI_COMPAT_MODEL,
+            .openai => DEFAULT_REVIEW_MODEL,
+            .anthropic => ANTHROPIC_MODEL,
         },
         .key = key,
     };
@@ -997,13 +999,22 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
     try jw.write(cfg.model);
     // reasoning models think out loud before the JSON verdict; 150 truncated
     // them mid-thought and every reply parsed as inconclusive
-    try jw.objectField("max_tokens");
-    try jw.write(2000);
-    // sampling parameters are rejected by newer Anthropic models; the vote is
-    // a majority of three, so determinism buys nothing there
-    if (cfg.provider == .openai) {
-        try jw.objectField("temperature");
-        try jw.write(0);
+    // openai.com's current models take `max_completion_tokens` (reasoning
+    // spends from it) and reject sampling parameters; co/core's models take
+    // the older `max_tokens` and think out loud, so both get room. Anthropic
+    // takes `max_tokens` and its newer models reject sampling too. the vote
+    // is a majority of three, so determinism buys nothing anyway.
+    const openai_dot_com = cfg.provider == .openai and std.mem.indexOf(u8, cfg.url, "openai.com") != null;
+    if (openai_dot_com) {
+        try jw.objectField("max_completion_tokens");
+        try jw.write(6000);
+    } else {
+        try jw.objectField("max_tokens");
+        try jw.write(2000);
+        if (cfg.provider == .openai) {
+            try jw.objectField("temperature");
+            try jw.write(0);
+        }
     }
     try jw.objectField("messages");
     try jw.beginArray();

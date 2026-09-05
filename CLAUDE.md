@@ -57,7 +57,7 @@
 - deployed on fastmcp.app
 
 ## labeler judge
-- the classifier's model-pass reads `REVIEW_PROVIDER` (`anthropic`, default, or `openai`), `REVIEW_MODEL`, `REVIEW_API_URL`, `REVIEW_API_KEY` from fly secrets. defaults: Anthropic Messages API, `claude-haiku-4-5`. re-evaluate a candidate judge with `scripts/judge-eval <model>` before changing it; it must get every known account right on a majority of votes
+- the classifier's model-pass reads `REVIEW_PROVIDER` (`anthropic`, default, or `openai`), `REVIEW_MODEL`, `REVIEW_API_URL`, `REVIEW_API_KEY` from fly secrets. defaults: OpenAI `gpt-5.6-luna` at api.openai.com; `REVIEW_PROVIDER=anthropic` switches to `claude-haiku-4-5` (both scored 9/9 on judge-eval, 2026-09-05). re-evaluate a candidate judge with `scripts/judge-eval <model>` before changing it; it must get every known account right on a majority of votes
 
 ## common tasks
 - check indexing: `curl -s https://leaflet-search-backend.fly.dev/api/dashboard | jq`

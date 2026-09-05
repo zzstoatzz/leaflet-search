@@ -15,3 +15,4 @@
 did:plc:oql6ds5vnff4ugar6rruliwd  # drivepatents.com patent bot
 did:plc:2s32mlusc66sjb256aenynfc  # destinationcharged.com NHTSA recall mirror
 did:plc:llnmp5t7s3u4dzjqyhp76h62  # crownnote.com music-charts mirror
+did:plc:6dis2hlap2lhwohabb2tniln  # vccbusiness.bsky.social SEO / virtual-card article farm (whitewind)

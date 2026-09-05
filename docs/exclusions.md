@@ -134,3 +134,27 @@ cleanup after a ban (the stores that don't self-heal):
   Surfaced as the 621-publication `/wrapped` latency outlier earlier the
   same session — the latency anomaly was the first symptom of the ramp.
 - **cleanup**: this ban (see git history for execution)
+
+### did:plc:6dis2hlap2lhwohabb2tniln — vccbusiness.bsky.social
+
+- **banned**: 2026-09-04
+- **what**: an SEO article farm on whitewind. every document is a long
+  (~16–25k character) machine-written "how to" piece rotating between two
+  product families — link-building software and virtual credit cards —
+  with titles like "How to Use AI powered link building Without Losing
+  Editorial Trust" and "How to buy VCC with crypto Without Disrupting Your
+  Operating Cash Flow". the writing exists to rank for keywords, not
+  because anyone had something to say.
+- **evidence at ban time**: 124 documents since 2026-07-30 (~3.4/day,
+  sustained); held 13 of the top 20 keyword results for `link` and 10 of 10
+  hybrid results for `link building`; **0 subscribers** to the account's
+  publications. surfaced by an agent session that spent six queries trying
+  to find writing about the "Free Link" moderation situation through this
+  noise (2026-09-04).
+- **call**: generated, bulk relative to its topics, no curation signal. the
+  classifier's heuristic scored it 0.05 against a 0.50 threshold — its
+  signals (thin bodies, templated or digit titles, registry-scale volume)
+  describe registry mirrors, and this is the opposite shape: fluent, long,
+  varied titles, modest volume. nothing routed it to the model judge below
+  the 5,000-document floor. see the labeler notes for the gate change.
+- **cleanup**: this ban (see git history for execution)

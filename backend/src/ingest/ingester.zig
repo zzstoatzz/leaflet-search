@@ -94,7 +94,6 @@ const LeafletPublication = struct {
     base_path: ?[]const u8 = null,
 };
 
-
 /// Shared record dispatch: both wire protocols (/channel frames and jetstream
 /// events) normalize into an IngesterRecord + optional inner record value and
 /// land here, so the two ingest sources index identically by construction.
@@ -224,7 +223,7 @@ fn processDocument(allocator: Allocator, io: Io, uri: []const u8, did: []const u
     // feed the autonomous labeler: it keeps a rolling per-DID aggregate and
     // emits bulk-mirror on its own when an author crosses the threshold. Local
     // sqlite only — never blocks the firehose.
-    classifier.observe(uri, did, doc.title, doc.content);
+    classifier.observe(uri, did, doc.title, doc.content, doc.created_at orelse "");
 }
 
 /// leaflet moves the page tree out of the record and into a content.blobPages
@@ -510,9 +509,20 @@ pub fn applyDocumentReconciliation(
                     logfire.warn("reconcile: blobPages hydration failed for {s}: {}", .{ uri, err });
                 };
                 try indexer.insertDocument(
-                    uri, did.raw, rkey, doc.title, doc.content, doc.created_at,
-                    doc.publication_uri, doc.tags, doc.platformName(), doc.source_collection,
-                    doc.path, doc.content_type, doc.cover_image, actual_cid,
+                    uri,
+                    did.raw,
+                    rkey,
+                    doc.title,
+                    doc.content,
+                    doc.created_at,
+                    doc.publication_uri,
+                    doc.tags,
+                    doc.platformName(),
+                    doc.source_collection,
+                    doc.path,
+                    doc.content_type,
+                    doc.cover_image,
+                    actual_cid,
                 );
                 logfire.counter("ingest.documents_indexed", 1);
             }

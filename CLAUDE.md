@@ -57,7 +57,9 @@
 - deployed on fastmcp.app
 
 ## labeler judge
-- the classifier's model-pass reads `REVIEW_PROVIDER` (`anthropic`, default, or `openai`), `REVIEW_MODEL`, `REVIEW_API_URL`, `REVIEW_API_KEY` from fly secrets. defaults: OpenAI `gpt-5.6-luna` at api.openai.com; `REVIEW_PROVIDER=anthropic` switches to `claude-haiku-4-5` (both scored 9/9 on judge-eval, 2026-09-05). re-evaluate a candidate judge with `scripts/judge-eval <model>` before changing it; it must get every known account right on a majority of votes
+- the classifier's model-pass reads `REVIEW_PROVIDER` (`openai`, default, or `anthropic`), `REVIEW_MODEL`, `REVIEW_API_URL`, `REVIEW_API_KEY` from fly secrets. defaults: OpenAI `gpt-5.6-luna` at api.openai.com; `REVIEW_PROVIDER=anthropic` switches to `claude-haiku-4-5` (both scored 9/9 on judge-eval, 2026-09-04). re-evaluate a candidate judge with `scripts/judge-eval <model>` before changing it; it must get every known account right on a majority of votes
+- who reaches the judge: the title heuristic (`score` ≥ THRESHOLD), extreme volume (≥5000 docs), or **velocity** — at the 50-doc floor and every 25 after, an author whose documents per day over their date span is ≥2 is nominated regardless of score (fluent long-form farms score ~0.05). a human backfilling an old blog looks the same, costs one review, and then stays decided; REJECTED/VETOED verdicts survive a scoring-version rescore
+- reviews are budgeted: `REVIEW_DAILY_BUDGET` (default 10) authors per UTC day, tracked in `classifier_meta` so a restart does not reset it; nominations past the budget stay PENDING and are picked up on later days
 
 ## common tasks
 - check indexing: `curl -s https://leaflet-search-backend.fly.dev/api/dashboard | jq`

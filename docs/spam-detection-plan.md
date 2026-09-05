@@ -3,7 +3,7 @@
 status: **BUILT** (labeler live 2026-06-30; this doc is the original plan and
 drifts from the as-built system). as built: the label is `bulk-generated`(renamed from `bulk-mirror`), the classifier is autonomous
 (`backend/src/ingest/classifier.zig`: heuristic pre-filter → majority-of-3
-model votes → emit; the judge is OpenAI's gpt-5.6-luna since 2026-09-05, after co/core dropped the served model id twice; `REVIEW_PROVIDER=anthropic` switches to Claude Haiku, and any chat-completions endpoint still works through the openai provider), and the policy line evolved to **composed vs
+model votes → emit; the judge is OpenAI's gpt-5.6-luna since 2026-09-04, after co/core dropped the served model id twice; `REVIEW_PROVIDER=anthropic` switches to Claude Haiku, and any chat-completions endpoint still works through the openai provider; since 2026-09-04 a velocity gate — ≥2 docs/day over an author's date span at the 50-doc floor — sends fluent farms the title heuristic misses to the judge, under a `REVIEW_DAILY_BUDGET` of 10 authors per day), and the policy line evolved to **composed vs
 generated** (see [exclusions.md](exclusions.md)). the public face is
 [pub-search.waow.tech/labels](https://pub-search.waow.tech/labels). hard-drop
 (acting on labels) is still pending the notify/appeal loop.

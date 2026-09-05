@@ -32,6 +32,17 @@ const log = std.log.scoped(.classifier);
 const FLOOR: i64 = 50; // min docs before a DID can be judged
 const EVAL_EVERY: i64 = 25; // re-score every N docs past the floor until labeled
 const EXTREME_VOLUME_REVIEW_FLOOR: i64 = 5000;
+// documents per day, over the span of an author's document dates, that sends
+// them to the model judge regardless of how the titles score. an SEO farm
+// with fluent titles and long bodies (vccbusiness, 2026-09: 124 docs in 36
+// days, heuristic 0.05) is invisible to every other signal; almost no human
+// sustains two a day. a human backfilling an old blog looks the same and
+// costs one review, then stays decided.
+const VELOCITY_DOCS_PER_DAY: f64 = 2.0;
+// reviews the worker will start per UTC day. bounds spend when a rescore or
+// a burst of backfills nominates many authors at once; the rest stay
+// PENDING and are picked up on later days.
+const DEFAULT_REVIEW_DAILY_BUDGET: i64 = 10;
 // Precision comes from the signal fixes (date/empty/non-ASCII titles score ~0.3),
 // not the threshold — so 0.50 catches genuine mirrors (transit feeds ~0.54)
 // while staying FP-safe. The curation veto is the backstop for prolific humans.
@@ -42,7 +53,9 @@ const THRESHOLD: f64 = 0.50;
 // (heuristic flags → LLM confirms content is bulk-generated before emit).
 // v11 = rotating-slot template fix (short mostly-scaffold titles count fully
 // templated) + thin-volume promotion (eligundry mood tracker sat at 0.47).
-const SCORING_VERSION: i64 = 11;
+// v12 = velocity promotion (documents per day over the author's date span)
+// and the rescore keeps REJECTED / VETOED verdicts instead of re-judging.
+const SCORING_VERSION: i64 = 12;
 const AGGREGATION_VERSION: i64 = 1; // v1: count unique document URIs, not put/update events
 
 // review pipeline states. The heuristic is a cheap PRE-FILTER: it never emits
@@ -135,6 +148,11 @@ pub fn init() void {
     // display identity for authors with no replica presence (seeded bans):
     // the replica can't resolve a site for a DID it has zero docs for.
     conn.execNoArgs("ALTER TABLE author_stats ADD COLUMN site TEXT NOT NULL DEFAULT ''") catch {};
+    // first and last document date, as days since the epoch (0 = unknown), for
+    // the velocity signal. document dates, not observation times: a bootstrap
+    // rescore observes the whole corpus in one pass.
+    conn.execNoArgs("ALTER TABLE author_stats ADD COLUMN first_day INTEGER NOT NULL DEFAULT 0") catch {};
+    conn.execNoArgs("ALTER TABLE author_stats ADD COLUMN last_day INTEGER NOT NULL DEFAULT 0") catch {};
     conn.execNoArgs("CREATE TABLE IF NOT EXISTS observed_documents (uri TEXT PRIMARY KEY)") catch {};
     g_conn = conn;
     logfire.info("classifier: author-stats ready (floor={d} threshold={d:.2})", .{ FLOOR, THRESHOLD });
@@ -143,8 +161,25 @@ pub fn init() void {
 /// Feed one ingested document. Cheap upsert; scores + maybe emits when a DID
 /// crosses the floor. Called from the firehose path — must never block on
 /// anything but local sqlite.
-pub fn observe(uri: []const u8, did: []const u8, title: []const u8, content: []const u8) void {
-    observeLen(uri, did, title, content.len);
+pub fn observe(uri: []const u8, did: []const u8, title: []const u8, content: []const u8, created_at: []const u8) void {
+    observeLen(uri, did, title, content.len, epochDay(created_at));
+}
+
+/// Days since 1970-01-01 for an ISO-8601 date prefix (`YYYY-MM-DD…`), or 0
+/// when the text does not start with one. Howard Hinnant's days_from_civil.
+fn epochDay(iso: []const u8) i64 {
+    if (iso.len < 10 or iso[4] != '-' or iso[7] != '-') return 0;
+    const y0 = std.fmt.parseInt(i64, iso[0..4], 10) catch return 0;
+    const m = std.fmt.parseInt(i64, iso[5..7], 10) catch return 0;
+    const d = std.fmt.parseInt(i64, iso[8..10], 10) catch return 0;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return 0;
+    const y = if (m <= 2) y0 - 1 else y0;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
 }
 
 /// One-time backfill: feed the existing corpus through the aggregate so the
@@ -191,17 +226,32 @@ pub fn bootstrap(io: Io) void {
         }
         if (prev.items.len > 0)
             logfire.info("classifier: cleared {d} prior labels for re-scoring (v{d})", .{ prev.items.len, SCORING_VERSION });
-        conn.execNoArgs("DELETE FROM author_stats") catch {};
-        conn.execNoArgs("DELETE FROM observed_documents") catch {};
     }
 
-    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize };
+    // a model verdict does not depend on the heuristic, so REJECTED (human)
+    // and VETOED (curated) survive the rescore: re-judging them would spend
+    // review budget to learn what is already known.
+    const Decided = struct { did: []const u8, state: i64, reason: []const u8 };
+    var decided: std.ArrayList(Decided) = .empty;
+    {
+        var rows = conn.rows("SELECT did, state, reason FROM author_stats WHERE state = ? OR state = ?", .{ STATE_REJECTED, STATE_VETOED }) catch return;
+        while (rows.next()) |row| decided.append(a, .{
+            .did = a.dupe(u8, row.text(0)) catch continue,
+            .state = row.int(1),
+            .reason = a.dupe(u8, row.text(2)) catch continue,
+        }) catch {};
+        rows.deinit();
+    }
+    conn.execNoArgs("DELETE FROM author_stats") catch {};
+    conn.execNoArgs("DELETE FROM observed_documents") catch {};
+
+    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize, day: i64 };
     var entries: std.ArrayList(Entry) = .empty;
 
     // materialize first so we don't hold a replica read connection across the
     // (slower) per-row upserts below.
     {
-        var rows = local.query("SELECT uri, did, title, LENGTH(content) FROM documents", .{}) catch |err| {
+        var rows = local.query("SELECT uri, did, title, LENGTH(content), created_at FROM documents", .{}) catch |err| {
             logfire.err("classifier: bootstrap query failed: {s}", .{@errorName(err)});
             return;
         };
@@ -212,11 +262,17 @@ pub fn bootstrap(io: Io) void {
                 .did = a.dupe(u8, row.text(1)) catch continue,
                 .title = a.dupe(u8, row.text(2)) catch continue,
                 .len = @intCast(@max(row.int(3), 0)),
+                .day = epochDay(row.text(4)),
             }) catch continue;
         }
     }
 
-    for (entries.items) |e| observeLen(e.uri, e.did, e.title, e.len);
+    for (entries.items) |e| observeLen(e.uri, e.did, e.title, e.len, e.day);
+    for (decided.items) |d| {
+        conn.exec("UPDATE author_stats SET labeled = 1, state = ?, reason = ? WHERE did = ?", .{ d.state, d.reason, d.did }) catch {};
+    }
+    if (decided.items.len > 0)
+        logfire.info("classifier: kept {d} decided verdicts across the rescore", .{decided.items.len});
     setMeta(conn, "scoring_version", SCORING_VERSION);
     setMeta(conn, "aggregation_version", AGGREGATION_VERSION);
     logfire.info("classifier: bootstrap (re)scored {d} existing docs at v{d}", .{ entries.items.len, SCORING_VERSION });
@@ -261,22 +317,23 @@ fn rebuildUniqueAggregation(conn: zqlite.Conn) void {
     }
     decided_rows.deinit();
 
-    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize };
+    const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize, day: i64 };
     var entries: std.ArrayList(Entry) = .empty;
-    var rows = local.query("SELECT uri, did, title, LENGTH(content) FROM documents", .{}) catch return;
+    var rows = local.query("SELECT uri, did, title, LENGTH(content), created_at FROM documents", .{}) catch return;
     while (rows.next()) |row| {
         entries.append(a, .{
             .uri = a.dupe(u8, row.text(0)) catch continue,
             .did = a.dupe(u8, row.text(1)) catch continue,
             .title = a.dupe(u8, row.text(2)) catch continue,
             .len = @intCast(@max(row.int(3), 0)),
+            .day = epochDay(row.text(4)),
         }) catch continue;
     }
     rows.deinit();
 
     conn.execNoArgs("DELETE FROM author_stats") catch return;
     conn.execNoArgs("DELETE FROM observed_documents") catch return;
-    for (entries.items) |entry| observeLen(entry.uri, entry.did, entry.title, entry.len);
+    for (entries.items) |entry| observeLen(entry.uri, entry.did, entry.title, entry.len, entry.day);
 
     for (decisions.items) |decision| {
         conn.exec(
@@ -332,7 +389,7 @@ fn setMeta(conn: zqlite.Conn, key: []const u8, v: i64) void {
     conn.exec("INSERT OR REPLACE INTO classifier_meta (k, v) VALUES (?, ?)", .{ key, v }) catch {};
 }
 
-fn observeLen(uri: []const u8, did: []const u8, title: []const u8, content_len: usize) void {
+fn observeLen(uri: []const u8, did: []const u8, title: []const u8, content_len: usize, day: i64) void {
     const conn = g_conn orelse return;
     if (!claimDocument(conn, uri)) return;
 
@@ -343,16 +400,18 @@ fn observeLen(uri: []const u8, did: []const u8, title: []const u8, content_len: 
 
     // append the normalized title to the sample (newline-joined) until capped.
     conn.exec(
-        \\INSERT INTO author_stats (did, doc_count, len_sum, empty_titles, digit_titles, title_sample, sample_count)
-        \\VALUES (?, 1, ?, ?, ?, ?, 1)
+        \\INSERT INTO author_stats (did, doc_count, len_sum, empty_titles, digit_titles, title_sample, sample_count, first_day, last_day)
+        \\VALUES (?, 1, ?, ?, ?, ?, 1, ?, ?)
         \\ON CONFLICT(did) DO UPDATE SET
         \\  doc_count = doc_count + 1,
         \\  len_sum = len_sum + excluded.len_sum,
         \\  empty_titles = empty_titles + excluded.empty_titles,
         \\  digit_titles = digit_titles + excluded.digit_titles,
         \\  title_sample = CASE WHEN sample_count < ? THEN title_sample || char(10) || ? ELSE title_sample END,
-        \\  sample_count = CASE WHEN sample_count < ? THEN sample_count + 1 ELSE sample_count END
-    , .{ did, @as(i64, @intCast(content_len)), is_empty, has_digit, norm, SAMPLE_CAP, norm, SAMPLE_CAP }) catch |err| {
+        \\  sample_count = CASE WHEN sample_count < ? THEN sample_count + 1 ELSE sample_count END,
+        \\  first_day = CASE WHEN excluded.first_day = 0 THEN first_day WHEN first_day = 0 THEN excluded.first_day ELSE MIN(first_day, excluded.first_day) END,
+        \\  last_day = MAX(last_day, excluded.last_day)
+    , .{ did, @as(i64, @intCast(content_len)), is_empty, has_digit, norm, day, day, SAMPLE_CAP, norm, SAMPLE_CAP }) catch |err| {
         log.debug("observe upsert: {s}", .{@errorName(err)});
         return;
     };
@@ -371,7 +430,7 @@ fn claimDocument(conn: zqlite.Conn, uri: []const u8) bool {
 
 fn maybeEvaluate(conn: zqlite.Conn, did: []const u8) void {
     const row = (conn.row(
-        "SELECT doc_count, len_sum, empty_titles, digit_titles, title_sample, labeled FROM author_stats WHERE did = ?",
+        "SELECT doc_count, len_sum, empty_titles, digit_titles, title_sample, labeled, first_day, last_day FROM author_stats WHERE did = ?",
         .{did},
     ) catch return) orelse return;
     defer row.deinit();
@@ -390,6 +449,8 @@ fn maybeEvaluate(conn: zqlite.Conn, did: []const u8) void {
         .empty_titles = row.int(2),
         .digit_titles = row.int(3),
         .sample = row.text(4),
+        .first_day = row.int(6),
+        .last_day = row.int(7),
     };
     const score = stats.score(arena.allocator());
     if (!stats.shouldReview(score)) return;
@@ -566,6 +627,23 @@ const Stats = struct {
     empty_titles: i64,
     digit_titles: i64,
     sample: []const u8, // newline-joined normalized titles
+    first_day: i64 = 0, // epoch days of the earliest document date, 0 = unknown
+    last_day: i64 = 0,
+
+    /// documents per day over the span of the author's document dates; a
+    /// span under a day counts as one. 0 when no dates are known.
+    fn docsPerDay(self: Stats) f64 {
+        if (self.first_day <= 0 or self.last_day < self.first_day) return 0;
+        const span: f64 = @floatFromInt(@max(self.last_day - self.first_day, 1));
+        return @as(f64, @floatFromInt(self.doc_count)) / span;
+    }
+
+    /// Sustained output no human keeps up: send to the judge whatever the
+    /// titles look like. The judge is the precision layer; this only decides
+    /// who is worth tokens.
+    fn velocityPromote(self: Stats) bool {
+        return self.doc_count >= FLOOR and self.docsPerDay() >= VELOCITY_DOCS_PER_DAY;
+    }
 
     fn frac(n: i64, d: i64) f64 {
         return if (d == 0) 0 else @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(d));
@@ -594,7 +672,7 @@ const Stats = struct {
     }
 
     fn shouldReview(self: Stats, score_value: f64) bool {
-        return score_value >= THRESHOLD or self.thinPromote() or self.extremeVolumePromote();
+        return score_value >= THRESHOLD or self.thinPromote() or self.velocityPromote() or self.extremeVolumePromote();
     }
 
     /// composite 0..1 — same shape as scripts/classify-bulk-mirror.
@@ -724,11 +802,16 @@ fn reviewWorker(allocator: Allocator, cfg: ReviewCfg, io: Io) void {
             resetExhaustedAttempts(conn);
             reset_done = true;
         }
+        if (!reviewBudgetAvailable(conn, io)) {
+            io.sleep(Io.Duration.fromSeconds(600), .awake) catch {};
+            continue;
+        }
         const did = nextPending(allocator, conn) orelse {
             io.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
             continue;
         };
         defer allocator.free(did);
+        countReview(conn, io);
 
         // null verdict = inconclusive (empty/garbled reply, transient provider
         // error, or out of CC) → leave PENDING and retry, never reject. Only a
@@ -772,6 +855,43 @@ fn reviewWorker(allocator: Allocator, cfg: ReviewCfg, io: Io) void {
         }
         io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
     }
+}
+
+fn reviewDailyBudget() i64 {
+    const raw = std.c.getenv("REVIEW_DAILY_BUDGET") orelse return DEFAULT_REVIEW_DAILY_BUDGET;
+    return std.fmt.parseInt(i64, std.mem.span(raw), 10) catch DEFAULT_REVIEW_DAILY_BUDGET;
+}
+
+fn todayEpochDay(io: Io) i64 {
+    return @divFloor(Io.Timestamp.now(io, .real).toMicroseconds(), 86_400 * 1_000_000);
+}
+
+/// Reviews started today, tracked in classifier_meta so a restart does not
+/// reset the budget. A new UTC day resets it.
+fn reviewsToday(conn: zqlite.Conn, io: Io) i64 {
+    if (getMeta(conn, "review_day") != todayEpochDay(io)) return 0;
+    return getMeta(conn, "review_count");
+}
+
+fn reviewBudgetAvailable(conn: zqlite.Conn, io: Io) bool {
+    const used = reviewsToday(conn, io);
+    const budget = reviewDailyBudget();
+    if (used < budget) return true;
+    if (used == budget) {
+        // log once: bump past the budget so the next pass stays quiet
+        setMeta(conn, "review_count", used + 1);
+        logfire.info("classifier: review budget for today spent ({d}); pending authors wait for the next UTC day", .{budget});
+    }
+    return false;
+}
+
+fn countReview(conn: zqlite.Conn, io: Io) void {
+    const today = todayEpochDay(io);
+    if (getMeta(conn, "review_day") != today) {
+        setMeta(conn, "review_day", today);
+        setMeta(conn, "review_count", 0);
+    }
+    setMeta(conn, "review_count", getMeta(conn, "review_count") + 1);
 }
 
 fn resetExhaustedAttempts(conn: zqlite.Conn) void {
@@ -1211,6 +1331,31 @@ fn normalizeTitle(title: []const u8, buf: *[256]u8) []const u8 {
 }
 
 // === tests ===
+
+test "epochDay: ISO date prefixes, unknown otherwise" {
+    try std.testing.expectEqual(@as(i64, 0), epochDay("1970-01-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(i64, 19723), epochDay("2024-01-01"));
+    try std.testing.expectEqual(@as(i64, 20700), epochDay("2026-09-04T23:05:37.000Z"));
+    try std.testing.expectEqual(@as(i64, 0), epochDay(""));
+    try std.testing.expectEqual(@as(i64, 0), epochDay("yesterday"));
+    try std.testing.expectEqual(@as(i64, 0), epochDay("2026-13-01"));
+}
+
+test "velocityPromote: sustained output reaches the judge, a slow human does not" {
+    // vccbusiness-shaped: 124 fluent docs in 36 days, heuristic ~0.05
+    const farm = Stats{ .doc_count = 124, .len_sum = 124 * 19675, .empty_titles = 0, .digit_titles = 11, .sample = "how to use ai powered link building\nwhen virtual visa cards fit", .first_day = 20662, .last_day = 20698 };
+    try std.testing.expect(farm.velocityPromote());
+    try std.testing.expect(farm.shouldReview(0.05));
+    // a prolific human: 203 docs over three years
+    const human = Stats{ .doc_count = 203, .len_sum = 203 * 1400, .empty_titles = 0, .digit_titles = 5, .sample = "struggling with typescript\nbreaking the cycle", .first_day = 19600, .last_day = 20698 };
+    try std.testing.expect(!human.velocityPromote());
+    // a backfill burst below the floor is not yet judged; at the floor it is
+    const backfill = Stats{ .doc_count = 49, .len_sum = 49 * 3000, .empty_titles = 0, .digit_titles = 0, .sample = "old post", .first_day = 20690, .last_day = 20692 };
+    try std.testing.expect(!backfill.velocityPromote());
+    // unknown dates never promote
+    const undated = Stats{ .doc_count = 500, .len_sum = 500 * 3000, .empty_titles = 0, .digit_titles = 0, .sample = "x" };
+    try std.testing.expect(!undated.velocityPromote());
+}
 
 test "normalizeTitle collapses digits + punctuation" {
     var buf: [256]u8 = undefined;

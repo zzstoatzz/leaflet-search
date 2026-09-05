@@ -2932,7 +2932,7 @@ test "overlay merge: tag browse includes fresh tagged docs" {
         try w.exec("CREATE VIRTUAL TABLE publications_fts USING fts5(uri UNINDEXED, name, description, base_path)", .{});
         try w.exec("CREATE TABLE document_tags (document_uri TEXT, tag TEXT, PRIMARY KEY (document_uri, tag))", .{});
         try w.exec("CREATE TABLE recommend_counts (document_uri TEXT PRIMARY KEY, rc INTEGER)", .{});
-        try w.exec("INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) VALUES ('at://doc/snap', 'did:plc:a', 'r1', 'snapshot zig post', 'zig writing', datetime('now', '-20 days'), 'other', '', 0, '', '')", .{});
+        try w.exec("INSERT INTO documents (uri, did, rkey, title, content, created_at, platform, base_path, has_publication, path, cover_image) VALUES ('at://doc/snap', 'did:plc:a', 'r1', 'snapshot zig post', 'zig writing', '2020-01-01T00:00:00', 'other', '', 0, '', '')", .{});
         try w.exec("INSERT INTO documents_fts (rowid, uri, title, content) SELECT rowid, uri, title, content FROM documents", .{});
         try w.exec("INSERT INTO document_tags (document_uri, tag) VALUES ('at://doc/snap', 'zig')", .{});
     }

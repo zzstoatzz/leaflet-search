@@ -76,6 +76,7 @@ test "isBanned matches only the banned list" {
     try std.testing.expect(isBanned("did:plc:oql6ds5vnff4ugar6rruliwd"));
     try std.testing.expect(isBanned("did:plc:2s32mlusc66sjb256aenynfc"));
     try std.testing.expect(isBanned("did:plc:llnmp5t7s3u4dzjqyhp76h62"));
+    try std.testing.expect(isBanned("did:plc:6dis2hlap2lhwohabb2tniln"));
     try std.testing.expect(!isBanned("did:plc:ragtjsm2j2vknwkz3zp4oxrd"));
 }
 
@@ -91,7 +92,7 @@ test "banned entries carry their inline notes" {
 
 test "banned_dids_sql is a quoted comma-separated list" {
     try std.testing.expectEqualStrings(
-        "'did:plc:oql6ds5vnff4ugar6rruliwd','did:plc:2s32mlusc66sjb256aenynfc','did:plc:llnmp5t7s3u4dzjqyhp76h62'",
+        "'did:plc:oql6ds5vnff4ugar6rruliwd','did:plc:2s32mlusc66sjb256aenynfc','did:plc:llnmp5t7s3u4dzjqyhp76h62','did:plc:6dis2hlap2lhwohabb2tniln'",
         banned_dids_sql,
     );
 }

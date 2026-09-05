@@ -209,41 +209,12 @@ pub fn bootstrap(io: Io) void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // scoring changed since last bootstrap: negate every label we previously
-    // emitted, so the corrected scoring starts from a clean slate (otherwise a
-    // now-below-threshold author would keep a stale positive label). No-op on
-    // the very first boot (nothing labeled yet).
-    {
-        var prev: std.ArrayList([]const u8) = .empty;
-        var rows = conn.rows("SELECT did FROM author_stats WHERE labeled = 1", .{}) catch return;
-        while (rows.next()) |row| prev.append(a, a.dupe(u8, row.text(0)) catch continue) catch {};
-        rows.deinit();
-        for (prev.items) |did| {
-            _ = labeler.emit(did, labeler.LABEL_BULK_GENERATED, true) catch {};
-            // negation matches on (src, uri, val) — labels emitted before the
-            // v10 rename carry the old value and need their own retraction.
-            _ = labeler.emit(did, "machine-generated", true) catch {};
-        }
-        if (prev.items.len > 0)
-            logfire.info("classifier: cleared {d} prior labels for re-scoring (v{d})", .{ prev.items.len, SCORING_VERSION });
-    }
-
-    // a model verdict does not depend on the heuristic, so REJECTED (human)
-    // and VETOED (curated) survive the rescore: re-judging them would spend
-    // review budget to learn what is already known.
-    const Decided = struct { did: []const u8, state: i64, reason: []const u8 };
-    var decided: std.ArrayList(Decided) = .empty;
-    {
-        var rows = conn.rows("SELECT did, state, reason FROM author_stats WHERE state = ? OR state = ?", .{ STATE_REJECTED, STATE_VETOED }) catch return;
-        while (rows.next()) |row| decided.append(a, .{
-            .did = a.dupe(u8, row.text(0)) catch continue,
-            .state = row.int(1),
-            .reason = a.dupe(u8, row.text(2)) catch continue,
-        }) catch {};
-        rows.deinit();
-    }
-    conn.execNoArgs("DELETE FROM author_stats") catch {};
-    conn.execNoArgs("DELETE FROM observed_documents") catch {};
+    // scoring changed since last bootstrap: rebuild every aggregate from the
+    // replica. decided authors keep their verdict throughout (see
+    // resetForRescore) — serving filters on that state live, so a wipe-then-
+    // restore left every labeled account searchable for the minutes the
+    // rebuild took (2026-09-05, docs/retro-2026-09-05-rescore-label-spill.md).
+    const kept = resetForRescore(conn);
 
     const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize, day: i64 };
     var entries: std.ArrayList(Entry) = .empty;
@@ -268,11 +239,8 @@ pub fn bootstrap(io: Io) void {
     }
 
     for (entries.items) |e| observeLen(e.uri, e.did, e.title, e.len, e.day);
-    for (decided.items) |d| {
-        conn.exec("UPDATE author_stats SET labeled = 1, state = ?, reason = ? WHERE did = ?", .{ d.state, d.reason, d.did }) catch {};
-    }
-    if (decided.items.len > 0)
-        logfire.info("classifier: kept {d} decided verdicts across the rescore", .{decided.items.len});
+    if (kept > 0)
+        logfire.info("classifier: kept {d} decided verdicts across the rescore", .{kept});
     setMeta(conn, "scoring_version", SCORING_VERSION);
     setMeta(conn, "aggregation_version", AGGREGATION_VERSION);
     logfire.info("classifier: bootstrap (re)scored {d} existing docs at v{d}", .{ entries.items.len, SCORING_VERSION });
@@ -294,29 +262,6 @@ fn rebuildUniqueAggregation(conn: zqlite.Conn) void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const Decision = struct {
-        did: []const u8,
-        state: i64,
-        attempts: i64,
-        reason: []const u8,
-        site: []const u8,
-    };
-    var decisions: std.ArrayList(Decision) = .empty;
-    var decided_rows = conn.rows(
-        "SELECT did, state, review_attempts, reason, site FROM author_stats WHERE state IN (?, ?, ?)",
-        .{ STATE_LABELED, STATE_REJECTED, STATE_VETOED },
-    ) catch return;
-    while (decided_rows.next()) |row| {
-        decisions.append(a, .{
-            .did = a.dupe(u8, row.text(0)) catch continue,
-            .state = row.int(1),
-            .attempts = row.int(2),
-            .reason = a.dupe(u8, row.text(3)) catch continue,
-            .site = a.dupe(u8, row.text(4)) catch continue,
-        }) catch continue;
-    }
-    decided_rows.deinit();
-
     const Entry = struct { uri: []const u8, did: []const u8, title: []const u8, len: usize, day: i64 };
     var entries: std.ArrayList(Entry) = .empty;
     var rows = local.query("SELECT uri, did, title, LENGTH(content), created_at FROM documents", .{}) catch return;
@@ -331,20 +276,36 @@ fn rebuildUniqueAggregation(conn: zqlite.Conn) void {
     }
     rows.deinit();
 
-    conn.execNoArgs("DELETE FROM author_stats") catch return;
-    conn.execNoArgs("DELETE FROM observed_documents") catch return;
+    const kept = resetForRescore(conn);
     for (entries.items) |entry| observeLen(entry.uri, entry.did, entry.title, entry.len, entry.day);
-
-    for (decisions.items) |decision| {
-        conn.exec(
-            \\INSERT INTO author_stats (did, labeled, state, review_attempts, reason, site)
-            \\VALUES (?, 1, ?, ?, ?, ?)
-            \\ON CONFLICT(did) DO UPDATE SET labeled = 1, state = excluded.state,
-            \\  review_attempts = excluded.review_attempts, reason = excluded.reason, site = excluded.site
-        , .{ decision.did, decision.state, decision.attempts, decision.reason, decision.site }) catch {};
-    }
     setMeta(conn, "aggregation_version", AGGREGATION_VERSION);
-    logfire.info("classifier: rebuilt {d} unique documents; preserved {d} terminal decisions", .{ entries.items.len, decisions.items.len });
+    logfire.info("classifier: rebuilt {d} unique documents; preserved {d} terminal decisions", .{ entries.items.len, kept });
+}
+
+/// Clear every aggregate so a rescore can rebuild it from the replica, without
+/// ever dropping a decided author. LABELED, REJECTED and VETOED are verdicts
+/// from the model, an operator, or curation; none depends on the heuristic,
+/// so a scoring change has nothing to say about them. Their rows stay, with
+/// counters zeroed and `labeled = 1` intact, which keeps `isLabeledDid` true
+/// for every labeled account at every instant of the rebuild and keeps the
+/// evaluator away from them. Observing and pending rows are dropped and must
+/// qualify again from their real document count. Returns the decided count.
+fn resetForRescore(conn: zqlite.Conn) i64 {
+    conn.exec(
+        "DELETE FROM author_stats WHERE state NOT IN (?, ?, ?)",
+        .{ STATE_LABELED, STATE_REJECTED, STATE_VETOED },
+    ) catch |err| {
+        logfire.err("classifier: rescore reset failed: {s}", .{@errorName(err)});
+        return 0;
+    };
+    conn.execNoArgs(
+        \\UPDATE author_stats SET doc_count = 0, len_sum = 0, empty_titles = 0, digit_titles = 0,
+        \\  title_sample = '', sample_count = 0, first_day = 0, last_day = 0
+    ) catch {};
+    conn.execNoArgs("DELETE FROM observed_documents") catch {};
+    const row = (conn.row("SELECT COUNT(*) FROM author_stats", .{}) catch return 0) orelse return 0;
+    defer row.deinit();
+    return row.int(0);
 }
 
 /// The hand-banned registry (banned-dids.txt / docs/exclusions.md) must be a
@@ -1532,6 +1493,67 @@ test "extreme volume reaches review despite fluent unique titles (regression: tr
         .sample = feed_articles.sample,
     };
     try std.testing.expect(!prolific_human.extremeVolumePromote());
+}
+
+test "a rescore never drops a decided author (regression: 2026-09-05 label spill)" {
+    const conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite);
+    defer conn.close();
+    try conn.execNoArgs(
+        \\CREATE TABLE author_stats (
+        \\  did TEXT PRIMARY KEY,
+        \\  doc_count INTEGER NOT NULL DEFAULT 0,
+        \\  len_sum INTEGER NOT NULL DEFAULT 0,
+        \\  empty_titles INTEGER NOT NULL DEFAULT 0,
+        \\  digit_titles INTEGER NOT NULL DEFAULT 0,
+        \\  title_sample TEXT NOT NULL DEFAULT '',
+        \\  sample_count INTEGER NOT NULL DEFAULT 0,
+        \\  labeled INTEGER NOT NULL DEFAULT 0,
+        \\  state INTEGER NOT NULL DEFAULT 0,
+        \\  review_attempts INTEGER NOT NULL DEFAULT 0,
+        \\  reason TEXT NOT NULL DEFAULT '',
+        \\  site TEXT NOT NULL DEFAULT '',
+        \\  first_day INTEGER NOT NULL DEFAULT 0,
+        \\  last_day INTEGER NOT NULL DEFAULT 0
+        \\)
+    );
+    try conn.execNoArgs("CREATE TABLE observed_documents (uri TEXT PRIMARY KEY)");
+    try conn.exec(
+        "INSERT INTO author_stats (did, doc_count, labeled, state, review_attempts, reason, site) VALUES (?, 640, 1, ?, 3, 'templated catalog', 'farm.example')",
+        .{ "did:farm", STATE_LABELED },
+    );
+    try conn.exec("INSERT INTO author_stats (did, doc_count, labeled, state) VALUES (?, 120, 1, ?)", .{ "did:human", STATE_REJECTED });
+    try conn.exec("INSERT INTO author_stats (did, doc_count, state) VALUES (?, 75, ?)", .{ "did:queued", STATE_PENDING });
+    try conn.exec("INSERT INTO author_stats (did, doc_count, state) VALUES (?, 12, ?)", .{ "did:quiet", STATE_OBSERVING });
+    try conn.exec("INSERT INTO observed_documents (uri) VALUES (?)", .{"at://did:farm/1"});
+
+    const prev = g_conn;
+    g_conn = conn;
+    defer g_conn = prev;
+
+    try std.testing.expectEqual(@as(i64, 2), resetForRescore(conn));
+    try std.testing.expect(isLabeledDid("did:farm"));
+
+    // the rebuild observes the corpus again: counters restart from zero, the
+    // verdict and its provenance are untouched, and the row stays labeled
+    // throughout (the evaluator skips labeled rows, so no re-review either).
+    observeLen("at://did:farm/1", "did:farm", "catalog 2026-01", 500, 20454);
+    observeLen("at://did:farm/2", "did:farm", "catalog 2026-02", 500, 20485);
+    const farm = (try conn.row("SELECT doc_count, state, labeled, review_attempts, reason, site, first_day FROM author_stats WHERE did = 'did:farm'", .{})).?;
+    defer farm.deinit();
+    try std.testing.expectEqual(@as(i64, 2), farm.int(0));
+    try std.testing.expectEqual(STATE_LABELED, farm.int(1));
+    try std.testing.expectEqual(@as(i64, 1), farm.int(2));
+    try std.testing.expectEqual(@as(i64, 3), farm.int(3));
+    try std.testing.expectEqualStrings("templated catalog", farm.text(4));
+    try std.testing.expectEqualStrings("farm.example", farm.text(5));
+    try std.testing.expectEqual(@as(i64, 20454), farm.int(6));
+    try std.testing.expect(isLabeledDid("did:farm"));
+
+    const human = (try conn.row("SELECT state, doc_count FROM author_stats WHERE did = 'did:human'", .{})).?;
+    defer human.deinit();
+    try std.testing.expectEqual(STATE_REJECTED, human.int(0));
+    try std.testing.expectEqual(@as(i64, 0), human.int(1));
+    try std.testing.expect((try conn.row("SELECT 1 FROM author_stats WHERE did IN ('did:queued', 'did:quiet')", .{})) == null);
 }
 
 test "operator positive and negated labels update enforcement state" {

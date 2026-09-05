@@ -79,6 +79,7 @@ the tools are popular and well-established. the assembly — wiring the firehose
 - [api.md](api.md) — API endpoint reference
 - [exclusions.md](exclusions.md) — the registry of manually excluded authors: the policy line (composed vs generated), enforcement layers, and the evidence for each ban
 - [spam-detection-plan.md](spam-detection-plan.md) — the labeler: pub-search autonomously labels accounts that generate documents from datasets (`bulk-generated`, see [/labels](https://pub-search.waow.tech/labels)); doc is the original plan with an as-built status header
+- [retro-2026-09-05-rescore-label-spill.md](retro-2026-09-05-rescore-label-spill.md) — a scoring rescore wiped `author_stats` and un-labeled every bulk-generated account for 25 minutes; a rescore now rebuilds counters in place and never drops a verdict
 - [agent-surfaces.md](agent-surfaces.md) — adopting pub-search for agents: MCP vs HTTP API, when to use which
 - [snapshot-pipeline.md](snapshot-pipeline.md) — how the keyword index ships (builder → manifest → R2 → verified adoption), what scales, and how to do production data surgery
 - [scaling-plan.md](scaling-plan.md) — the plan of record: snapshot builder → R2 → verified swap → live overlay (largely executed; see status header)

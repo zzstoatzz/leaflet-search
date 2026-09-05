@@ -52,6 +52,7 @@ BANNED_DIDS = load_banned_dids()
 
 BATCH_SIZE = 300
 SLEEP_BETWEEN_BATCHES = 12.0
+REQUEST_TIMEOUT = 120.0
 CANARY_SLOW_SECS = 1.5
 CANARY_PAUSE_SECS = 60.0
 CANARY_ABORT_AFTER = 3  # consecutive slow canaries
@@ -92,7 +93,7 @@ async def _execute(client: httpx.AsyncClient, settings: Settings, sql: str, args
             "Content-Type": "application/json",
         },
         json={"requests": [{"type": "execute", "stmt": _make_stmt(sql, args)}, {"type": "close"}]},
-        timeout=120,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     data = response.json()
@@ -114,9 +115,17 @@ async def canary(client, settings) -> float:
 
 
 async def main() -> None:
+    global BATCH_SIZE, REQUEST_TIMEOUT
     parser = argparse.ArgumentParser(description="paced banned-DID purge from turso")
     parser.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
+    parser.add_argument("--batch", type=int, default=BATCH_SIZE, help=f"uris per batch (default {BATCH_SIZE})")
+    parser.add_argument(
+        "--timeout", type=float, default=REQUEST_TIMEOUT,
+        help=f"seconds per statement (default {REQUEST_TIMEOUT:.0f}); the FTS delete scans the whole table and can exceed it",
+    )
     args = parser.parse_args()
+    BATCH_SIZE = args.batch
+    REQUEST_TIMEOUT = args.timeout
 
     settings = Settings()  # type: ignore
 

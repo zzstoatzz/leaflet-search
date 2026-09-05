@@ -68,7 +68,10 @@ const MAX_REVIEW_ATTEMPTS: i64 = 5; // give up after this many inconclusive revi
 // economics we control. Qwen2.5-7B (the original judge) was 0/3, confidently
 // inverted. Reasoning-style + slow is fine: the worker is a durable queue,
 // candidates just stay PENDING longer.
-const DEFAULT_REVIEW_MODEL = "mlx-community/gemma-4-12B-it-8bit";
+// co/core renamed its catalog on 2026-09-04: the old id stopped resolving
+// ("no connected provider serves model"), the review queue paused in
+// ten-minute loops, and nothing was judged. the id must match /v1/models.
+const DEFAULT_REVIEW_MODEL = "google/gemma-4-12b";
 const DEFAULT_REVIEW_URL = "https://console.cocore.dev/api/v1/chat/completions";
 
 const ReviewCfg = struct {

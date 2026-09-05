@@ -12,7 +12,7 @@ A usable judge must get ALL known cases right on a majority of votes.
 
 Usage:
   scripts/judge-eval                          # default candidate set
-  scripts/judge-eval mlx-community/gemma-4-12B-it-8bit [more models...]
+  scripts/judge-eval google/gemma-4-12b [more models...]
 
 Needs .env with turso_url/turso_token, and COCORE_API_KEY in the env or .env.
 """
@@ -37,7 +37,7 @@ KNOWN = {
 DEFAULT_MODELS = [
     "mlx-community/Qwen2.5-7B-Instruct-4bit",  # current judge (baseline)
     "mlx-community/Qwen3.5-9B-MLX-4bit",
-    "mlx-community/gemma-4-12B-it-8bit",
+    "google/gemma-4-12b",
     "mlx-community/Qwen3.6-35B-A3B-4bit",
 ]
 

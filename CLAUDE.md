@@ -56,5 +56,8 @@
 - the installable project lives in `pub-search-mcp/server/` — nested intentionally to work around a horizon (fastmcp.app's builder) bug where single-segment pyproject paths render as bare-name PyPI lookups instead of path installs (see prefecthq/horizon#3814). Remove the `server/` nesting once that PR lands.
 - deployed on fastmcp.app
 
+## labeler judge
+- the classifier's model-pass reads `REVIEW_PROVIDER` (`anthropic`, default, or `openai`), `REVIEW_MODEL`, `REVIEW_API_URL`, `REVIEW_API_KEY` from fly secrets. defaults: Anthropic Messages API, `claude-haiku-4-5`. re-evaluate a candidate judge with `scripts/judge-eval <model>` before changing it; it must get every known account right on a majority of votes
+
 ## common tasks
 - check indexing: `curl -s https://leaflet-search-backend.fly.dev/api/dashboard | jq`

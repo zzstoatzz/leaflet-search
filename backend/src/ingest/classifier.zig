@@ -56,25 +56,29 @@ const STATE_LABELED: i64 = 2; // model confirmed bulk-generated → emitted
 const STATE_REJECTED: i64 = 3; // model said human → not labeled
 const STATE_VETOED: i64 = 4; // had curation → never labeled
 const MAX_REVIEW_ATTEMPTS: i64 = 5; // give up after this many inconclusive reviews
-// the model-pass runs on co/core (cocore.dev) — an AT-Protocol-native, OpenAI-
-// compatible decentralized inference exchange. Fitting: the labeler is an AT
-// Proto thing, so its content judge runs on AT-Proto-native inference.
-// review provider: any OpenAI-compatible chat-completions endpoint. Defaults
-// to co/core; override all three via env (REVIEW_API_URL / REVIEW_MODEL /
-// REVIEW_API_KEY) to switch providers with a secrets change, no deploy of code.
-// picked by scripts/judge-eval: gemma-4-12B went 19/19 conclusive votes
-// correct across two runs on the composed-vs-generated prompt (2026-07-02),
-// and it's the model our own provider machine serves — reliability and
-// economics we control. Qwen2.5-7B (the original judge) was 0/3, confidently
-// inverted. Reasoning-style + slow is fine: the worker is a durable queue,
-// candidates just stay PENDING longer.
-// co/core renamed its catalog on 2026-09-04: the old id stopped resolving
-// ("no connected provider serves model"), the review queue paused in
-// ten-minute loops, and nothing was judged. the id must match /v1/models.
-const DEFAULT_REVIEW_MODEL = "google/gemma-4-12b";
-const DEFAULT_REVIEW_URL = "https://console.cocore.dev/api/v1/chat/completions";
+// the model-pass is a single chat turn against a hosted model. two providers
+// are understood, selected by REVIEW_PROVIDER: `anthropic` (the Messages API,
+// default) and `openai` (any chat-completions-compatible endpoint, which is
+// how co/core was reached). REVIEW_API_URL / REVIEW_MODEL / REVIEW_API_KEY
+// override the provider's defaults with a secrets change, no deploy of code.
+//
+// history: the judge ran on co/core's gemma-4-12B from 2026-07-02 (19/19
+// conclusive votes correct on the composed-vs-generated prompt; Qwen2.5-7B
+// was 0/3, confidently inverted). twice the model left co/core's roster —
+// 2026-08-13 and 2026-09-04, when the catalog was renamed — and each time the
+// review queue paused in ten-minute loops with nothing judged. a labeler that
+// depends on a marketplace serving one model id is not a labeler, so the
+// default moved to a first-party model on 2026-09-05. reasoning-style + slow
+// is fine either way: the worker is a durable queue.
+const Provider = enum { anthropic, openai };
+const DEFAULT_REVIEW_PROVIDER: Provider = .anthropic;
+const DEFAULT_REVIEW_MODEL = "claude-haiku-4-5";
+const DEFAULT_REVIEW_URL = "https://api.anthropic.com/v1/messages";
+const OPENAI_COMPAT_MODEL = "google/gemma-4-12b";
+const OPENAI_COMPAT_URL = "https://console.cocore.dev/api/v1/chat/completions";
 
 const ReviewCfg = struct {
+    provider: Provider,
     url: []const u8,
     model: []const u8,
     key: []const u8,
@@ -666,17 +670,33 @@ const Stats = struct {
 /// back to COCORE_API_KEY). Without one, flagged authors stay PENDING
 /// (unlabeled) — emission is paused, not faked.
 pub fn startReview(allocator: Allocator, io: Io) void {
+    const provider: Provider = if (std.c.getenv("REVIEW_PROVIDER")) |p| blk: {
+        const s = std.mem.span(p);
+        if (std.mem.eql(u8, s, "openai")) break :blk .openai;
+        if (std.mem.eql(u8, s, "anthropic")) break :blk .anthropic;
+        logfire.err("classifier: unknown REVIEW_PROVIDER {s}; using {s}", .{ s, @tagName(DEFAULT_REVIEW_PROVIDER) });
+        break :blk DEFAULT_REVIEW_PROVIDER;
+    } else DEFAULT_REVIEW_PROVIDER;
     const key = if (std.c.getenv("REVIEW_API_KEY")) |p|
         std.mem.span(p)
-    else if (std.c.getenv("COCORE_API_KEY")) |p|
-        std.mem.span(p)
+    else if (provider == .anthropic and std.c.getenv("ANTHROPIC_API_KEY") != null)
+        std.mem.span(std.c.getenv("ANTHROPIC_API_KEY").?)
+    else if (provider == .openai and std.c.getenv("COCORE_API_KEY") != null)
+        std.mem.span(std.c.getenv("COCORE_API_KEY").?)
     else {
-        logfire.info("classifier: model-pass disabled (no REVIEW_API_KEY/COCORE_API_KEY) — flagged authors queue unlabeled", .{});
+        logfire.info("classifier: model-pass disabled (no REVIEW_API_KEY for provider {s}) — flagged authors queue unlabeled", .{@tagName(provider)});
         return;
     };
     const cfg = ReviewCfg{
-        .url = if (std.c.getenv("REVIEW_API_URL")) |p| std.mem.span(p) else DEFAULT_REVIEW_URL,
-        .model = if (std.c.getenv("REVIEW_MODEL")) |p| std.mem.span(p) else DEFAULT_REVIEW_MODEL,
+        .provider = provider,
+        .url = if (std.c.getenv("REVIEW_API_URL")) |p| std.mem.span(p) else switch (provider) {
+            .anthropic => DEFAULT_REVIEW_URL,
+            .openai => OPENAI_COMPAT_URL,
+        },
+        .model = if (std.c.getenv("REVIEW_MODEL")) |p| std.mem.span(p) else switch (provider) {
+            .anthropic => DEFAULT_REVIEW_MODEL,
+            .openai => OPENAI_COMPAT_MODEL,
+        },
         .key = key,
     };
     const t = std.Thread.spawn(.{}, reviewWorker, .{ allocator, cfg, io }) catch |err| {
@@ -961,7 +981,10 @@ fn utf8Excerpt(s: []const u8, max: usize) []const u8 {
     return s[0..end];
 }
 
-/// POST /chat/completions against any OpenAI-compatible provider (cfg.url).
+/// One user turn against the configured provider: the Anthropic Messages API
+/// (`x-api-key` + `anthropic-version`) or an OpenAI-compatible
+/// /chat/completions endpoint (bearer token). The request body is the same
+/// shape for both.
 fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) ![]const u8 {
     var client: http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
@@ -976,8 +999,12 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
     // them mid-thought and every reply parsed as inconclusive
     try jw.objectField("max_tokens");
     try jw.write(2000);
-    try jw.objectField("temperature");
-    try jw.write(0);
+    // sampling parameters are rejected by newer Anthropic models; the vote is
+    // a majority of three, so determinism buys nothing there
+    if (cfg.provider == .openai) {
+        try jw.objectField("temperature");
+        try jw.write(0);
+    }
     try jw.objectField("messages");
     try jw.beginArray();
     try jw.beginObject();
@@ -993,6 +1020,10 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
 
     var auth_buf: [256]u8 = undefined;
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{cfg.key}) catch return error.AuthTooLong;
+    const anthropic_headers = [_]http.Header{
+        .{ .name = "x-api-key", .value = cfg.key },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+    };
 
     var resp: std.Io.Writer.Allocating = .init(allocator);
     errdefer resp.deinit();
@@ -1001,7 +1032,14 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
         .method = .POST,
         .headers = .{
             .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = auth },
+            .authorization = switch (cfg.provider) {
+                .openai => .{ .override = auth },
+                .anthropic => .omit,
+            },
+        },
+        .extra_headers = switch (cfg.provider) {
+            .anthropic => &anthropic_headers,
+            .openai => &.{},
         },
         .payload = payload,
         .response_writer = &resp.writer,
@@ -1018,13 +1056,41 @@ fn callModel(allocator: Allocator, cfg: ReviewCfg, io: Io, prompt: []const u8) !
         // gemma-4-12B vanished and the worker hot-looped 3 failing TLS calls
         // per author on the serving vCPU). Same treatment: pause, stay
         // PENDING, resume when the model returns or REVIEW_MODEL changes.
-        if (res.status == .service_unavailable or res.status == .not_found) return error.NoCapacity;
+        // 429 / 529 from the Messages API mean the same thing operationally:
+        // nothing is wrong with the author, try again later.
+        if (res.status == .service_unavailable or res.status == .not_found or
+            res.status == .too_many_requests or @intFromEnum(res.status) == 529) return error.NoCapacity;
         return error.CocoreApiError;
     }
     return text;
 }
 
-/// Pull the verdict + reason out of the OpenAI envelope. The content is
+/// The model's text out of either envelope: OpenAI's
+/// choices[0].message.content, or the Messages API's content[] text blocks
+/// joined. Null when there is no text.
+fn replyText(a: Allocator, parsed: json.Value) ?[]const u8 {
+    if (parsed != .object) return null;
+    if (parsed.object.get("choices")) |choices| {
+        if (choices != .array or choices.array.items.len == 0) return null;
+        const msg = choices.array.items[0].object.get("message") orelse return null;
+        const content = msg.object.get("content") orelse return null;
+        if (content != .string or content.string.len == 0) return null;
+        return content.string;
+    }
+    const content = parsed.object.get("content") orelse return null;
+    if (content != .array) return null;
+    var out: std.ArrayList(u8) = .empty;
+    for (content.array.items) |block| {
+        if (block != .object) continue;
+        const kind = block.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
+        const text = block.object.get("text") orelse continue;
+        if (text == .string) out.appendSlice(a, text.string) catch return null;
+    }
+    return if (out.items.len == 0) null else out.items;
+}
+
+/// Pull the verdict + reason out of the provider's reply. The text is
 /// {"machine": bool, "reason": "..."}. Returns null when the reply is
 /// empty/garbled/missing (transient failure or out of CC) so the worker retries
 /// instead of falsely rejecting. The reason is owned by `allocator`.
@@ -1033,13 +1099,7 @@ fn parseVerdict(allocator: Allocator, response: []const u8) ?Verdict {
     defer arena.deinit();
     const a = arena.allocator();
     const parsed = json.parseFromSliceLeaky(json.Value, a, response, .{}) catch return null;
-    if (parsed != .object) return null;
-    const choices = parsed.object.get("choices") orelse return null;
-    if (choices != .array or choices.array.items.len == 0) return null;
-    const msg = choices.array.items[0].object.get("message") orelse return null;
-    const content = msg.object.get("content") orelse return null;
-    if (content != .string or content.string.len == 0) return null;
-    const s = content.string;
+    const s = replyText(a, parsed) orelse return null;
 
     // the verdict is the LAST "machine": true/false in the reply — reasoning
     // models emit a thought stream (which may draft verdicts) before the final
@@ -1218,6 +1278,14 @@ test "parseVerdict: clear verdicts decide + carry reason, empty/garbled retries"
     try std.testing.expect(parseVerdict(a, "{\"choices\":[{\"message\":{\"content\":\"\"}}]}") == null); // → retry
     try std.testing.expect(parseVerdict(a, "not json") == null); // → retry
     try std.testing.expect(parseVerdict(a, "{\"choices\":[]}") == null); // → retry
+
+    // the Messages API envelope: content is an array of blocks
+    const messages_api = "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"machine\\\": true, \\\"reason\\\":\\\"one per recall\\\"}\"}],\"stop_reason\":\"end_turn\"}";
+    const mv = parseVerdict(a, messages_api).?;
+    defer a.free(mv.reason);
+    try std.testing.expect(mv.machine);
+    try std.testing.expectEqualStrings("one per recall", mv.reason);
+    try std.testing.expect(parseVerdict(a, "{\"content\":[],\"stop_reason\":\"end_turn\"}") == null); // → retry
 }
 
 test "parseVerdict: reasoning-model thought stream — LAST verdict wins, reason from final object" {

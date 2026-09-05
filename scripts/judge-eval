@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx", "pydantic-settings"]
+# dependencies = ["httpx", "pydantic-settings", "anthropic>=1"]
 # ///
 """Evaluate candidate review models against known-truth accounts.
 
@@ -11,10 +11,12 @@ then runs each candidate model over each vote slice for every known account.
 A usable judge must get ALL known cases right on a majority of votes.
 
 Usage:
-  scripts/judge-eval                          # default candidate set
-  scripts/judge-eval google/gemma-4-12b [more models...]
+  scripts/judge-eval                                   # anthropic, default candidate set
+  scripts/judge-eval claude-haiku-4-5 claude-sonnet-5  # anthropic, named models
+  JUDGE_PROVIDER=openai scripts/judge-eval google/gemma-4-12b   # co/core (chat-completions)
 
-Needs .env with turso_url/turso_token, and COCORE_API_KEY in the env or .env.
+Needs .env with turso_url/turso_token, and ANTHROPIC_API_KEY (or COCORE_API_KEY
+for the openai provider) in the env or .env. ENV_FILE points at another file.
 """
 
 import asyncio
@@ -34,12 +36,16 @@ KNOWN = {
     "did:plc:sttgf52vkk46f6yuknvqxvgh": ("coryd.dev (942-doc human)", False),  # volume trap
 }
 
-DEFAULT_MODELS = [
-    "mlx-community/Qwen2.5-7B-Instruct-4bit",  # current judge (baseline)
-    "mlx-community/Qwen3.5-9B-MLX-4bit",
-    "google/gemma-4-12b",
-    "mlx-community/Qwen3.6-35B-A3B-4bit",
-]
+PROVIDER = os.environ.get("JUDGE_PROVIDER", "anthropic")
+DEFAULT_MODELS = {
+    "anthropic": ["claude-haiku-4-5"],  # the judge since 2026-09-05
+    "openai": [
+        "mlx-community/Qwen2.5-7B-Instruct-4bit",  # the original judge (baseline)
+        "mlx-community/Qwen3.5-9B-MLX-4bit",
+        "google/gemma-4-12b",  # the judge 2026-07-02 → 2026-09-05
+        "mlx-community/Qwen3.6-35B-A3B-4bit",
+    ],
+}[PROVIDER]
 
 VOTES = 3
 TITLES_PER_VOTE = 30
@@ -84,7 +90,8 @@ class Settings(BaseSettings):
     )
     turso_url: str
     turso_token: str
-    cocore_api_key: str
+    cocore_api_key: str = ""
+    anthropic_api_key: str = ""
 
     @property
     def turso_host(self) -> str:
@@ -166,21 +173,34 @@ async def ask(client, st, model: str, material: str) -> tuple[bool | None, str]:
 
 
 async def _ask(client, st, model: str, material: str) -> tuple[bool | None, str]:
-    r = await client.post(
-        COCORE_URL,
-        headers={"Authorization": f"Bearer {st.cocore_api_key}"},
-        json={
-            "model": model,
-            # reasoning-style models think out loud before the JSON; give them room
-            "max_tokens": 2000,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": PROMPT_HEAD + material + PROMPT_TAIL}],
-        },
-        timeout=float(os.environ.get("JUDGE_TIMEOUT", "90")),
-    )
-    if r.status_code != 200:
-        return None, f"http {r.status_code}"
-    content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+    prompt = PROMPT_HEAD + material + PROMPT_TAIL
+    timeout = float(os.environ.get("JUDGE_TIMEOUT", "90"))
+    if PROVIDER == "anthropic":
+        from anthropic import AsyncAnthropic
+
+        anthropic = AsyncAnthropic(api_key=st.anthropic_api_key or None, timeout=timeout)
+        message = await anthropic.messages.create(
+            model=model,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = "".join(block.text for block in message.content if block.type == "text")
+    else:
+        r = await client.post(
+            COCORE_URL,
+            headers={"Authorization": f"Bearer {st.cocore_api_key}"},
+            json={
+                "model": model,
+                # reasoning-style models think out loud before the JSON; give them room
+                "max_tokens": 2000,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return None, f"http {r.status_code}"
+        content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
     # the verdict is the LAST json object with a "machine" key — reasoning models
     # emit a thought stream (with stray braces) before it
     dec = json.JSONDecoder()
@@ -204,10 +224,14 @@ async def main() -> None:
     models = sys.argv[1:] or DEFAULT_MODELS
     async with httpx.AsyncClient() as client:
         # build all vote materials once (same evidence for every model)
-        materials = {
-            did: [await vote_material(client, st, did, v) for v in range(VOTES)]
-            for did in KNOWN
-        }
+        materials = {}
+        for did in KNOWN:
+            try:
+                materials[did] = [await vote_material(client, st, did, v) for v in range(VOTES)]
+            except RuntimeError as exc:
+                # an account whose rows left turso (purged, or dropped by a
+                # later policy) cannot be judged; say so and score the rest
+                print(f"skipping {KNOWN[did][0]}: {exc}")
         # every (model, account, vote) call is independent, but cocore's
         # decentralized serving drowns under a full burst — bound concurrency
         sem = asyncio.Semaphore(int(os.environ.get("JUDGE_CONCURRENCY", "12")))
@@ -219,7 +243,7 @@ async def main() -> None:
         tasks = {
             (model, did, v): asyncio.create_task(bounded(model, did, v))
             for model in models
-            for did in KNOWN
+            for did in materials
             for v in range(VOTES)
         }
         results = {k: await t for k, t in tasks.items()}
@@ -227,7 +251,8 @@ async def main() -> None:
         print(f"{'model':<45} {'account':<30} truth  votes      verdict")
         scores: dict[str, int] = {}
         for model in models:
-            for did, (name, truth) in KNOWN.items():
+            for did in materials:
+                name, truth = KNOWN[did]
                 votes = []
                 for v in range(VOTES):
                     verdict, note = results[(model, did, v)]
@@ -243,7 +268,7 @@ async def main() -> None:
                 print(f"{model:<45} {name:<30} {'M' if truth else 'H'}      {vs:<10} {ok}")
         print()
         for model, s in scores.items():
-            print(f"{model}: {s}/{len(KNOWN)}")
+            print(f"{model}: {s}/{len(materials)}")
 
 
 asyncio.run(main())
